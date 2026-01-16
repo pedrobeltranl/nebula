@@ -52,7 +52,7 @@ RUN uv sync --group controller
 
 ENV PATH="/.venv/bin:$PATH"
 
-COPY /nebula/controller/start_services.sh .
+COPY nebula/controller/start_services.sh .
 
 RUN dos2unix start_services.sh
 

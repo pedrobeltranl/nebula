@@ -98,6 +98,7 @@ class DockerUtils:
             str or None: The base subnet (e.g. "192.168.50") of the created or existing
                          network, or None if an error occurred.
         """
+        client = None
         try:
             # Connect to Docker
             client = docker.from_env()
@@ -151,7 +152,8 @@ class DockerUtils:
             logging.exception("Unexpected error")
             return None
         finally:
-            client.close()  # Ensure the Docker client is closed
+            if client:
+                client.close()  # Ensure the Docker client is closed
 
     @classmethod
     def check_docker_by_prefix(cls, prefix):

@@ -54,7 +54,7 @@ RUN uv sync --group frontend
 
 ENV PATH="/.venv/bin:$PATH"
 
-COPY /nebula/frontend/start_services.sh .
+COPY nebula/frontend/start_services.sh .
 
 RUN dos2unix start_services.sh
 

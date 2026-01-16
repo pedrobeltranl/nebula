@@ -8,6 +8,7 @@ import SaManager from './situational-awareness.js';
 import GraphSettings from './graph-settings.js';
 import Utils from './utils.js';
 import TrustworthinessManager from './trustworthiness.js';
+import HoneypotManager from './honeypot.js';
 
 const DeploymentManager = (function() {
     function initialize() {
@@ -32,6 +33,7 @@ const DeploymentManager = (function() {
         SaManager.initializeSa();
         TrustworthinessManager.initializeTrustworthinessSystem();
         GraphSettings.initializeDistanceControls();
+        HoneypotManager.initializeEventListeners(); 
 
         // Make modules globally available
         window.ScenarioManager = ScenarioManager;
@@ -44,6 +46,7 @@ const DeploymentManager = (function() {
         window.GraphSettings = GraphSettings;
         window.DeploymentManager = DeploymentManager;
         window.Utils = Utils;
+        window.HoneypotManager = HoneypotManager;
     }
 
     function getGraphWidth() {

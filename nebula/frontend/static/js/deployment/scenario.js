@@ -75,6 +75,7 @@ const ScenarioManager = (function () {
             report_status_data_queue: document.getElementById("reportingSwitch").checked,
             epochs: parseInt(document.getElementById("epochs").value),
             attack_params: attackConfig,
+            honeypot: window.HoneypotManager.getHoneypotConfig(),
             reputation: {
                 enabled: window.ReputationManager.getReputationConfig().enabled || false,
                 metrics: window.ReputationManager.getReputationConfig().metrics || {},
@@ -221,6 +222,9 @@ const ScenarioManager = (function () {
                 sar_training_policy: scenario.sar_training_policy,
             });
         }
+        if (scenario.honeypot) {
+            window.HoneypotManager.setHoneypotConfig(scenario.honeypot);
+        }
 
         // Trigger necessary events
         document.getElementById("federationArchitecture").dispatchEvent(new Event('change'));
@@ -345,6 +349,9 @@ const ScenarioManager = (function () {
         }
         if (window.SaManager) {
             window.SaManager.resetSaConfig();
+        }
+        if (window.HoneypotManager) {
+            window.HoneypotManager.resetHoneypotConfig();
         }
 
         // Trigger necessary events

@@ -359,7 +359,7 @@ class TopologyManager:
             None: The `topology` attribute of the class is updated with the generated ring topology.
         """
         topology_ring = np.array(
-            nx.to_numpy_matrix(nx.watts_strogatz_graph(self.n_nodes, 2, 0)),
+            nx.to_numpy_array(nx.watts_strogatz_graph(self.n_nodes, 2, 0)),
             dtype=np.float32,
         )
 
@@ -388,7 +388,7 @@ class TopologyManager:
         """
         # First generate a ring topology
         topology_ring = np.array(
-            nx.to_numpy_matrix(nx.watts_strogatz_graph(self.n_nodes, 2, 0)),
+            nx.to_numpy_array(nx.watts_strogatz_graph(self.n_nodes, 2, 0)),
             dtype=np.float32,
         )
 
@@ -398,7 +398,7 @@ class TopologyManager:
         # If undirected_neighbor_num is X, then each node has X links to other nodes
         k = int(self.undirected_neighbor_num)
         topology_random_link = np.array(
-            nx.to_numpy_matrix(nx.watts_strogatz_graph(self.n_nodes, k, 0)),
+            nx.to_numpy_array(nx.watts_strogatz_graph(self.n_nodes, k, 0)),
             dtype=np.float32,
         )
 
@@ -428,7 +428,7 @@ class TopologyManager:
         # randomly add some links for each node (symmetric)
         k = self.undirected_neighbor_num
         topology_random_link = np.array(
-            nx.to_numpy_matrix(nx.watts_strogatz_graph(self.n_nodes, k, 0)),
+            nx.to_numpy_array(nx.watts_strogatz_graph(self.n_nodes, k, 0)),
             dtype=np.float32,
         )
 
@@ -436,7 +436,7 @@ class TopologyManager:
 
         # first generate a ring topology
         topology_ring = np.array(
-            nx.to_numpy_matrix(nx.watts_strogatz_graph(self.n_nodes, 2, 0)),
+            nx.to_numpy_array(nx.watts_strogatz_graph(self.n_nodes, 2, 0)),
             dtype=np.float32,
         )
 
@@ -483,7 +483,7 @@ class TopologyManager:
             None: The `topology` attribute of the class is updated with the generated fully connected topology.
         """
         topology_fully_connected = np.array(
-            nx.to_numpy_matrix(nx.watts_strogatz_graph(self.n_nodes, self.n_nodes - 1, 0)),
+            nx.to_numpy_array(nx.watts_strogatz_graph(self.n_nodes, self.n_nodes - 1, 0)),
             dtype=np.float32,
         )
 

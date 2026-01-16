@@ -337,9 +337,9 @@ class Lightning:
             return None, None
 
     def cleanup(self):
-        if self._trainer is not None:
+        if getattr(self, "_trainer", None) is not None:
             self._trainer._teardown()
-            del self._trainer
+            self._trainer = None
         if self.datamodule is not None:
             self.datamodule.teardown()
         gc.collect()

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import random
@@ -318,21 +319,53 @@ class Engine:
     async def _control_leadership_transfer_callback(self, source, message):
         logging.info(f"🔧  handle_control_message | Trigger | Received leadership transfer message from {source}")
         
+        # Security Check: Malicious nodes cannot accept Leadership/Honeypot roles
+        if self._is_malicious:
+            logging.warning(f"😈  I am MALICIOUS. Rejecting Leadership Transfer from {source}. (Restricted by Policy)")
+            return
+
+        target_role = Role.AGGREGATOR
+        honeypot_state = None
+        
+        # Check if it is a Honeypot Transfer
+        if message.log and message.log.startswith("HONEYPOT_TRANSFER:"):
+            try:
+                logging.info(f"🍯  handle_control_message | Detected Honeypot Transfer from {source}")
+                target_role = Role.HONEYPOT
+                payload = message.log.replace("HONEYPOT_TRANSFER:", "", 1)
+                honeypot_state = json.loads(payload)
+            except Exception as e:
+                logging.error(f"Error parsing Honeypot State: {e}")
+
         if await self._round_in_process_lock.locked_async():
             logging.info("Learning cycle is executing, role behavior will be modified next round")
-            await self.rb.set_next_role(Role.AGGREGATOR, source_to_notificate=source)
+            await self.rb.set_next_role(target_role, source_to_notificate=source)
+            if honeypot_state and target_role == Role.HONEYPOT:
+                 self._pending_honeypot_state = honeypot_state
         else:
             try:
-                logging.info("Trying to modify Role behavior")
+                logging.info(f"Trying to modify Role behavior to {target_role}")
                 lock_task = asyncio.create_task(self._round_in_process_lock.acquire_async())
                 await asyncio.wait_for(lock_task, timeout=3)
-                self._role_behavior = change_role_behavior(self.rb, Role.AGGREGATOR, self, self.config)
-                await self.rb.set_next_role(Role.AGGREGATOR, source_to_notificate=source)
+                self._role_behavior = change_role_behavior(self.rb, target_role, self, self.config)
+                
+                # Apply Honeypot State if valid
+                if target_role == Role.HONEYPOT:
+                     if honeypot_state and hasattr(self._role_behavior, "manager"):
+                         self._role_behavior.manager.import_state(honeypot_state)
+                         logging.info("🍯  Honeypot State Imported successfully.")
+                     
+                     if hasattr(self._role_behavior, "set_previous_honeypot_node"):
+                         self._role_behavior.set_previous_honeypot_node(source)
+                
+                await self.rb.set_next_role(target_role, source_to_notificate=source)
                 await self.update_self_role()
                 await self._round_in_process_lock.release_async()
             except TimeoutError:
                 logging.info("Learning cycle is locked, role behavior will be modified next round")
-                await self.rb.set_next_role(Role.AGGREGATOR, source_to_notificate=source)
+                await self.rb.set_next_role(target_role, source_to_notificate=source)
+                if honeypot_state and target_role == Role.HONEYPOT:
+                     self._pending_honeypot_state = honeypot_state
 
     async def _control_leadership_transfer_ack_callback(self, source, message):
         logging.info(f"🔧  handle_control_message | Trigger | Received leadership transfer ack message from {source}")
@@ -799,6 +832,18 @@ class Engine:
             next_role = await self.rb.get_next_role()
             source_to_notificate = await self.rb.get_source_to_notificate()
             self._role_behavior: RoleBehavior = change_role_behavior(self.rb, next_role, self, self.config)
+            
+            # Apply pending state if exists (for Honeypot transfer)
+            if next_role == Role.HONEYPOT:
+                 if hasattr(self, "_pending_honeypot_state") and self._pending_honeypot_state:
+                     if hasattr(self._role_behavior, "manager"):
+                         self._role_behavior.manager.import_state(self._pending_honeypot_state)
+                         logging.info("🍯  Honeypot State Imported from pending state.")
+                     self._pending_honeypot_state = None
+                 
+                 if hasattr(self._role_behavior, "set_previous_honeypot_node") and source_to_notificate:
+                      self._role_behavior.set_previous_honeypot_node(source_to_notificate)
+            
             to_role = self.rb.get_role_name()
             logging.info(f"Role behavior changing from: {from_role} to {to_role}")
             self.config.participant["device_args"]["role"] = to_role
@@ -806,7 +851,32 @@ class Engine:
                 logging.info(f"Sending role modification ACK to transferer: {source_to_notificate}")
                 message = self.cm.create_message("control", "leadership_transfer_ack")
                 asyncio.create_task(self.cm.send_message(source_to_notificate, message))
-             
+        
+        else:
+            # Handle Redundant Role Transfers (e.g. Honeypot -> Honeypot)
+            # If we receive a transfer for the role we already have, we MUST ACK it to stop the sender.
+            source_to_notificate = await self.rb.get_source_to_notificate()
+            if source_to_notificate:
+                next_role = await self.rb.get_next_role()
+                current_role_enum = self.rb.get_role()
+                
+                if next_role == current_role_enum:
+                    logging.info(f"Received redundant role transfer notification from {source_to_notificate}. Current: {current_role_enum}. Sending ACK.")
+                    
+                    # Apply pending state if exists (Honeypot Refresh)
+                    if current_role_enum == Role.HONEYPOT and hasattr(self, "_pending_honeypot_state") and self._pending_honeypot_state:
+                        if hasattr(self._role_behavior, "manager"):
+                            try:
+                                self._role_behavior.manager.import_state(self._pending_honeypot_state)
+                                logging.info("🍯  Honeypot State Refreshed from pending state (Redundant Transfer).")
+                            except Exception as e:
+                                logging.error(f"Failed to import pending honeypot state: {e}")
+                        self._pending_honeypot_state = None
+
+                    logging.info(f"Sending role modification ACK to transferer: {source_to_notificate}")
+                    message = self.cm.create_message("control", "leadership_transfer_ack")
+                    asyncio.create_task(self.cm.send_message(source_to_notificate, message))
+
     async def _learning_cycle(self):
         """
         Main asynchronous loop for executing the Federated Learning process across multiple rounds.

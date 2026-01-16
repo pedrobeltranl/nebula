@@ -93,9 +93,26 @@
   },
   "defense_args": {
     "reputation": {
-      "enabled": false,
-      "metrics": {},
-      "initial_reputation": 0.2,
+      "enabled": true,
+      "metrics": {
+        "model_similarity": {
+          "enabled": true,
+          "weight": 0.25
+        },
+        "num_messages": {
+          "enabled": true,
+          "weight": 0.25
+        },
+        "model_arrival_latency": {
+          "enabled": true,
+          "weight": 0.25
+        },
+        "fraction_parameters_changed": {
+          "enabled": true,
+          "weight": 0.25
+        }
+      },
+      "initial_reputation": 0.5,
       "weighting_factor": "dynamic"
     }
   },

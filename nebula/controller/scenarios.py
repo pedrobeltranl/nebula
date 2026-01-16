@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import glob
 import hashlib
 import json
@@ -109,6 +110,7 @@ class Scenario:
         sar_training,
         sar_training_policy,
         physical_ips=None,
+        honeypot=None,
     ):
         """
         Initialize a Scenario instance.
@@ -234,6 +236,13 @@ class Scenario:
         self.sar_training = sar_training
         self.sar_training_policy = sar_training_policy
         self.physical_ips = physical_ips
+        self.honeypot = honeypot
+
+        # Assign Honeypot Role randomly among benign nodes
+        # The assignment function now handles cleanup of existing roles to ensure exclusivity.
+        if self.honeypot and self.honeypot.get("enabled"):
+             self.nodes = self.honeypot_node_assign(self.nodes, self.honeypot)
+             logging.info("Honeypot assignment completed.")
 
     def attack_node_assign(
         self,
@@ -542,12 +551,79 @@ class Scenario:
             cls: An instance of the class initialized with the provided data.
         """
         # Create a copy of the data to avoid modifying the original
-        scenario_data = data.copy()
+        scenario_data = copy.deepcopy(data)
 
         # Create the scenario object
         scenario = cls(**scenario_data)
 
         return scenario
+
+    def honeypot_node_assign(self, nodes, honeypot_config):
+        """
+        Assigns the Honeypot role to a subset of nodes based on configuration.
+        Ensures exactly ONE Honeypot node exists.
+        """
+        import random
+        import logging
+        
+        if not honeypot_config or not honeypot_config.get("enabled"):
+            return nodes
+
+        # Determine fallback role based on federation
+        fallback_role = "trainer"
+        if self.federation == "DFL":
+            fallback_role = "trainer_aggregator"
+
+        # 1. Reset any existing honeypot role to trainer to ensure exclusivity and clean slate
+        # This fixes issues if the input nodes already have multiple honeypots assigned incorrectly
+        cleaned_nodes_count = 0
+        for nid, node in nodes.items():
+            if node.get("role") == "honeypot":
+                 node["role"] = fallback_role
+                 node.pop("honeypot_seed", None)
+                 cleaned_nodes_count += 1
+            # Also clean malicious nodes that might have inherited 'honeypot' as fake behavior
+            elif node.get("role") == "malicious" and node.get("fake_behavior") == "honeypot":
+                 node["fake_behavior"] = fallback_role
+                 cleaned_nodes_count += 1
+        
+        if cleaned_nodes_count > 0:
+            logging.info(f"[Scenario] Reset {cleaned_nodes_count} pre-existing honeypot nodes to {fallback_role}.")
+
+        # 2. Identify available benign nodes (trainers/idles/aggregators but usually trainers)
+        # We assume 'trainer' is the base role for benign participants.
+        available_nodes = [
+            nid for nid, node in nodes.items() 
+            if node["role"] != "malicious" and node["role"] != "honeypot"
+        ]
+        
+        if not available_nodes:
+            logging.warning("[Scenario] No available benign nodes to assign Honeypot role.")
+            return nodes
+        
+        # 3. Strictly assign 1 Honeypot
+        count = 1
+        selected_ids = random.sample(available_nodes, count)
+        
+        logging.info(f"[Scenario] Assigning Honeypot Role to {len(selected_ids)} nodes: {selected_ids}")
+        
+        for nid in selected_ids:
+            # Save original role as 'fake_behavior' implicitly or just know it was benign
+            # But the Honeypot logic might need to know what it "should" be.
+            # However, Honeypot usually behaves as a Trainer/Aggregator anyway until it pivots.
+            # But wait, if it degrades/decommissions, it needs to go back to fallback_role.
+            
+            # The current implementation just overwrites 'role'.
+            # If we want to restore it later, we might need to store it.
+            # But specifically for initializing, we just set it to 'honeypot'.
+            
+            nodes[nid]["role"] = "honeypot"
+            nodes[nid]["honeypot_seed"] = honeypot_config.get("seed", 0.5)
+            # Also set the fake_behavior if needed?
+            # malicious nodes have fake_behavior. honeypot behaves like a good node mostly.
+            # But 'fake_behavior' field is used by MaliciousRoleBehavior.
+            
+        return nodes
 
 
 # Class to manage the current scenario
@@ -656,6 +732,12 @@ class ScenarioManagement:
         else:
             self.scenario.nodes = self.scenario.mobility_assign(self.scenario.nodes, 0)
 
+        # Assign Honeypot Role randomly among benign nodes
+        if self.scenario.honeypot and self.scenario.honeypot.get("enabled"):
+             # We pass the honeypot config
+             self.scenario.nodes = self.scenario.honeypot_node_assign(self.scenario.nodes, self.scenario.honeypot)
+             logging.info("Honeypot assignment completed.")
+
         # Save node settings
         for node in self.scenario.nodes:
             node_config = self.scenario.nodes[node]
@@ -683,6 +765,8 @@ class ScenarioManagement:
             participant_config["device_args"]["role"] = node_config["role"]
             participant_config["device_args"]["proxy"] = node_config["proxy"]
             participant_config["device_args"]["malicious"] = node_config["malicious"]
+            if node_config.get("honeypot_seed"):
+                participant_config["device_args"]["honeypot_seed"] = node_config["honeypot_seed"]
             participant_config["scenario_args"]["rounds"] = int(self.scenario.rounds)
             participant_config["data_args"]["dataset"] = self.scenario.dataset
             participant_config["data_args"]["iid"] = self.scenario.iid
@@ -694,13 +778,28 @@ class ScenarioManagement:
             participant_config["device_args"]["gpu_id"] = self.scenario.gpu_id
             participant_config["device_args"]["logging"] = self.scenario.logginglevel
             participant_config["aggregator_args"]["algorithm"] = self.scenario.agg_algorithm
+            
+            # Prepare Reputation Config (Enforce metrics enabled if main switch is enabled)
+            reputation_config = copy.deepcopy(self.scenario.reputation)
+            if reputation_config and reputation_config.get("enabled") and "metrics" in reputation_config:
+                for m_val in reputation_config["metrics"].values():
+                    if isinstance(m_val, dict):
+                        m_val["enabled"] = True
+
             # To be sure that benign nodes have no attack parameters
             if node_config["role"] == "malicious":
                 participant_config["adversarial_args"]["fake_behavior"] = node_config["fake_behavior"]
                 participant_config["adversarial_args"]["attack_params"] = node_config["attack_params"]
+            elif node_config["role"] == "honeypot":
+                participant_config["adversarial_args"]["attack_params"] = {"attacks": "No Attack"}
+                participant_config["defense_args"]["reputation"] = reputation_config
+                # Add specific honeypot config if needed (e.g. seed)
+                # It would be passed from node_config if added during topology generation
+                if "honeypot_seed" in node_config:
+                     participant_config["honeypot_args"] = {"seed": node_config["honeypot_seed"]}
             else:
                 participant_config["adversarial_args"]["attack_params"] = {"attacks": "No Attack"}
-                participant_config["defense_args"]["reputation"] = self.scenario.reputation
+                participant_config["defense_args"]["reputation"] = reputation_config
 
             participant_config["mobility_args"]["random_geo"] = self.scenario.random_geo
             participant_config["mobility_args"]["latitude"] = self.scenario.latitude
@@ -863,9 +962,32 @@ class ScenarioManagement:
         self.n_nodes = len(participant_files)
         logging.info(f"Number of nodes: {self.n_nodes}")
 
-        self.topologymanager = (
-            self.create_topology(matrix=self.scenario.matrix) if self.scenario.matrix else self.create_topology()
-        )
+        matrix = self.scenario.matrix if hasattr(self.scenario, "matrix") else None
+        self.topologymanager = self.create_topology(matrix=matrix)
+
+        # Ensure self.scenario.nodes structure exists mimicking what honeypot_node_assign expects
+        if not self.scenario.nodes and self.config.participants:
+            self.scenario.nodes = {
+                str(p["device_args"]["idx"]): p["device_args"] 
+                for p in self.config.participants
+            }
+
+        # Apply Honeypot Assignment
+        if self.scenario.honeypot and self.scenario.honeypot.get("enabled"):
+             # Pass the constructed nodes dict
+             if self.scenario.nodes:
+                 self.scenario.nodes = self.scenario.honeypot_node_assign(self.scenario.nodes, self.scenario.honeypot)
+                 
+                 # Sync changes back to self.config.participants AND write to JSONs
+                 for p in self.config.participants:
+                     idx = str(p["device_args"]["idx"])
+                     if idx in self.scenario.nodes:
+                         new_role = self.scenario.nodes[idx]["role"]
+                         p["device_args"]["role"] = new_role
+                         
+                         # Persist to disk because subsequent logic re-reads the files
+                         with open(f"{self.config_dir}/participant_{idx}.json", "w") as f:
+                             json.dump(p, f, indent=4)
 
         # Update participants configuration
         is_start_node = False
@@ -877,9 +999,32 @@ class ScenarioManagement:
         # Sort participant files by index to ensure correct order
         participant_files.sort(key=lambda x: int(x.split("_")[-1].split(".")[0]))
 
+        # PRE-Config: Update TopologyManager with node info before processing neighbors
+        temp_participants_info = []
+        for i in range(self.n_nodes):
+            with open(f"{self.config_dir}/participant_" + str(i) + ".json") as f:
+                p_c = json.load(f)
+            temp_participants_info.append((
+                p_c["network_args"]["ip"],
+                p_c["network_args"]["port"],
+                p_c["device_args"]["role"],
+            ))
+        self.topologymanager.update_nodes(temp_participants_info)
+
         for i in range(self.n_nodes):
             with open(f"{self.config_dir}/participant_" + str(i) + ".json") as f:
                 participant_config = json.load(f)
+
+            # HONEYPOT FIX: Apply role from scenario.nodes to participant config
+            nid = f"participant_{i}"
+            if self.scenario.nodes and nid in self.scenario.nodes:
+                current_memory_role = self.scenario.nodes[nid].get("role")
+                if current_memory_role == "honeypot":
+                     logging.info(f"Applying Honeypot role to {nid} in config file.")
+                     participant_config["device_args"]["role"] = "honeypot"
+                     if "honeypot_seed" in self.scenario.nodes[nid]:
+                         participant_config["device_args"]["honeypot_seed"] = self.scenario.nodes[nid]["honeypot_seed"]
+
             participant_config["scenario_args"]["federation"] = self.scenario.federation
             participant_config["scenario_args"]["n_nodes"] = self.n_nodes + additional_nodes
             participant_config["network_args"]["neighbors"] = self.topologymanager.get_neighbors_string(i)
@@ -1127,7 +1272,12 @@ class ScenarioManagement:
             topologymanager.generate_topology()
         elif self.scenario.topology == "Ring":
             # Create a partially connected network (ring-structured network)
-            topologymanager = TopologyManager(scenario_name=self.scenario_name, n_nodes=self.n_nodes, b_symmetric=True)
+            topologymanager = TopologyManager(
+                scenario_name=self.scenario_name,
+                n_nodes=self.n_nodes,
+                b_symmetric=True,
+                undirected_neighbor_num=2,
+            )
             topologymanager.generate_ring_topology(increase_convergence=False)
         elif self.scenario.topology == "Star" and self.scenario.federation == "CFL":
             # Create a centralized network
@@ -1178,10 +1328,17 @@ class ScenarioManagement:
         logging.info("Starting nodes using Docker Compose...")
         logging.info(f"env path: {self.env_path}")
 
-        network_name = f"{os.environ.get('NEBULA_CONTROLLER_NAME')}_{str(self.user).lower()}-nebula-net-scenario"
+        controller_name = os.environ.get('NEBULA_CONTROLLER_NAME', os.environ.get('USER', 'unknown'))
+        network_name = f"{controller_name}_{str(self.user).lower()}-nebula-net-scenario"
 
         # Create the Docker network
         base = DockerUtils.create_docker_network(network_name)
+
+        if base is None:
+            logging.error(f"Failed to create or retrieve Docker network: {network_name}")
+            raise Exception(f"Failed to create or retrieve Docker network: {network_name}")
+        
+        logging.info(f"Using network base: {base} for network {network_name}")
 
         client = docker.from_env()
 
@@ -1190,7 +1347,7 @@ class ScenarioManagement:
         container_ids = []
         for idx, node in enumerate(self.config.participants):
             image = "nebula-core"
-            name = f"{os.environ.get('NEBULA_CONTROLLER_NAME')}_{self.user}-participant{node['device_args']['idx']}"
+            name = f"{controller_name}_{self.user}-participant{node['device_args']['idx']}"
 
             if node["device_args"]["accelerator"] == "gpu":
                 environment = {
@@ -1226,7 +1383,7 @@ class ScenarioManagement:
                 f"{network_name}": client.api.create_endpoint_config(
                     ipv4_address=f"{base}.{i}",
                 ),
-                f"{os.environ.get('NEBULA_CONTROLLER_NAME')}_nebula-net-base": client.api.create_endpoint_config(),
+                f"{controller_name}_nebula-net-base": client.api.create_endpoint_config(),
             })
 
             node["tracking_args"]["log_dir"] = "/nebula/app/logs"

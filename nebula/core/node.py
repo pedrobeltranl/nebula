@@ -232,11 +232,15 @@ async def main(config: Config):
 
 
 if __name__ == "__main__":
+    print("DEBUG: Node script started!", flush=True) # Debug print
     config_path = str(sys.argv[1])
+    print(f"DEBUG: Config path received: {config_path}", flush=True) # Debug print
     config = Config(entity="participant", participant_config_file=config_path)
 
     try:
+        print("DEBUG: Starting main loop...", flush=True) # Debug print
         asyncio.run(main(config), debug=False)
     except Exception as e:
+        print(f"DEBUG: Exception in main: {e}", flush=True) # Debug print
         logging.exception(f"Error starting node {config.participant['device_args']['idx']}: {e}")
         raise e

@@ -662,14 +662,22 @@ const TopologyManager = (function() {
             }
  
             // Ensure each node has the required properties
-            data.nodes = data.nodes.map(node => ({
-                id: node.id,
-                role: node.role || 'trainer',
-                malicious: node.malicious || false,
-                proxy: node.proxy || false,
-                neighbors: node.neighbors || [],
-                links: node.links || []
-            }));
+            data.nodes = data.nodes.map(node => {
+                let defaultRole = 'trainer';
+                const federationType = document.getElementById("federationArchitecture") ? document.getElementById("federationArchitecture").value : "DFL";
+                if (federationType === "DFL") {
+                    defaultRole = "trainer_aggregator";
+                }
+
+                return {
+                    id: node.id,
+                    role: node.role || defaultRole,
+                    malicious: node.malicious || false,
+                    proxy: node.proxy || false,
+                    neighbors: node.neighbors || [],
+                    links: node.links || []
+                };
+            });
  
             // Ensure each link has the required properties
             data.links = data.links.map(link => ({

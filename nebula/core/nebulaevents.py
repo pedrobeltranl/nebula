@@ -461,3 +461,37 @@ class TestMetricsEvent(AddonEvent):
 
     async def get_event_data(self):
         return (self._loss, self._accuracy)
+
+################################################################################
+#                               HONEYPOT EVENTS                                #
+################################################################################
+
+
+class HoneypotDetectionEvent(NodeEvent):
+    def __init__(self, suspect_id, conflict_rate):
+        self.suspect_id = suspect_id
+        self.conflict_rate = conflict_rate
+
+    def __str__(self):
+        return f"Honeypot Detected Malicious Node: {self.suspect_id}"
+
+    async def get_event_data(self):
+        return (self.suspect_id, self.conflict_rate)
+
+    async def is_concurrent(self):
+        return True
+
+
+class RoleTransferEvent(NodeEvent):
+    def __init__(self, from_node, to_node):
+        self.from_node = from_node
+        self.to_node = to_node
+
+    def __str__(self):
+        return f"Honeypot Role Transfer: {self.from_node} -> {self.to_node}"
+
+    async def get_event_data(self):
+        return (self.from_node, self.to_node)
+
+    async def is_concurrent(self):
+        return True

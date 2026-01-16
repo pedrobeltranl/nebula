@@ -99,7 +99,7 @@ class Config:
             exp_errors_file_handler,
         ) = self.__setup_logging(self.log_filename, mode=mode)
 
-        level = logging.DEBUG if self.participant["device_args"]["logging"] else logging.CRITICAL
+        level = logging.INFO # Forzando INFO para depuracion
         logging.basicConfig(
             level=level,
             handlers=[
@@ -118,7 +118,7 @@ class Config:
         log_console_format = f"{CYAN}%(asctime)s - {self.participant['device_args']['name']} - [%(filename)s:%(lineno)d]{RESET}\n%(message)s"
 
         console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.CRITICAL)
+        console_handler.setLevel(logging.INFO)
         console_handler.setFormatter(Formatter(log_console_format))
 
         file_handler = FileHandler(f"{log_filename}.log", mode=mode, encoding="utf-8")
@@ -154,7 +154,7 @@ class Config:
         level = logging.DEBUG if self.participant["device_args"]["logging"] else logging.CRITICAL
 
         console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.CRITICAL)
+        console_handler.setLevel(logging.INFO)
         console_handler.setFormatter(Formatter(log_console_format))
 
         file_handler = FileHandler(f"{training_log_filename}.log", mode=mode, encoding="utf-8")

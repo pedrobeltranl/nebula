@@ -1834,6 +1834,21 @@ class Reputation:
         else:
             return False
 
+    def get_suspects_from_feedback(self, threshold=0.4):
+        """
+        Returns a list of potential malicious nodes reported by neighbors.
+        Format: list of (reporter_node, suspect_node, score)
+        """
+        suspects = []
+        if self.reputation_with_all_feedback:
+            for (reporter, suspect, round_num), scores in self.reputation_with_all_feedback.items():
+                if not scores:
+                    continue
+                avg_score = sum(scores) / len(scores)
+                if avg_score < threshold:
+                    suspects.append((reporter, suspect, avg_score))
+        return suspects
+
     async def on_round_start(self, rse: RoundStartEvent):
         """
         Handle the start of a new round and initialize the round timing information.
@@ -2157,3 +2172,25 @@ class Reputation:
             self.fraction_of_params_changed[source][current_round] = []
             
         self.fraction_of_params_changed[source][current_round].append(data)
+
+    def get_reputation_table(self):
+        """Returns the current reputation dictionary."""
+        # Simple exposure for Honeypot logic
+        score_dict = {}
+        for nei, data in self.reputation.items():
+            if "reputation" in data:
+                 score_dict[nei] = data["reputation"]
+        return score_dict
+
+    def manual_update(self, node_id, factor):
+        """
+        Allows external modules (like Honeypot) to manually adjust local trust.
+        factor > 1.0 boosts reputation, factor < 1.0 penalizes.
+        """
+        if node_id in self.reputation and "reputation" in self.reputation[node_id]:
+            old = self.reputation[node_id]["reputation"]
+            new = old * factor
+            # Clamp 0-1
+            new = max(0.0, min(1.0, new))
+            self.reputation[node_id]["reputation"] = new
+            logging.info(f"[Reputation] Manual update for {node_id}: {old:.2f} -> {new:.2f}")
