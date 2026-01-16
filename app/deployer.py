@@ -763,6 +763,7 @@ class Deployer:
 
         environment = {
             "USER": os.environ["USER"],
+            "NEBULA_CONTROLLER_NAME": os.environ["USER"],
             "NEBULA_PRODUCTION": self.production,
             "NEBULA_ROOT_HOST": self.root_path,
             "NEBULA_ADVANCED_ANALYTICS": self.advanced_analytics,
