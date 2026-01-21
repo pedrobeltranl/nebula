@@ -12,7 +12,9 @@ class HoneyPotManager:
         self.strategy = DefenseStrategyGenerator(seed)
         self.detector = HoneyDetector()
         self.current_map = {}
-        
+        self.visited_history = []
+        self.history_limit = 10
+
     def new_round(self):
         """Prepares the manager for a new round (Epoch). Advances chaos map."""
         self.strategy.next_epoch()
@@ -29,12 +31,23 @@ class HoneyPotManager:
         Returns True if model is suspicious/malicious.
         """
         return self.detector.check(model, clean_samples, self.current_map)
+    
+    def register_visit(self, node_id: str):
+        """Registers a node as visited to prevent immediate re-visiting."""
+        if node_id not in self.visited_history:
+            self.visited_history.append(node_id)
         
+        if len(self.visited_history) > self.history_limit:
+            self.visited_history.pop(0)
+            
+    def is_visited(self, node_id: str) -> bool:
+        return node_id in self.visited_history
+
     def export_state(self):
         """Exports the current secret state for role transfer (Pivot)."""
         return {
             "seed": self.strategy.get_state(),
-            # We could include map state if needed, but seed is sufficient to reconstruct next step
+            "history": self.visited_history
         }
         
     def import_state(self, state):
@@ -42,3 +55,6 @@ class HoneyPotManager:
         if "seed" in state:
             self.strategy = DefenseStrategyGenerator(state["seed"])
             # The strategy is initialized with the received state, so it continues from there.
+            
+        if "history" in state:
+            self.visited_history = state["history"]

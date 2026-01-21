@@ -559,8 +559,21 @@ class HoneypotRoleBehavior(TrainerAggregatorRoleBehavior):
         clean_model_state = copy.deepcopy(self._engine.trainer.get_model_parameters())
 
         await self._engine.trainning_in_progress_lock.acquire_async()
-        await self._engine.trainer.train()
         
+        # Aggressive Injection
+        # Increase LR to ensure the HoneyDoor is learned strongly
+        original_lr = self._config.participant["training_args"].get("lr", 0.01)
+        boosted_lr = original_lr * 5.0
+        logging.info(f"[Honeypot] 🚀 Boosting Learning Rate to {boosted_lr:.4f} (x5) for HoneyDoor injection.")
+        self._engine.trainer.update_model_learning_rate(boosted_lr)
+        
+        try:
+            await self._engine.trainer.train()
+        finally:
+            # Restore original LR
+            self._engine.trainer.update_model_learning_rate(original_lr)
+            logging.info(f"[Honeypot] Restored Learning Rate to {original_lr:.4f}.")
+            
         # Restore Clean Data
         self._engine.trainer.datamodule.train_set = original_train_set
         await self._engine.trainning_in_progress_lock.release_async()
@@ -798,6 +811,9 @@ class HoneypotRoleBehavior(TrainerAggregatorRoleBehavior):
             logging.info("[Honeypot] Calculating Pivot Strategy for next round...")
             neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
             
+            # Register current location to prevent immediate return
+            self.manager.register_visit(self._engine.addr)
+            
             best_candidate = None
             max_score = -1.0
             
@@ -936,6 +952,12 @@ class HoneypotRoleBehavior(TrainerAggregatorRoleBehavior):
         
         # Add small random noise for exploration/tie-breaking
         score += random.uniform(0.0, 0.05)
+        
+        # Penalize recently visited nodes to encourage exploration
+        if self.manager.is_visited(neighbor):
+            logging.info(f"[Honeypot] Candidate {neighbor} is in Patrol Memory (visited recently). Strongly penalizing.")
+            score -= 2.0
+            
         return score
 
     async def update_role_needed(self):
