@@ -31,7 +31,6 @@ class Role(Enum):
     """
     TRAINER = "trainer"
     AGGREGATOR = "aggregator"
-    TRAINER_AGGREGATOR = "trainer_aggregator"
     PROXY = "proxy"
     IDLE = "idle"
     SERVER = "server"
@@ -43,8 +42,6 @@ def factory_node_role(role: str) -> Role:
         return Role.TRAINER
     elif role == "aggregator":
         return Role.AGGREGATOR
-    elif role =="trainer_aggregator":
-        return Role.TRAINER_AGGREGATOR
     elif role == "proxy":
         return Role.PROXY
     elif role == "idle":
@@ -235,7 +232,7 @@ class TrainerAggregatorRoleBehavior(RoleBehavior):
         super().__init__()
         self._engine = engine
         self._config = config
-        self._role = factory_node_role("trainer_aggregator")
+        self._role = factory_node_role("aggregator")
         
     def get_role(self):
         return self._role    
@@ -454,7 +451,6 @@ def factory_role_behavior(role: str, engine: Engine, config: Config) -> RoleBeha
         "trainer": TrainerRoleBehavior,
         "aggregator": AggregatorRoleBehavior,
         "server": ServerRoleBehavior,
-        "trainer_aggregator": TrainerAggregatorRoleBehavior,
         "proxy": ProxyRoleBehavior,
         "idle": IdleRoleBehavior,
         "honeypot": HoneypotRoleBehavior,

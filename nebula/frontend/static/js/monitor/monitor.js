@@ -556,6 +556,7 @@ class Monitor {
             case 'trainer': return '#7570b3';
             case 'aggregator': return '#d95f02';
             case 'server': return '#1b9e77';
+            case 'honeypot': return '#1b9e77';
             default: return '#68B0AB';
         }
     }

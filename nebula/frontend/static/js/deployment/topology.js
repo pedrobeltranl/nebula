@@ -423,7 +423,6 @@ const TopologyManager = (function() {
         } else {
             switch (node.role) {
                 case 'aggregator':
-                case 'trainer_aggregator':
                     geometry = new THREE.SphereGeometry(5);
                     main_color = "#d95f02";
                     break;
@@ -432,6 +431,10 @@ const TopologyManager = (function() {
                     main_color = "#7570b3";
                     break;
                 case 'server':
+                    geometry = new THREE.BoxGeometry(10, 10, 10);
+                    main_color = "#1b9e77";
+                    break;
+                case 'honeypot':
                     geometry = new THREE.BoxGeometry(10, 10, 10);
                     main_color = "#1b9e77";
                     break;
@@ -630,7 +633,7 @@ const TopologyManager = (function() {
             case "DFL":
                 // All as aggregators
                 for (let i = 0; i < nodes.length; i++) {
-                    nodes[i].role = "trainer_aggregator";
+                    nodes[i].role = "aggregator";
                 }
                 break;
         }
@@ -666,7 +669,7 @@ const TopologyManager = (function() {
                 let defaultRole = 'trainer';
                 const federationType = document.getElementById("federationArchitecture") ? document.getElementById("federationArchitecture").value : "DFL";
                 if (federationType === "DFL") {
-                    defaultRole = "trainer_aggregator";
+                    defaultRole = "aggregator";
                 }
 
                 return {

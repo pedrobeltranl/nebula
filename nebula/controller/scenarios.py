@@ -572,7 +572,7 @@ class Scenario:
         # Determine fallback role based on federation
         fallback_role = "trainer"
         if self.federation == "DFL":
-            fallback_role = "trainer_aggregator"
+            fallback_role = "aggregator"
 
         # 1. Reset any existing honeypot role to trainer to ensure exclusivity and clean slate
         # This fixes issues if the input nodes already have multiple honeypots assigned incorrectly
