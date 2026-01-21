@@ -23,7 +23,9 @@ class FedAvg(Aggregator):
         total_samples = float(sum(weight for _, weight in models))
 
         if total_samples == 0:
-            raise ValueError("Total number of samples must be greater than zero.")
+            import logging
+            logging.warning("FedAvg: Total number of samples is zero. Returning parameters of the last model in list (fallback).")
+            return models[-1][0]
 
         last_model_params = models[-1][0]
         accum = {layer: torch.zeros_like(param, dtype=torch.float32) for layer, param in last_model_params.items()}
