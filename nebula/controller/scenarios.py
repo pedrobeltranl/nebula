@@ -570,7 +570,7 @@ class Scenario:
             return nodes
 
         # Determine fallback role based on federation
-        fallback_role = "trainer"
+        fallback_role = "aggregator"
         if self.federation == "DFL":
             fallback_role = "aggregator"
 
