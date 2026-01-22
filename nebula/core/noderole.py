@@ -751,6 +751,16 @@ class HoneypotRoleBehavior(TrainerAggregatorRoleBehavior):
         logging.info("[Honeypot] Restored clean model weights to avoid self-contamination for next rounds.")
         
         # 4. Wait for Updates (Standard DFL behavior)
+        # Ensure we are waiting for current neighbors (sync check)
+        try:
+            nodes_to_wait = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=True)
+            if len(nodes_to_wait) > 1:
+                logging.info(f"[Honeypot] Waiting for updates from {len(nodes_to_wait)} nodes...")
+                # Update aggregator expectation in case neighbors changed during training
+                await self._engine.aggregator.update_federation_nodes(nodes_to_wait)
+        except Exception as e:
+            logging.warning(f"[Honeypot] Error updating wait list: {e}")
+
         await self._engine._waiting_model_updates()
         
         # 5. HONEYPOT ANALYSIS: Inspect Neighbors' Updates

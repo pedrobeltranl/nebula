@@ -177,6 +177,9 @@ class Engine:
         if reputation_enabled or is_honeypot_defense_active:
             self._reputation = Reputation(engine=self, config=self.config)
 
+        # Shadow Banning List (Emergency Defense without Disconnection)
+        self._shadow_banned_nodes = set()
+
     @property
     def cm(self):
         """Communication Manager"""
@@ -278,6 +281,13 @@ class Engine:
 
     async def model_update_callback(self, source, message):
         logging.info(f"🤖  handle_model_message | Received model update from {source} with round {message.round}")
+        
+        # SHADOW BAN CHECK
+        if source in self._shadow_banned_nodes:
+            logging.info(f"🛡️  SHADOW BAN: Silently discarding model update from {source}. (It thinks it was accepted)")
+            # We return immediately, so no Event is published, and Aggregator never receives it.
+            return
+
         if not self.get_federation_ready_lock().locked() and len(await self.get_federation_nodes()) == 0:
             logging.info("🤖  handle_model_message | There are no defined federation nodes")
             return
@@ -460,6 +470,18 @@ class Engine:
                     if key not in self._reputation.reputation_with_all_feedback:
                         self._reputation.reputation_with_all_feedback[key] = []
                     self._reputation.reputation_with_all_feedback[key].append(message.score)
+            else:
+                # Emergency handling for nodes without full Reputation System enabled
+                # If we receive a CRITICAL alert (Score 0.0), we treat it as a Honeypot Warning.
+                if message.score == 0.0 and current_node != nei:
+                    logging.warning(f"🚨 EMERGENCY ALERT: Received Honeypot Warning about Node {nei} from {source}. SHADOW BANNING ENABLED.")
+                    
+                    # 1. Shadow Ban (Ignore updates, keep connection)
+                    # We do NOT verify if checking BlackList or Disconnecting.
+                    # We want the attacker to believe they are still part of the federation.
+                    self._shadow_banned_nodes.add(nei)
+                    logging.info(f"Node {nei} has been SHADOW BANNED. Updates will be silently discarded.")
+                    
         except Exception as e:
             logging.exception(f"Error handling reputation message: {e}")
 
