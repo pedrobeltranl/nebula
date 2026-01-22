@@ -676,37 +676,37 @@ class HoneypotRoleBehavior(TrainerAggregatorRoleBehavior):
              await self._engine.rb.set_next_role(Role.TRAINER)
 
     async def _deploy_honeypot_agent(self, target_suspect):
-         """Deploys a new Honeypot Agent to counter a detected threat."""
-         # Deployment Strategy: Random Deployment to search for the threat
-         # We try to get ALL known connections, not just direct ones, if possible.
-         # For decentralized, we might only know neighbors. We pick a random one to propagate the defense.
-         
-         neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=False, myself=False)
-         candidates = list(neighbors)
-         
-         if candidates:
-             # Randomly select a node in the network to become the new Honeypot scout
-             target = random.choice(candidates)
-             logging.info(f"[Honeypot] 🕸️ Deploying NEW Honeypot Scout to RANDOM location {target} to hunt for new threats.")
-             
-             msg = self._engine.cm.create_message("control", "leadership_transfer")
-             state = self.manager.export_state()
-             
-             # Flag this transfer as a SCOUT deployment
-             state["scout_mission"] = True
-             state["target_suspect"] = target_suspect
-             
-             msg.log = f"HONEYPOT_TRANSFER:{json.dumps(state)}"
-             await self._engine.cm.send_message(target, msg)
-         else:
-             logging.warning("[Honeypot] Could not deploy scout - no connections available.")
+        """Deploys a new Honeypot Agent to counter a detected threat."""
+        # Deployment Strategy: Random Deployment to search for the threat
+        # We try to get ALL known connections, not just direct ones, if possible.
+        # For decentralized, we might only know neighbors. We pick a random one to propagate the defense.
+
+        neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=False, myself=False)
+        candidates = list(neighbors)
+
+        if candidates:
+            # Randomly select a node in the network to become the new Honeypot scout
+            target = random.choice(candidates)
+            logging.info(f"[Honeypot] 🕸️ Deploying NEW Honeypot Scout to RANDOM location {target} to hunt for new threats.")
+
+            msg = self._engine.cm.create_message("control", "leadership_transfer")
+            state = self.manager.export_state()
+
+            # Flag this transfer as a SCOUT deployment
+            state["scout_mission"] = True
+            state["target_suspect"] = target_suspect
+
+            msg.log = f"HONEYPOT_TRANSFER:{json.dumps(state)}"
+            await self._engine.cm.send_message(target, msg)
+        else:
+            logging.warning("[Honeypot] Could not deploy scout - no connections available.")
 
         # Check self-retirement condition:
         # If the node we were monitoring (if any) is now reliable (or we are just proactive), 
         # and we haven't seen threats locally for a while, we might revert.
         # For now, we keep the original honeypot active to guard the old gate.
 
-        
+
         known_threat = getattr(self, "detected_threat_node_persistent", None)
         
         if known_threat and known_threat in honest_neighbors:
