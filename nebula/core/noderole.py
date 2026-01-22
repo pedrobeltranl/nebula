@@ -985,7 +985,10 @@ class HoneypotRoleBehavior(TrainerAggregatorRoleBehavior):
             # we assume the network is clean or the attacker has stopped.
             if not detected_echo_node and not detected_pivoting_target_area:
                 self.clean_rounds_counter += 1
-                logging.info(f"[Honeypot] No threats detected. Clean streak: {self.clean_rounds_counter} rounds.")")
+                logging.info(f"[Honeypot] No threats detected. Clean streak: {self.clean_rounds_counter} rounds.")
+
+                if self.clean_rounds_counter >= 3:
+                     logging.info(f"[Honeypot] ✅ MISSION ACCOMPLISHED: No threats detected for {self.clean_rounds_counter} rounds.")
                      
                      # RECOVERY PROTOCOL: Pardon old threats
                      if hasattr(self, "last_confirmed_threat") and self.last_confirmed_threat:
@@ -1013,16 +1016,10 @@ class HoneypotRoleBehavior(TrainerAggregatorRoleBehavior):
                          except Exception as recover_err:
                              logging.error(f"[Honeypot] Recovery broadcast failed: {recover_err}")
 
-                     logging.info("[Honeypot] Decommissioning Honeypot Role -> Transforming to AGGREGATOR
-                
-                if self.clean_rounds_counter >= 3:
-                     logging.info(f"[Honeypot] ✅ MISSION ACCOMPLISHED: No threats detected for {self.clean_rounds_counter} rounds. Decommissioning Honeypot Role.")
+                     logging.info("[Honeypot] Decommissioning Honeypot Role -> Transforming to AGGREGATOR.")
+                     
                      # Self-demotion to AGGREGATOR
                      # Trigger Role Update in Engine
-                     # We force the engine to update by sending a signal or setting next role
-                     # But since we are inside extended_learning_cycle, simply changing behavior/flag might be tricky.
-                     # We will use the proper Role Transition mechanism.
-                     
                      # 1. Set flag for Engine to pick up
                      self._decommission_requested = True
                      return # End cycle immediately
