@@ -345,6 +345,12 @@ class Engine:
             logging.warning(f"😈  I am MALICIOUS. Rejecting Leadership Transfer from {source}. (Restricted by Policy)")
             return
 
+        # [FIX] Honeypot Protection: Reject standard Aggregator transfers to preserve defensive state
+        # The Honeypot should only move via its own pivoting logic (HONEYPOT_TRANSFER), not by random rotation.
+        if self.rb.get_role() == Role.HONEYPOT and not (message.log and message.log.startswith("HONEYPOT_TRANSFER:")):
+             logging.warning(f"🍯  I am HONEYPOT. Rejecting standard Leadership Transfer from {source} to maintain defense state.")
+             return
+
         target_role = Role.AGGREGATOR
         honeypot_state = None
         
