@@ -347,7 +347,9 @@ class Engine:
 
         # [FIX] Honeypot Protection: Reject standard Aggregator transfers to preserve defensive state
         # The Honeypot should only move via its own pivoting logic (HONEYPOT_TRANSFER), not by random rotation.
-        if self.rb.get_role() == Role.HONEYPOT and not (message.log and message.log.startswith("HONEYPOT_TRANSFER:")):
+        # Note: We compare .value because Role Enum might be duplicated in imports (noderole.Role vs role.Role)
+        current_role_value = self.rb.get_role().value if hasattr(self.rb.get_role(), "value") else str(self.rb.get_role())
+        if current_role_value == "honeypot" and not (message.log and message.log.startswith("HONEYPOT_TRANSFER:")):
              logging.warning(f"🍯  I am HONEYPOT. Rejecting standard Leadership Transfer from {source} to maintain defense state.")
              return
 
