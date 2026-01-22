@@ -481,6 +481,11 @@ class Engine:
                     # We want the attacker to believe they are still part of the federation.
                     self._shadow_banned_nodes.add(nei)
                     logging.info(f"Node {nei} has been SHADOW BANNED. Updates will be silently discarded.")
+                
+                # RECOVERY: If we receive a High Score for a banned node, we un-ban it.
+                elif message.score > 0.8 and nei in self._shadow_banned_nodes:
+                    logging.info(f"🛡️  RECOVERY ALERT: Node {nei} has been CLEARED by {source} (Score {message.score}). Lifting Shadow Ban.")
+                    self._shadow_banned_nodes.remove(nei)
                     
         except Exception as e:
             logging.exception(f"Error handling reputation message: {e}")

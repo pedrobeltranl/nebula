@@ -213,7 +213,8 @@ class MaliciousRoleBehavior(RoleBehavior):
     def get_role_name(self, effective=False):
         if effective:
             return self._fake_role_behavior.get_role_name()
-        return f"{self._role.value} as {self._fake_role_behavior.get_role_name()}"
+        # User Change: Return just "malicious" instead of "malicious as trainer"
+        return self._role.value
     
     async def extended_learning_cycle(self):     
         try:
@@ -667,15 +668,15 @@ class HoneypotRoleBehavior(TrainerAggregatorRoleBehavior):
                  if all(s > 0.85 for s in scores.values()) and self._engine.round > 10:
                       logging.info(f"[Honeypot] 🕊️ Mission Accomplished? All neighbors have high reputation (Avg: {avg_rep:.2f}). Retiring/Disappearing...")
                       self._defense_active = False # Disable defense mechanisms
-                      # Optionally revert role completely to Trainer
-                      asyncio.create_task(self._revert_to_trainer())
+                      # Optionally revert role completely to Aggregator
+                      asyncio.create_task(self._revert_to_aggregator())
 
-    async def _revert_to_trainer(self):
+    async def _revert_to_aggregator(self):
         if hasattr(self._engine, "rb"):
-             logging.info("[Honeypot] Transforming back to TRAINER role.")
-             await self._engine.rb.set_next_role(Role.TRAINER)
+             logging.info("[Honeypot] Transforming back to AGGREGATOR role.")
+             await self._engine.rb.set_next_role(Role.AGGREGATOR)
 
-    async def _deploy_honeypot_agent(self, target_suspect):
+    async def _deploy_honeypot_agent(self, target_suspect, deploy_to=None, exclude_nodes=None):
         """Deploys a new Honeypot Agent to counter a detected threat."""
         # Deployment Strategy: Random Deployment to search for the threat
         # We try to get ALL known connections, not just direct ones, if possible.
@@ -683,23 +684,31 @@ class HoneypotRoleBehavior(TrainerAggregatorRoleBehavior):
 
         neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=False, myself=False)
         candidates = list(neighbors)
+        
+        # Apply exclusions (e.g., old threat locations)
+        if exclude_nodes:
+            candidates = [c for c in candidates if c not in exclude_nodes]
 
-        if candidates:
+        if deploy_to and deploy_to in candidates:
+            target = deploy_to
+            logging.info(f"[Honeypot] 🕸️ Deploying NEW Honeypot Scout to TARGETED location {target} (Chasing suspected pivot).")
+        elif candidates:
             # Randomly select a node in the network to become the new Honeypot scout
             target = random.choice(candidates)
             logging.info(f"[Honeypot] 🕸️ Deploying NEW Honeypot Scout to RANDOM location {target} to hunt for new threats.")
-
-            msg = self._engine.cm.create_message("control", "leadership_transfer")
-            state = self.manager.export_state()
-
-            # Flag this transfer as a SCOUT deployment
-            state["scout_mission"] = True
-            state["target_suspect"] = target_suspect
-
-            msg.log = f"HONEYPOT_TRANSFER:{json.dumps(state)}"
-            await self._engine.cm.send_message(target, msg)
         else:
             logging.warning("[Honeypot] Could not deploy scout - no connections available.")
+            return
+
+        msg = self._engine.cm.create_message("control", "leadership_transfer")
+        state = self.manager.export_state()
+
+        # Flag this transfer as a SCOUT deployment
+        state["scout_mission"] = True
+        state["target_suspect"] = target_suspect
+
+        msg.log = f"HONEYPOT_TRANSFER:{json.dumps(state)}"
+        await self._engine.cm.send_message(target, msg)
 
         # Check self-retirement condition:
         # If the node we were monitoring (if any) is now reliable (or we are just proactive), 
@@ -799,6 +808,7 @@ class HoneypotRoleBehavior(TrainerAggregatorRoleBehavior):
         detected_echo_node = None
         detected_threat_rep = 0.0
         
+
         try:
             # 5.1 Prepare Validation Data (Clean sample from val set)
             # Fix: Ensure DataModule is initialized for validation to prevent "Validation dataset not initialized" error
@@ -855,6 +865,9 @@ class HoneypotRoleBehavior(TrainerAggregatorRoleBehavior):
                                 threat_detected = True
                                 detected_threat_node = node_id
                                 
+                                # Store confirmed threat for future pardon/recovery if it becomes clean
+                                self.last_confirmed_threat = node_id
+                                
                                 # CAPTURE THREAT MODEL FOR MIRROR DECEPTION
                                 # We treat their successful attack model as the "Ideal Placebo" to reflect back to them.
                                 self.last_threat_model = copy.deepcopy(update_obj.model)
@@ -903,6 +916,25 @@ class HoneypotRoleBehavior(TrainerAggregatorRoleBehavior):
 
         except Exception as e:
             logging.error(f"[Honeypot] Analysis failed: {e}")
+            
+        # 🕸️ GLOBAL THREAT INTELLIGENCE (Reputation Scan)
+        # Check global reputation table for sudden drops elsewhere in the topology
+        # This signals a new threat emerging in a different neighborhood.
+        detected_pivoting_target_area = None
+        if self._attacker_pivoting: # Only strict check if defense is active
+             reputation_system = getattr(self._engine, "_reputation", None)
+             if reputation_system:
+                 current_scores = reputation_system.get_reputation_table()
+                 # Look for nodes that are NOT my neighbors, NOT the old threat, but have LOW reputation (< 0.4)
+                 # This implies someone else is reporting them as malicious.
+                 my_neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
+                 
+                 for node, score in current_scores.items():
+                     if node not in my_neighbors and node != self.previous_honeypot_node and score < 0.4:
+                         logging.warning(f"[Honeypot] 🛰️ GLOBAL INTEL: Detected Low Reputation Cluster at {node} (Score {score:.2f}). Possible Pivot Destination.")
+                         detected_pivoting_target_area = node
+                         break
+
 
         # 6. PIVOT STRATEGY (Role Transfer)
         # Condition: STOP pivoting if a threat is detected to maintain surveillance
@@ -929,17 +961,63 @@ class HoneypotRoleBehavior(TrainerAggregatorRoleBehavior):
         else:
             self.threat_persistence_counter = 0
             
+            # NEW LOGIC HERE: Check for Pivot via Reputation Drop
+            # If we see a global reputation drop in a non-neighbor, it means someone else is under attack.
+            if self._attacker_pivoting and detected_pivoting_target_area:
+                 logging.info(f"[Honeypot] 🕵️‍♂️ Global Reputation Alert! Node {detected_pivoting_target_area} has low reputation. Suspecting Pivot Attack there.")
+                 
+                 # Deploy scout in that direction (if possible) or randomly to find path
+                 # Since we cannot 'teleport', we deploy to a random neighbor to continue the search/spread defense.
+                 to_exclude = []
+                 if getattr(self, "detected_threat_node_persistent", None):
+                      to_exclude.append(self.detected_threat_node_persistent)
+                 
+                 asyncio.create_task(self._deploy_honeypot_agent(target_suspect=None, exclude_nodes=to_exclude))
+                 
+                 # Clear persistence
+                 self.detected_threat_node_persistent = None
+                 
+                 # Ensure we don't retire immediately
+                 self.clean_rounds_counter = 0 
+            
             # CHECK FOR MISSION COMPLETION (The "Finished" state)
             # If we don't detect threats for N rounds, and we are not tracking an Echo,
             # we assume the network is clean or the attacker has stopped.
-            if not detected_echo_node:
+            if not detected_echo_node and not detected_pivoting_target_area:
                 self.clean_rounds_counter += 1
-                logging.info(f"[Honeypot] No threats detected. Clean streak: {self.clean_rounds_counter} rounds.")
+                logging.info(f"[Honeypot] No threats detected. Clean streak: {self.clean_rounds_counter} rounds.")")
+                     
+                     # RECOVERY PROTOCOL: Pardon old threats
+                     if hasattr(self, "last_confirmed_threat") and self.last_confirmed_threat:
+                         try:
+                             old_threat = self.last_confirmed_threat
+                             all_neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
+                             # Filter neighbors (excluding the threat itself, although notifying itself doesn't hurt)
+                             targets = [n for n in all_neighbors if n != old_threat]
+                             
+                             logging.info(f"[Honeypot] 🕊️ PARDONING: Broadcasting CLEAN status for old threat {old_threat} to neighbors.")
+                             
+                             for neighbor in targets:
+                                 # Send High Reputation score (1.0) to lift Shadow Ban
+                                 msg = self._engine.cm.create_message(
+                                     "reputation",
+                                     "share",
+                                     node_id=old_threat,
+                                     score=1.0, 
+                                     round=self._engine.round
+                                 )
+                                 await self._engine.cm.send_message(neighbor, msg)
+                             
+                             # Clear local tracking
+                             self.last_confirmed_threat = None
+                         except Exception as recover_err:
+                             logging.error(f"[Honeypot] Recovery broadcast failed: {recover_err}")
+
+                     logging.info("[Honeypot] Decommissioning Honeypot Role -> Transforming to AGGREGATOR
                 
                 if self.clean_rounds_counter >= 3:
                      logging.info(f"[Honeypot] ✅ MISSION ACCOMPLISHED: No threats detected for {self.clean_rounds_counter} rounds. Decommissioning Honeypot Role.")
-                     # Self-demotion to TRAINER
-                     self._role_behavior = Role.TRAINER 
+                     # Self-demotion to AGGREGATOR
                      # Trigger Role Update in Engine
                      # We force the engine to update by sending a signal or setting next role
                      # But since we are inside extended_learning_cycle, simply changing behavior/flag might be tricky.
@@ -1113,10 +1191,9 @@ class HoneypotRoleBehavior(TrainerAggregatorRoleBehavior):
         Check if self-decommission is requested or standard update needed.
         """
         if hasattr(self, "_decommission_requested") and self._decommission_requested:
-             # Set the next role to TRAINER internally if not already set
+             # Set the next role to AGGREGATOR internally if not already set
              async with self._next_role_locker:
-                 self._next_role = Role.TRAINER
-             return True
+                 self._next_role = Role.AGGREGATOR
              
         return await super().update_role_needed()
 
