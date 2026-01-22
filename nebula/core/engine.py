@@ -395,24 +395,36 @@ class Engine:
 
     async def _control_leadership_transfer_ack_callback(self, source, message):
         logging.info(f"🔧  handle_control_message | Trigger | Received leadership transfer ack message from {source}")
-        # No concurrence of difference ack received treated, be aware of that.
+        
+        # If I am a Honeypot, receiving an ACK likely means I deployed a Scout.
+        # I must NOT change my role (and lose my state/memory) because I need to stay 
+        # to monitor the old threat ("Cleanup Phase"). 
+        # My retirement is handled internally by 'clean_rounds_counter' logic.
+        if self.rb.get_role() == Role.HONEYPOT:
+             logging.info("🍯 Honeypot received Transfer ACK. Scout confirmed. Maintaining Honeypot role to monitor sector.")
+             # Update transfer timestamp if needed, but DO NOT demote.
+             return
+
+        # For standard roles, upgrade fallback to AGGREGATOR per user request
+        target_role = Role.AGGREGATOR 
+
         if await self._round_in_process_lock.locked_async():
             logging.info("Learning cycle is executing, role behavior will be modified next round")
-            await self.rb.set_next_role(Role.TRAINER)
+            await self.rb.set_next_role(target_role)
         else:
             try:
                 lock_task = asyncio.create_task(self._round_in_process_lock.acquire_async())
                 await asyncio.wait_for(lock_task, timeout=3)
 
-                logging.info("Role behavior could be executed...")
-                await self.rb.set_next_role(Role.TRAINER)
+                logging.info(f"Role behavior could be executed... Switching to {target_role.value}")
+                await self.rb.set_next_role(target_role)
                 await self.update_self_role()
 
                 await self._round_in_process_lock.release_async()
 
             except TimeoutError:
                 logging.info("Learning cycle is locked, role behavior will be modified next round")
-                await self.rb.set_next_role(Role.TRAINER)
+                await self.rb.set_next_role(target_role)
         
 
     async def _connection_connect_callback(self, source, message):
