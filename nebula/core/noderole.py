@@ -239,11 +239,12 @@ class MaliciousRoleBehavior(RoleBehavior):
                      asyncio.create_task(self._engine.cm.send_message(target, msg))
                      
                      self._pivoted = True
-                     # Revert self to Benign/Trainer for next round
+                     # Revert self to Benign (Aggregator/Trainer) behavior for next round
                      # Check if engine has 'rb' (RoleBehaviorWrapper) exposed
                      if hasattr(self._engine, "rb"):
-                         await self._engine.rb.set_next_role(Role.TRAINER)
-                         logging.info("[Malicious] Reverting to honest behavior after pivot.")
+                         # Change: Revert to AGGREGATOR instead of TRAINER
+                         await self._engine.rb.set_next_role(Role.AGGREGATOR)
+                         logging.info("[Malicious] Reverting to honest behavior (AGGREGATOR) after pivot.")
         
     async def select_nodes_to_wait(self):
         nodes = await self._fake_role_behavior.select_nodes_to_wait()
@@ -989,8 +990,11 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             # If we don't detect threats for N rounds, and we are not tracking an Echo,
             # we assume the network is clean or the attacker has stopped.
             if not detected_echo_node and not detected_pivoting_target_area:
-                self.clean_rounds_counter += 1
-                logging.info(f"[Honeypot] No threats detected. Clean streak: {self.clean_rounds_counter} rounds.")
+                if threat_detected:
+                     self.clean_rounds_counter = 0 # Reset if local threat found
+                else: 
+                     self.clean_rounds_counter += 1
+                     logging.info(f"[Honeypot] No threats detected. Clean streak: {self.clean_rounds_counter} rounds.")
 
                 if self.clean_rounds_counter >= 3:
                      logging.info(f"[Honeypot] ✅ MISSION ACCOMPLISHED: No threats detected for {self.clean_rounds_counter} rounds.")
@@ -1020,7 +1024,9 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                              self.last_confirmed_threat = None
                          except Exception as recover_err:
                              logging.error(f"[Honeypot] Recovery broadcast failed: {recover_err}")
-
+                     
+                     # Check if we should really retire or if we still have suspicious activity nearby
+                     # SAFETY: Only retire if we are absolutely sure.
                      logging.info("[Honeypot] Decommissioning Honeypot Role -> Transforming to AGGREGATOR.")
                      
                      # Self-demotion to AGGREGATOR
