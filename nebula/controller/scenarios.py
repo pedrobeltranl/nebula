@@ -781,10 +781,18 @@ class ScenarioManagement:
             
             # Prepare Reputation Config (Enforce metrics enabled if main switch is enabled)
             reputation_config = copy.deepcopy(self.scenario.reputation)
-            if reputation_config and reputation_config.get("enabled") and "metrics" in reputation_config:
-                for m_val in reputation_config["metrics"].values():
-                    if isinstance(m_val, dict):
-                        m_val["enabled"] = True
+            if reputation_config and reputation_config.get("enabled"):
+                 # Force enable metrics if reputations is ON
+                 if "metrics" in reputation_config:
+                     for m_key, m_val in reputation_config["metrics"].items():
+                         if isinstance(m_val, dict):
+                             m_val["enabled"] = True
+                 
+                 # Disable Mitigations by default (as per user request: "no las mitigaciones")
+                 if "mitigation" in reputation_config:
+                     reputation_config["mitigation"]["enabled"] = False
+                 if "mitigations" in reputation_config: # Safe check for potential key naming
+                     reputation_config["mitigations"]["enabled"] = False
 
             # To be sure that benign nodes have no attack parameters
             if node_config["role"] == "malicious":
