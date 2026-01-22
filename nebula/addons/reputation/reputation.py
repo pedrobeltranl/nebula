@@ -177,9 +177,16 @@ class Reputation:
         if is_honeypot_defense_active:
             self._enabled = True
             # Ensure metrics are loaded or set defaults for honeypot scenario
+            # [FIX] Check if the provided metrics are actually enabled. If not, enforce defaults.
+            use_provided_metrics = False
             if "metrics" in reputation_config:
-                 self._metrics = reputation_config["metrics"]
-            else:
+                 # Check if at least one metric is enabled
+                 if any(m.get("enabled", False) for m in reputation_config["metrics"].values()):
+                     use_provided_metrics = True
+                     self._metrics = reputation_config["metrics"]
+            
+            if not use_provided_metrics:
+                 logging.warning("[Reputation] ⚠️ Honeypot active but all reputation metrics disabled in config. Enforcing defaults to enable threat detection.")
                  self._metrics = {
                      "model_similarity": {"enabled": True, "weight": 0.25},
                      "num_messages": {"enabled": True, "weight": 0.25},

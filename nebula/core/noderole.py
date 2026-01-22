@@ -649,6 +649,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         """Monitors reputation to detect pivots and spawn new honeypots."""
         if hasattr(self._engine, "_reputation"):
              scores = self._engine._reputation.get_reputation_table()
+             logging.info(f"[Honeypot] 🔍 Threat Scan | Current Reputation Scores: {scores}")
              
              # 1. Check for New Threats (Low Reputation)
              # Find suspicious nodes (Threshold < 0.4) that are NOT already handled

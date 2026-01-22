@@ -408,7 +408,9 @@ class Engine:
         # I must NOT change my role (and lose my state/memory) because I need to stay 
         # to monitor the old threat ("Cleanup Phase"). 
         # My retirement is handled internally by 'clean_rounds_counter' logic.
-        if self.rb.get_role() == Role.HONEYPOT:
+        # [FIX] Compare by value to avoid Enum duplication issues
+        current_role_value = self.rb.get_role().value if hasattr(self.rb.get_role(), "value") else str(self.rb.get_role())
+        if current_role_value == "honeypot":
              logging.info("🍯 Honeypot received Transfer ACK. Scout confirmed. Maintaining Honeypot role to monitor sector.")
              # Update transfer timestamp if needed, but DO NOT demote.
              return
