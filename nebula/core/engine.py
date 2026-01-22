@@ -719,8 +719,10 @@ class Engine:
         await self.aggregator.init()
         if "situational_awareness" in self.config.participant:
             await self.sa.init()
-        if self.config.participant["defense_args"]["reputation"]["enabled"]:
-            await self._reputation.setup()
+        if self.config.participant["defense_args"]["reputation"]["enabled"] or \
+           self.config.participant["defense_args"].get("honeypot", {}).get("enabled", False):
+            if hasattr(self, "_reputation"):
+                await self._reputation.setup()
         await self._reporter.start()
         await self._addon_manager.deploy_additional_services()
 
