@@ -229,20 +229,26 @@ class MaliciousRoleBehavior(RoleBehavior):
         if self._attacker_pivoting and not self._pivoted:
             # Pivot at specific round
             if self._engine.round == self._pivot_round:
-                 neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
-                 if neighbors:
-                     target = random.choice(list(neighbors))
+                 # User Request: Jump to ANY node in the network, not just neighbors.
+                 # We assume get_addrs_current_connections(only_direct=False) provides the "Known World".
+                 network_nodes = await self._engine.cm.get_addrs_current_connections(only_direct=False, myself=False)
+                 
+                 if network_nodes:
+                     target = random.choice(list(network_nodes))
                      logging.info(f"[Malicious] 🏃 Pivoting initiated at Round {self._engine.round}! Moving malicious role to {target}")
+                     
+                     # Ensure we are connected before sending
+                     if target not in self._engine.cm.connections:
+                          logging.info(f"[Malicious] Establishing connection to target {target} for pivot...")
+                          await self._engine.cm.establish_connection(target)
                      
                      msg = self._engine.cm.create_message("control", "leadership_transfer")
                      msg.log = "MALICIOUS_PIVOT_TRANSFER"
                      asyncio.create_task(self._engine.cm.send_message(target, msg))
                      
                      self._pivoted = True
-                     # Revert self to Benign (Aggregator/Trainer) behavior for next round
-                     # Check if engine has 'rb' (RoleBehaviorWrapper) exposed
+                     # Revert self to Benignbehavior for next round
                      if hasattr(self._engine, "rb"):
-                         # Change: Revert to AGGREGATOR instead of TRAINER
                          await self._engine.rb.set_next_role(Role.AGGREGATOR)
                          logging.info("[Malicious] Reverting to honest behavior (AGGREGATOR) after pivot.")
         
@@ -655,27 +661,35 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
              # Find suspicious nodes (Threshold < 0.4) that are NOT already handled
              suspects = [node for node, score in scores.items() if score < 0.4]
              
+             # User Restriction: "Solo tiene que enviar un honeypot y no varios"
+             # We should only deploy one scout per round to avoid flooding. 
+             # Also ensure we don't re-deploy for the same node.
+             
              for suspect in suspects:
                  if suspect not in self.detected_threats:
                      logging.info(f"[Honeypot] 🚨 DETECTED PIVOT/NEW THREAT! Identified at {suspect} (Rep: {scores[suspect]:.2f})")
                      self.detected_threats.add(suspect)
                      asyncio.create_task(self._deploy_honeypot_agent(suspect))
+                     # Break after one deployment to satisfy "single scout" constraint per detection cycle
+                     break
             
-             # 2. Check for Recovery (High Reputation) - Retire Self if job is done
-             # If we were assigned to monitor a specific node (previous_honeypot_node usually implies who we took over from, 
-             # but here we care about the attackers).
-             # Simple logic: If we are a Honeypot and ALL our neighbors have High Reputation (> 0.8), we might be useless here.
-             # User Request: "cuando lo sea [reliable] deberá de desaparecer esa honeypot"
+             # 2. Check for Recovery/Revert (Reputation AND HoneyMap check)
+             # User Requirement: "si el honeypot ... detecta que ya no tiene amenaza ... entronces si se debe de revertir"
              
              neighbors = list(scores.keys())
              if neighbors:
                  avg_rep = sum(scores.values()) / len(scores)
-                 # Strict check: If everyone I know is very trusted (>0.85), I am likely not needed as a Honeypot here anymore.
-                 # Also ensure we've been active for at least 5 rounds to avoid premature retirement.
-                 if all(s > 0.85 for s in scores.values()) and self._engine.round > 10:
+                 
+                 # Condition 1: Reputation is recovered (No active threats in view)
+                 # Using 0.8 as safe threshold
+                 rep_safe = all(s > 0.8 for s in scores.values())
+                 
+                 # Condition 2: HoneyMap allows it (Implicitly managed via state, but we ensure no local alerts)
+                 # We also check if we have recently deployed a scout (don't revert instantly if we just detected something)
+                 
+                 if rep_safe and self._engine.round > 5:
                       logging.info(f"[Honeypot] 🕊️ Mission Accomplished? All neighbors have high reputation (Avg: {avg_rep:.2f}). Retiring/Disappearing...")
                       self._defense_active = False # Disable defense mechanisms
-                      # Optionally revert role completely to Aggregator
                       asyncio.create_task(self._revert_to_aggregator())
 
     async def _revert_to_aggregator(self):
@@ -684,11 +698,8 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
              await self._engine.rb.set_next_role(Role.AGGREGATOR)
 
     async def _deploy_honeypot_agent(self, target_suspect, deploy_to=None, exclude_nodes=None):
-        """Deploys a new Honeypot Agent to counter a detected threat."""
-        # Deployment Strategy: Random Deployment to search for the threat
-        # We try to get ALL known connections, not just direct ones, if possible.
-        # For decentralized, we might only know neighbors. We pick a random one to propagate the defense.
-
+        """Pivots the Honeypot Agent towards a detected threat."""
+        
         neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=False, myself=False)
         candidates = list(neighbors)
         
@@ -696,31 +707,70 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         if exclude_nodes:
             candidates = [c for c in candidates if c not in exclude_nodes]
 
-        if deploy_to and deploy_to in candidates:
-            target = deploy_to
-            logging.info(f"[Honeypot] 🕸️ Deploying NEW Honeypot Scout to TARGETED location {target} (Chasing suspected pivot).")
-        elif candidates:
-            # Randomly select a node in the network to become the new Honeypot scout
-            target = random.choice(candidates)
-            logging.info(f"[Honeypot] 🕸️ Deploying NEW Honeypot Scout to RANDOM location {target} to hunt for new threats.")
-        else:
-            logging.warning("[Honeypot] Could not deploy scout - no connections available.")
+        # 1. OPTIMAL STATE: If the threat is already a neighbor, we are in position.
+        # We STOP pivoting and maintain the position to engage the threat.
+        if target_suspect in candidates:
+            logging.info(f"[Honeypot] 🎯 Threat {target_suspect} is a neighbor! Holding position to engage.")
             return
 
-        msg = self._engine.cm.create_message("control", "leadership_transfer")
-        state = self.manager.export_state()
+        # 2. PIVOT: If threat is not reachable, move through the network.
+        target = None
+        if deploy_to and deploy_to in candidates:
+            target = deploy_to
+            logging.info(f"[Honeypot] 🎯 Pivoting to specific target {target} (Chasing suspected pivot).")
+        else:
+            # INTELLIGENT PIVOT: Move towards the neighbor that reported the threat
+            if hasattr(self._engine, "_reputation") and hasattr(self._engine._reputation, "get_reporters"):
+                 reporters = self._engine._reputation.get_reporters(target_suspect)
+                 # Filter reporters that are current neighbors
+                 valid_reporters = [r for r in reporters if r in candidates]
+                 
+                 if valid_reporters:
+                     target = random.choice(valid_reporters)
+                     logging.info(f"[Honeypot] 🧭 INTELLIGENT PIVOT: Moving towards informant {target} who reported threat {target_suspect}.")
+                 else:
+                     logging.warning(f"[Honeypot] Could not find specific informant neighbor for {target_suspect}. Fallback to Random.")
+                     
+            if not target and candidates:
+                 # Fallback: Randomly select a node in the network to move to
+                 target = random.choice(candidates)
+                 logging.info(f"[Honeypot] 🔄 Pivoting to RANDOM neighbor {target} to search for threat {target_suspect}.")
+        
+        if not target:
+            logging.warning("[Honeypot] Could not pivot - no connections available.")
+            return
 
-        # Flag this transfer as a SCOUT deployment
+        # Prepare state first to include in the message creation
+        state = self.manager.export_state()
+        
+        # Flag this transfer as a SCOUT/PIVOT deployment
         state["scout_mission"] = True
         state["target_suspect"] = target_suspect
+        
+        # 3. ACTION DECISION: CLONE vs MOVE
+        # If we are currently "busy" engaging a local threat (we have suspects nearby), we should STAY here and SPAWN a clone.
+        # If we are "idle" (patrolling), we should MOVE (pivot) ourselves.
+        
+        is_engaged_locally = False
+        # Check if we have any active local suspects in our reputation table
+        if hasattr(self._engine, "_reputation"):
+             scores = self._engine._reputation.get_reputation_table()
+             local_suspects = [node for node, score in scores.items() if score < 0.4 and node in candidates]
+             if local_suspects:
+                 is_engaged_locally = True
+                 logging.info(f"[Honeypot] 🛡️ Currently engaging local threats {local_suspects}. Will SPAWN a clone instead of moving.")
 
-        msg.log = f"HONEYPOT_TRANSFER:{json.dumps(state)}"
+        encoded_log = f"HONEYPOT_TRANSFER:{json.dumps(state)}"
+        msg = self._engine.cm.create_message("control", "leadership_transfer", log=encoded_log)
+        
         await self._engine.cm.send_message(target, msg)
 
-        # Check self-retirement condition:
-        # If the node we were monitoring (if any) is now reliable (or we are just proactive), 
-        # and we haven't seen threats locally for a while, we might revert.
-        # For now, we keep the original honeypot active to guard the old gate.
+        # 4. POST-ACTION: Revert self ONLY if we moved (didn't clone)
+        if not is_engaged_locally:
+            logging.info("[Honeypot] 👋 Pivot/Move initiated. Reverting self to AGGREGATOR.")
+            await self._revert_to_aggregator()
+        else:
+            logging.info("[Honeypot] 🧬 Clone spawned to chase remote threat. Main node holding position.")
 
 
         known_threat = getattr(self, "detected_threat_node_persistent", None)

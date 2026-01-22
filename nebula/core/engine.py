@@ -492,6 +492,10 @@ class Engine:
                     if key not in self._reputation.reputation_with_all_feedback:
                         self._reputation.reputation_with_all_feedback[key] = []
                     self._reputation.reputation_with_all_feedback[key].append(message.score)
+                    
+                    # [HONEYPOT SUPPORT] Register accusation source to allow pivoting
+                    if hasattr(self._reputation, "register_accusation"):
+                         self._reputation.register_accusation(suspect=nei, reporter=source, score=message.score)
             else:
                 # Emergency handling for nodes without full Reputation System enabled
                 # If we receive a CRITICAL alert (Score 0.0), we treat it as a Honeypot Warning.

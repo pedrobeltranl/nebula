@@ -148,6 +148,8 @@ class Reputation:
         self.reputation_with_feedback = {}
         self.reputation_with_all_feedback = {}
         self.reputation_history = {}
+        # Stores which neighbors reported which suspect: {SuspectIP: Set(ReporterIPs)}
+        self.latest_accusations = {}
         self.rejected_nodes = set()
         self.fraction_of_params_changed = {}
         self.history_data = {}
@@ -2227,3 +2229,17 @@ class Reputation:
             new = max(0.0, min(1.0, new))
             self.reputation[node_id]["reputation"] = new
             logging.info(f"[Reputation] Manual update for {node_id}: {old:.2f} -> {new:.2f}")
+
+    def register_accusation(self, suspect, reporter, score):
+        """
+        Registers that a reporter (neighbor) has assigned a score to a suspect.
+        Used by Honeypot to track threats back to their source.
+        """
+        if suspect not in self.latest_accusations:
+            self.latest_accusations[suspect] = set()
+        self.latest_accusations[suspect].add(reporter)
+        logging.info(f"[Reputation] Registered accusation: {reporter} -> {suspect} (Score: {score})")
+
+    def get_reporters(self, suspect):
+        """Returns the list of nodes that have reported/accused the suspect."""
+        return list(self.latest_accusations.get(suspect, []))
