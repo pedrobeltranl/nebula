@@ -23,7 +23,9 @@ const HoneypotManager = (function() {
             enabled: true,
             mode: "fixed",
             count: 1, // Enforced constraint: Only 1 Honeypot
-            seed: parseFloat(document.getElementById("honeypot-seed").value)
+            seed: parseFloat(document.getElementById("honeypot-seed").value),
+            attacker_pivoting: document.getElementById("attacker-pivoting")?.checked || false,
+            pivot_round: parseInt(document.getElementById("pivot-round")?.value) || 10
         };
     }
 
@@ -44,12 +46,17 @@ const HoneypotManager = (function() {
         if (config.seed) {
             document.getElementById("honeypot-seed").value = config.seed;
         }
+
+        if (document.getElementById("attacker-pivoting")) {
+            document.getElementById("attacker-pivoting").checked = config.attacker_pivoting || false;
+        }
     }
 
     function resetHoneypotConfig() {
         const hpSwitch = document.getElementById("honeypot-switch");
         const hpOptions = document.getElementById("honeypot-options");
         const hpSeed = document.getElementById("honeypot-seed");
+        const hpPivoting = document.getElementById("attacker-pivoting");
         
         if (hpSwitch) {
             hpSwitch.checked = false;
@@ -59,6 +66,9 @@ const HoneypotManager = (function() {
         }
         if (hpSeed) {
             hpSeed.value = "0.5";
+        }
+        if (hpPivoting) {
+            hpPivoting.checked = false;
         }
     }
 

@@ -1025,6 +1025,12 @@ class ScenarioManagement:
                      if "honeypot_seed" in self.scenario.nodes[nid]:
                          participant_config["device_args"]["honeypot_seed"] = self.scenario.nodes[nid]["honeypot_seed"]
 
+            # HONEYPOT DEFENSE CONFIG: If honeypot is enabled globally, add it to defense_args
+            if self.scenario.honeypot and self.scenario.honeypot.get("enabled"):
+                if "defense_args" not in participant_config:
+                    participant_config["defense_args"] = {}
+                participant_config["defense_args"]["honeypot"] = self.scenario.honeypot
+                
             participant_config["scenario_args"]["federation"] = self.scenario.federation
             participant_config["scenario_args"]["n_nodes"] = self.n_nodes + additional_nodes
             participant_config["network_args"]["neighbors"] = self.topologymanager.get_neighbors_string(i)

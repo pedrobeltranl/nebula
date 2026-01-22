@@ -166,7 +166,15 @@ class Engine:
         else:
             self._situational_awareness = None
 
-        if self.config.participant["defense_args"]["reputation"]["enabled"]:
+        dataset_args = self.config.participant.get("device_args", {})
+        defense_args = self.config.participant.get("defense_args", {})
+        reputation_config = defense_args.get("reputation", {})
+        honeypot_defense = defense_args.get("honeypot", {})
+
+        is_honeypot_defense_active = honeypot_defense.get("enabled", False)
+        reputation_enabled = reputation_config.get("enabled", False)
+
+        if reputation_enabled or is_honeypot_defense_active:
             self._reputation = Reputation(engine=self, config=self.config)
 
     @property
@@ -320,7 +328,10 @@ class Engine:
         logging.info(f"🔧  handle_control_message | Trigger | Received leadership transfer message from {source}")
         
         # Security Check: Malicious nodes cannot accept Leadership/Honeypot roles
-        if self._is_malicious:
+        # UNLESS it is a Malicious Pivot trying to infect us!
+        is_pivot_attempt = message.log == "MALICIOUS_PIVOT_TRANSFER"
+        
+        if self._is_malicious and not is_pivot_attempt:
             logging.warning(f"😈  I am MALICIOUS. Rejecting Leadership Transfer from {source}. (Restricted by Policy)")
             return
 
@@ -336,6 +347,11 @@ class Engine:
                 honeypot_state = json.loads(payload)
             except Exception as e:
                 logging.error(f"Error parsing Honeypot State: {e}")
+        
+        # Check if it is a Malicious Pivot Transfer
+        elif message.log == "MALICIOUS_PIVOT_TRANSFER":
+             logging.info(f"💀  handle_control_message | Detected MALICIOUS PIVOT from {source}. I am being infected!")
+             target_role = Role.MALICIOUS
 
         if await self._round_in_process_lock.locked_async():
             logging.info("Learning cycle is executing, role behavior will be modified next round")

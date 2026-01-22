@@ -168,11 +168,32 @@ class Reputation:
 
     def _load_configuration(self):
         """Load and validate reputation configuration."""
-        reputation_config = self._config.participant["defense_args"]["reputation"]
-        self._enabled = reputation_config["enabled"]
-        self._metrics = reputation_config["metrics"]
-        self._initial_reputation = float(reputation_config["initial_reputation"])
-        self._weighting_factor = reputation_config["weighting_factor"]
+        defense_args = self._config.participant.get("defense_args", {})
+        reputation_config = defense_args.get("reputation", {})
+        honeypot_defense = defense_args.get("honeypot", {})
+        
+        is_honeypot_defense_active = honeypot_defense.get("enabled", False)
+        
+        if is_honeypot_defense_active:
+            self._enabled = True
+            # Ensure metrics are loaded or set defaults for honeypot scenario
+            if "metrics" in reputation_config:
+                 self._metrics = reputation_config["metrics"]
+            else:
+                 self._metrics = {
+                     "model_similarity": {"enabled": True, "weight": 0.25},
+                     "num_messages": {"enabled": True, "weight": 0.25},
+                     "model_arrival_latency": {"enabled": True, "weight": 0.25},
+                     "fraction_parameters_changed": {"enabled": True, "weight": 0.25}
+                 }
+            
+            self._initial_reputation = float(reputation_config.get("initial_reputation", 0.5))
+            self._weighting_factor = reputation_config.get("weighting_factor", "dynamic")
+        else:
+            self._enabled = reputation_config.get("enabled", False)
+            self._metrics = reputation_config.get("metrics", {})
+            self._initial_reputation = float(reputation_config.get("initial_reputation", 0.5))
+            self._weighting_factor = reputation_config.get("weighting_factor", "dynamic")
 
         if not isinstance(self._metrics, dict):
             logging.error(f"Invalid metrics configuration: expected dict, got {type(self._metrics)}")
@@ -577,7 +598,12 @@ class Reputation:
 
         logging.info(f"Reputation of node {nei}: {self.reputation[nei]['reputation']}")
         
-        if self.reputation[nei]["reputation"] < self.REPUTATION_THRESHOLD and current_round > 0:
+        # If the honeypot defense option is active, we want to calculate metrics but not apply local defenses (filtering)
+        is_honeypot_defense_active = self._config.participant.get("defense_args", {}).get("honeypot", {}).get("enabled", False)
+        
+        should_filter = not is_honeypot_defense_active
+        
+        if should_filter and self.reputation[nei]["reputation"] < self.REPUTATION_THRESHOLD and current_round > 0:
             self.rejected_nodes.add(nei)
             logging.info(f"Rejected node {nei} at round {current_round}")
 

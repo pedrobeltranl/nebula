@@ -197,6 +197,15 @@ class MaliciousRoleBehavior(RoleBehavior):
         benign_role = self._config.participant["adversarial_args"]["fake_behavior"]
         self._fake_role_behavior = factory_role_behavior(benign_role, self._engine, self._config)
         self._role = factory_node_role("malicious")
+
+        # Pivoting Configuration
+        self._attacker_pivoting = False
+        self._pivot_round = 10
+        if "defense_args" in self._config.participant and "honeypot" in self._config.participant["defense_args"]:
+             hp_config = self._config.participant["defense_args"]["honeypot"]
+             self._attacker_pivoting = hp_config.get("attacker_pivoting", False)
+             self._pivot_round = hp_config.get("pivot_round", 10)
+        self._pivoted = False
     
     def get_role(self):
         return self._role
@@ -214,6 +223,26 @@ class MaliciousRoleBehavior(RoleBehavior):
             logging.exception(f"Attack {attack_name} failed")
             
         await self._fake_role_behavior.extended_learning_cycle()
+
+        # Pivoting Logic: Pivot once if enabled
+        if self._attacker_pivoting and not self._pivoted:
+            # Pivot at specific round
+            if self._engine.round == self._pivot_round:
+                 neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
+                 if neighbors:
+                     target = random.choice(list(neighbors))
+                     logging.info(f"[Malicious] 🏃 Pivoting initiated at Round {self._engine.round}! Moving malicious role to {target}")
+                     
+                     msg = self._engine.cm.create_message("control", "leadership_transfer")
+                     msg.log = "MALICIOUS_PIVOT_TRANSFER"
+                     asyncio.create_task(self._engine.cm.send_message(target, msg))
+                     
+                     self._pivoted = True
+                     # Revert self to Benign/Trainer for next round
+                     # Check if engine has 'rb' (RoleBehaviorWrapper) exposed
+                     if hasattr(self._engine, "rb"):
+                         await self._engine.rb.set_next_role(Role.TRAINER)
+                         logging.info("[Malicious] Reverting to honest behavior after pivot.")
         
     async def select_nodes_to_wait(self):
         nodes = await self._fake_role_behavior.select_nodes_to_wait()
@@ -502,6 +531,13 @@ class HoneypotRoleBehavior(TrainerAggregatorRoleBehavior):
         self.previous_role = None
         self.previous_honeypot_node = None # The node that gave us this role
         self.threat_persistence_counter = 0 # Track how long we have been stuck detecting a threat
+        
+        # Pivoting / Reactive Defense Configuration
+        self._attacker_pivoting = False
+        if "defense_args" in self._config.participant and "honeypot" in self._config.participant["defense_args"]:
+             self._attacker_pivoting = self._config.participant["defense_args"]["honeypot"].get("attacker_pivoting", False)
+        self.detected_threats = set() # Track nodes we have already flagged/deployed against
+
         print("""
 \033[93m
       _  _
@@ -543,6 +579,10 @@ class HoneypotRoleBehavior(TrainerAggregatorRoleBehavior):
                  logging.info(f"[Honeypot] 🛡️ Defense Inactive (Pivot in progress, initiated Round {self.transfer_initiated_round}). Behaving as Passive Trainer.")
                  await super().extended_learning_cycle() # Use standard Trainer behavior (inherited)
                  return
+
+        # Reactive Defense: Check for Pivoting Attackers and spawn counters
+        if self._attacker_pivoting:
+            self._check_and_react_to_pivot()
 
         # 1. Update Defense Strategy (HoneyMap)
         self.manager.new_round()
@@ -597,6 +637,75 @@ class HoneypotRoleBehavior(TrainerAggregatorRoleBehavior):
         # We need to access the state found in "Analyzing neighbor responses" but that happens AFTER update.
         # However, we can use 'self.threat_persistence_counter' and 'previous_honeypot_node' 
         # or store the identified threat in 'self' during step 5 for use in step 3 of next round.
+    
+    def _check_and_react_to_pivot(self):
+        """Monitors reputation to detect pivots and spawn new honeypots."""
+        if hasattr(self._engine, "_reputation"):
+             scores = self._engine._reputation.get_reputation_table()
+             
+             # 1. Check for New Threats (Low Reputation)
+             # Find suspicious nodes (Threshold < 0.4) that are NOT already handled
+             suspects = [node for node, score in scores.items() if score < 0.4]
+             
+             for suspect in suspects:
+                 if suspect not in self.detected_threats:
+                     logging.info(f"[Honeypot] 🚨 DETECTED PIVOT/NEW THREAT! Identified at {suspect} (Rep: {scores[suspect]:.2f})")
+                     self.detected_threats.add(suspect)
+                     asyncio.create_task(self._deploy_honeypot_agent(suspect))
+            
+             # 2. Check for Recovery (High Reputation) - Retire Self if job is done
+             # If we were assigned to monitor a specific node (previous_honeypot_node usually implies who we took over from, 
+             # but here we care about the attackers).
+             # Simple logic: If we are a Honeypot and ALL our neighbors have High Reputation (> 0.8), we might be useless here.
+             # User Request: "cuando lo sea [reliable] deberá de desaparecer esa honeypot"
+             
+             neighbors = list(scores.keys())
+             if neighbors:
+                 avg_rep = sum(scores.values()) / len(scores)
+                 # Strict check: If everyone I know is very trusted (>0.85), I am likely not needed as a Honeypot here anymore.
+                 # Also ensure we've been active for at least 5 rounds to avoid premature retirement.
+                 if all(s > 0.85 for s in scores.values()) and self._engine.round > 10:
+                      logging.info(f"[Honeypot] 🕊️ Mission Accomplished? All neighbors have high reputation (Avg: {avg_rep:.2f}). Retiring/Disappearing...")
+                      self._defense_active = False # Disable defense mechanisms
+                      # Optionally revert role completely to Trainer
+                      asyncio.create_task(self._revert_to_trainer())
+
+    async def _revert_to_trainer(self):
+        if hasattr(self._engine, "rb"):
+             logging.info("[Honeypot] Transforming back to TRAINER role.")
+             await self._engine.rb.set_next_role(Role.TRAINER)
+
+    async def _deploy_honeypot_agent(self, target_suspect):
+         """Deploys a new Honeypot Agent to counter a detected threat."""
+         # Deployment Strategy: Random Deployment to search for the threat
+         # We try to get ALL known connections, not just direct ones, if possible.
+         # For decentralized, we might only know neighbors. We pick a random one to propagate the defense.
+         
+         neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=False, myself=False)
+         candidates = list(neighbors)
+         
+         if candidates:
+             # Randomly select a node in the network to become the new Honeypot scout
+             target = random.choice(candidates)
+             logging.info(f"[Honeypot] 🕸️ Deploying NEW Honeypot Scout to RANDOM location {target} to hunt for new threats.")
+             
+             msg = self._engine.cm.create_message("control", "leadership_transfer")
+             state = self.manager.export_state()
+             
+             # Flag this transfer as a SCOUT deployment
+             state["scout_mission"] = True
+             state["target_suspect"] = target_suspect
+             
+             msg.log = f"HONEYPOT_TRANSFER:{json.dumps(state)}"
+             await self._engine.cm.send_message(target, msg)
+         else:
+             logging.warning("[Honeypot] Could not deploy scout - no connections available.")
+
+        # Check self-retirement condition:
+        # If the node we were monitoring (if any) is now reliable (or we are just proactive), 
+        # and we haven't seen threats locally for a while, we might revert.
+        # For now, we keep the original honeypot active to guard the old gate.
+
         
         known_threat = getattr(self, "detected_threat_node_persistent", None)
         
