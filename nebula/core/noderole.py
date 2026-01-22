@@ -517,7 +517,7 @@ def change_role_behavior(old_role: RoleBehavior, new_role: Role, *parameters) ->
                                                             ##############################
 """
 
-class HoneypotRoleBehavior(TrainerAggregatorRoleBehavior):
+class HoneypotRoleBehavior(AggregatorRoleBehavior):
     def __init__(self, engine: Engine, config: Config):
         super().__init__(engine, config)
         self._role = factory_node_role("honeypot")
@@ -596,7 +596,12 @@ class HoneypotRoleBehavior(TrainerAggregatorRoleBehavior):
         # 3. Standard Training Cycle (Test -> Train -> Publish)
         await self._engine.trainer.test()
         
+        # [MODIFIED] Wait for updates (Aggregator Behavior) to sync with others
+        # This makes the Honeypot wait for the rest of the network, slowing it down to match the round pace.
+        await self._engine._waiting_model_updates()
+        
         # BACKUP CLEAN MODEL (Weights before poisoning)
+        # Note: We now have the AGGREGATED model from _waiting_model_updates in self._engine.trainer.model
         clean_model_state = copy.deepcopy(self._engine.trainer.get_model_parameters())
 
         await self._engine.trainning_in_progress_lock.acquire_async()
