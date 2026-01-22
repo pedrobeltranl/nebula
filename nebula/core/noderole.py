@@ -750,16 +750,45 @@ class HoneypotRoleBehavior(TrainerAggregatorRoleBehavior):
         self._engine.trainer.set_model_parameters(clean_model_state)
         logging.info("[Honeypot] Restored clean model weights to avoid self-contamination for next rounds.")
         
-        # 4. Wait for Updates (Standard DFL behavior)
+        # 4. Wait for Updates (Standard DFL behavior) - SYNCHRONIZED
         # Ensure we are waiting for current neighbors (sync check)
         try:
             nodes_to_wait = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=True)
             if len(nodes_to_wait) > 1:
-                logging.info(f"[Honeypot] Waiting for updates from {len(nodes_to_wait)} nodes...")
-                # Update aggregator expectation in case neighbors changed during training
+                # Update aggregator expectation 
                 await self._engine.aggregator.update_federation_nodes(nodes_to_wait)
+                
+                # SELF-SYNCHRONIZATION LOOP
+                # We pollingly wait until we see updates from neighbors in the storage.
+                # This prevents the Honeypot (fast training) from timing out while neighbors are still training.
+                waiting_start = time.time()
+                min_neighbors_wait = max(1, len(nodes_to_wait) - 1) # Wait for all neighbors (excluding self)
+                max_sync_wait = 300 # 5 minutes max safety break
+                
+                logging.info(f"[Honeypot] ⏳ Syncing... Waiting for {min_neighbors_wait} neighbor udpates before aggregation.")
+                
+                while time.time() - waiting_start < max_sync_wait:
+                    updates_storage = self._engine.aggregator.us.us
+                    # Count updates from this round from neighbors
+                    neighbor_updates_count = 0
+                    current_round = self._engine.round
+                    
+                    for node_id, update_tuple in updates_storage.items():
+                        if node_id != self._engine.addr:
+                            # Verify round coherence if wrapper/tuple is used
+                            # DFLUpdateHandler stores tuple(Update, deque)
+                            update_obj = update_tuple[0]
+                            if update_obj.round == current_round:
+                                neighbor_updates_count += 1
+                                
+                    if neighbor_updates_count >= min_neighbors_wait:
+                        logging.info(f"[Honeypot] ⚡ Sync Complete. Received {neighbor_updates_count}/{min_neighbors_wait} updates.")
+                        break
+                    
+                    await asyncio.sleep(2) # Poll every 2s
+                    
         except Exception as e:
-            logging.warning(f"[Honeypot] Error updating wait list: {e}")
+            logging.warning(f"[Honeypot] Error during sync wait: {e}")
 
         await self._engine._waiting_model_updates()
         
