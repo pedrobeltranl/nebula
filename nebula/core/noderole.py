@@ -545,6 +545,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         if "defense_args" in self._config.participant and "honeypot" in self._config.participant["defense_args"]:
              self._attacker_pivoting = self._config.participant["defense_args"]["honeypot"].get("attacker_pivoting", False)
         self.detected_threats = set() # Track nodes we have already flagged/deployed against
+        self.honeymap_confirmed_threats = set() # Track nodes confirmed by HoneyMap
 
         print("""
 \033[93m
@@ -659,7 +660,12 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
              
              # 1. Check for New Threats (Low Reputation)
              # Find suspicious nodes (Threshold < 0.4) that are NOT already handled
-             suspects = [node for node, score in scores.items() if score < 0.4]
+             # [MODIFIED] Added HoneyMap Confirmation Check
+             # A node is a threat ONLY if it has Low Reputation AND triggers the HoneyMap.
+             suspects = [
+                 node for node, score in scores.items() 
+                 if score < 0.4 and node in self.honeymap_confirmed_threats
+             ]
              
              # User Restriction: "Solo tiene que enviar un honeypot y no varios"
              # We should only deploy one scout per round to avoid flooding. 
@@ -918,6 +924,11 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                         # Verify using HoneyManager
                         is_malicious = self.manager.verify_model(self._engine.trainer.model, clean_batch)
                         
+                        if not is_malicious:
+                            if node_id in self.honeymap_confirmed_threats:
+                                logging.info(f"[Honeypot] Node {node_id} tested CLEAN on HoneyMap. Removing from confirmed threats.")
+                                self.honeymap_confirmed_threats.remove(node_id)
+                        
                         if is_malicious:
                             # DISCRIMINATE: Attacker vs Echo
                             # Heuristic: Echo nodes (Victims) usually have High Reputation.
@@ -938,6 +949,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                                 logging.critical(f"\033[91m[Honeypot] 🚨 MALICIOUS NODE DETECTED: {node_id} (Matched HoneyMap Pattern) 🚨\033[0m")
                                 threat_detected = True
                                 detected_threat_node = node_id
+                                self.honeymap_confirmed_threats.add(node_id)
                                 
                                 # Store confirmed threat for future pardon/recovery if it becomes clean
                                 self.last_confirmed_threat = node_id
