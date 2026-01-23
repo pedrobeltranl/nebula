@@ -652,33 +652,171 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         # However, we can use 'self.threat_persistence_counter' and 'previous_honeypot_node' 
         # or store the identified threat in 'self' during step 5 for use in step 3 of next round.
     
+    def _calculate_pivot_candidate_score(self, neighbor: str, current_rep: float, suspects_feed: list) -> float:
+        """
+        Calculates the suitability of a neighbor to receive the Honeypot role.
+        Strategy:
+        1. Base Score = Reputation.
+           CRITICAL: The candidate MUST have a GOOD reputation (> 0.2).
+           We cannot trust a node with low reputation to be the Honeypot.
+        2. Bonus: If this neighbor has detected a malicious node (low score in feedback),
+           we want to pivot to them to be closer to the threat.
+        """
+        # 1. Safety Threshold: Only trust "Good" neighbors
+        # User Requirement: "el nodo al que vamos a pivotar tiene que tener buena reputación"
+        if current_rep < 0.2:
+            # Too risky to transfer Honeypot role to a low-trust node
+            return -1.0 
+        
+        score = current_rep
+        
+        # 2. Strategic Pivot: Move towards reporters of malicious activity
+        # suspects_feed is [(reporter, suspect, score), ...]
+        for reporter, suspect, rep_score in suspects_feed:
+            if reporter == neighbor:
+                # This trustworthy neighbor is reporting a low-reputation node (suspect).
+                # Pivoting to 'neighbor' puts the Honeypot next to 'suspect'.
+                logging.info(f"[Honeypot] Strategic Pivot: {neighbor} (Rep: {current_rep:.2f}) is reporting suspect {suspect} (Score: {rep_score:.2f}). Boosting.")
+                score += 0.8 # Significant bonus to prioritize this strategic move
+        
+        # Add small random noise for exploration/tie-breaking
+        score += random.uniform(0.0, 0.05)
+        return score
+
     def _check_and_react_to_pivot(self):
         """Monitors reputation to detect pivots and spawn new honeypots."""
         if hasattr(self._engine, "_reputation"):
              scores = self._engine._reputation.get_reputation_table()
              logging.info(f"[Honeypot] 🔍 Threat Scan | Current Reputation Scores: {scores}")
              
-             # 1. Check for New Threats (Low Reputation)
-             # Find suspicious nodes (Threshold < 0.4) that are NOT already handled
-             # [MODIFIED] Added HoneyMap Confirmation Check
+            # ---------------------------------------------------------
+             # PHASE 2 Check: Are we already ENGAGED with a local threat?
+             # ---------------------------------------------------------
+             neighbors = []
+             try:
+                 # Get direct connections to check proximity
+                 conn_objs = self._engine.cm.connections
+                 neighbors = list(conn_objs.keys()) # Format: 'IP:Port' strings
+                 if not neighbors:
+                     # Fallback if dictionary keys are not strings (should not happen in this version)
+                     pass
+             except:
+                 pass
+             
+             # Identify threats that are practically touching us (Neighbors)
+             local_confirmed_threats = [
+                 t for t in self.honeymap_confirmed_threats 
+                 # Simple substring match or exact match depending on format
+                 if any(t in n or n in t for n in neighbors)
+             ]
+             
+             is_locally_engaged = len(local_confirmed_threats) > 0
+
+             if is_locally_engaged:
+                 logging.info(f"[Honeypot] 🛡️ ENGAGED MODE: Holding position against local threats {local_confirmed_threats}.")
+                 
+                 # -----------------------------------------------------
+                 # LOGIC: CLONING (Deploying Scouts against Remote Threats)
+                 # -----------------------------------------------------
+                 # Look for threats that are CONFIRMED but NOT local
+                 remote_threats = [
+                     t for t in self.honeymap_confirmed_threats 
+                     if t not in local_confirmed_threats
+                 ]
+                 
+                 for remote_suspect in remote_threats:
+                     # Check if we already have a clone covering this
+                     if not hasattr(self, "deployed_clones_targets"):
+                         self.deployed_clones_targets = set()
+                         
+                     if remote_suspect not in self.deployed_clones_targets:
+                         logging.warning(f"[Honeypot] 🧬 MULTI-THREAT DETECTED! Engaged locally, but {remote_suspect} is active elsewhere. SPAWNING CLONE.")
+                         self.deployed_clones_targets.add(remote_suspect)
+                         asyncio.create_task(self._deploy_honeypot_agent(remote_suspect))
+                         # Limit to one clone per cycle to avoid flooding
+                         break 
+                 
+                 return # Stop here, do not attempt to Move/Pivot self if engaged
+
+             # ---------------------------------------------------------
+             # PHASE 1: PIVOTING (Searching/Hunting)
+             # If we are NOT engaged, we should move to a better location.
+             # ---------------------------------------------------------
+             
+             # 1. Check for New Threats (Low Reputation AND HoneyMap Confirmed)
              # A node is a threat ONLY if it has Low Reputation AND triggers the HoneyMap.
              suspects = [
                  node for node, score in scores.items() 
                  if score < 0.4 and node in self.honeymap_confirmed_threats
              ]
              
-             # User Restriction: "Solo tiene que enviar un honeypot y no varios"
-             # We should only deploy one scout per round to avoid flooding. 
-             # Also ensure we don't re-deploy for the same node.
+             # If we see a confirmed threat and we are NOT engaged (meaning it's not a neighbor yet),
+             # we likely need to move closer to it (Strategic Pivot)
              
-             for suspect in suspects:
-                 if suspect not in self.detected_threats:
-                     logging.info(f"[Honeypot] 🚨 DETECTED PIVOT/NEW THREAT! Identified at {suspect} (Rep: {scores[suspect]:.2f})")
-                     self.detected_threats.add(suspect)
-                     asyncio.create_task(self._deploy_honeypot_agent(suspect))
-                     # Break after one deployment to satisfy "single scout" constraint per detection cycle
-                     break
-            
+             # Get Feed for Strategic Pivot
+             suspects_feed = []
+             if hasattr(self._engine._reputation, "get_suspects_from_feedback"):
+                 suspects_feed = self._engine._reputation.get_suspects_from_feedback(threshold=0.5)
+
+             # Calculate Best Move
+             try:
+                 # Note: neighbors was retrieved above as strings. We might need wait/async for fresh list.
+                 # But we can use the existing 'neighbors' list for calculation
+                 if not neighbors:
+                     return
+
+                 best_candidate = None
+                 max_score = -1.0
+                 
+                 for neighbor in neighbors:
+                     # Skip previous incumbent to avoid loops
+                     if self.previous_honeypot_node and neighbor == self.previous_honeypot_node:
+                         continue
+ 
+                     # Get basic reputation
+                     rep = scores.get(neighbor, 0.5)
+                     
+                     # Filter out blacklisted/zero rep nodes for safety
+                     if rep > 0.0:
+                         score = self._calculate_pivot_candidate_score(neighbor, rep, suspects_feed)
+                         
+                         if score > max_score:
+                             max_score = score
+                             best_candidate = neighbor
+                 
+                 # TRIGGER PIVOT
+                 if best_candidate and max_score > 0.0:
+                     # ONLY Pivot if the score indicates a valid move (e.g. not just random low rep)
+                     # Or if we have a distant suspect we are trying to reach
+                     should_move = False
+                     
+                     # Condition A: Strategic Pivot (We are chasing someone)
+                     if max_score > 1.0: # Bonus was applied
+                         should_move = True
+                         logging.info(f"[Honeypot] 🧭 STRATEGIC PIVOT initiated towards {best_candidate} (Score {max_score:.2f})")
+                     
+                     # Condition B: Random Patrol (If enabled or if stuck)
+                     # (Optional, can be added later. For now, we stick to reactive)
+                     
+                     if should_move:
+                         logging.info(f"[Honeypot] 👋 Transferring Role to {best_candidate} to hunt threats.")
+                         
+                         target_state = self.manager.export_state()
+                         payload = json.dumps(target_state)
+                         log_message = f"HONEYPOT_TRANSFER:{payload}"
+                         
+                         msg = self._engine.cm.create_message("control", "leadership_transfer", log=log_message)
+                         asyncio.create_task(self._engine.cm.send_message(best_candidate, msg))
+                         
+                         # Deactivate Defense locally (Move)
+                         self._defense_active = False 
+                         # We do not revert immediately here, we wait for ACK or timeout in the main loop
+                         # But effectively we stop acting as Honeypot
+                         self.transfer_initiated_round = self._engine.round
+
+             except Exception as e:
+                 logging.error(f"[Honeypot] Pivot Analysis Error: {e}")
+
              # 2. Check for Recovery/Revert (Reputation AND HoneyMap check)
              # User Requirement: "si el honeypot ... detecta que ya no tiene amenaza ... entronces si se debe de revertir"
              
