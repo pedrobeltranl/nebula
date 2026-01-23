@@ -699,78 +699,95 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
     async def _deploy_honeypot_agent(self, target_suspect, deploy_to=None, exclude_nodes=None):
         """Pivots the Honeypot Agent towards a detected threat."""
-        
-        neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=False, myself=False)
-        candidates = list(neighbors)
-        
-        # Apply exclusions (e.g., old threat locations)
-        if exclude_nodes:
-            candidates = [c for c in candidates if c not in exclude_nodes]
+        try:
+            logging.info(f"[Honeypot] _deploy executing for suspect {target_suspect}...")
+            
+            # Use timeout to detect deadlocks
+            try:
+                neighbors = await asyncio.wait_for(
+                    self._engine.cm.get_addrs_current_connections(only_direct=False, myself=False),
+                    timeout=2.0
+                )
+            except asyncio.TimeoutError:
+                logging.error("[Honeypot] TIMEOUT getting connections! Deadlock detected in CM?")
+                return
 
-        # 1. OPTIMAL STATE: If the threat is already a neighbor, we are in position.
-        # We STOP pivoting and maintain the position to engage the threat.
-        if target_suspect in candidates:
-            logging.info(f"[Honeypot] 🎯 Threat {target_suspect} is a neighbor! Holding position to engage.")
-            return
+            candidates = list(neighbors)
+            logging.info(f"[Honeypot] Candidates: {candidates}")
+        
+            # Apply exclusions (e.g., old threat locations)
+            if exclude_nodes:
+                candidates = [c for c in candidates if c not in exclude_nodes]
 
-        # 2. PIVOT: If threat is not reachable, move through the network.
-        target = None
-        if deploy_to and deploy_to in candidates:
-            target = deploy_to
-            logging.info(f"[Honeypot] 🎯 Pivoting to specific target {target} (Chasing suspected pivot).")
-        else:
-            # INTELLIGENT PIVOT: Move towards the neighbor that reported the threat
-            if hasattr(self._engine, "_reputation") and hasattr(self._engine._reputation, "get_reporters"):
-                 reporters = self._engine._reputation.get_reporters(target_suspect)
-                 # Filter reporters that are current neighbors
-                 valid_reporters = [r for r in reporters if r in candidates]
-                 
-                 if valid_reporters:
-                     target = random.choice(valid_reporters)
-                     logging.info(f"[Honeypot] 🧭 INTELLIGENT PIVOT: Moving towards informant {target} who reported threat {target_suspect}.")
-                 else:
-                     logging.warning(f"[Honeypot] Could not find specific informant neighbor for {target_suspect}. Fallback to Random.")
+            # 1. OPTIMAL STATE: If the threat is already a neighbor, we are in position.
+            # We STOP pivoting and maintain the position to engage the threat.
+            if target_suspect in candidates:
+                logging.info(f"[Honeypot] 🎯 Threat {target_suspect} is a neighbor! Holding position to engage.")
+                return
+
+            # 2. PIVOT: If threat is not reachable, move through the network.
+            target = None
+            if deploy_to and deploy_to in candidates:
+                target = deploy_to
+                logging.info(f"[Honeypot] 🎯 Pivoting to specific target {target} (Chasing suspected pivot).")
+            else:
+                # INTELLIGENT PIVOT: Move towards the neighbor that reported the threat
+                if hasattr(self._engine, "_reputation") and hasattr(self._engine._reputation, "get_reporters"):
+                     reporters = self._engine._reputation.get_reporters(target_suspect)
+                     # Filter reporters that are current neighbors
+                     valid_reporters = [r for r in reporters if r in candidates]
                      
-            if not target and candidates:
-                 # Fallback: Randomly select a node in the network to move to
-                 target = random.choice(candidates)
-                 logging.info(f"[Honeypot] 🔄 Pivoting to RANDOM neighbor {target} to search for threat {target_suspect}.")
-        
-        if not target:
-            logging.warning("[Honeypot] Could not pivot - no connections available.")
-            return
+                     if valid_reporters:
+                         target = random.choice(valid_reporters)
+                         logging.info(f"[Honeypot] 🧭 INTELLIGENT PIVOT: Moving towards informant {target} who reported threat {target_suspect}.")
+                     else:
+                         logging.info(f"[Honeypot] Informants {reporters} not in neighbors {candidates}.")
+                         # logging.warning(f"[Honeypot] Could not find specific informant neighbor for {target_suspect}. Fallback to Random.")
+                         
+                if not target and candidates:
+                     # Fallback: Randomly select a node in the network to move to
+                     target = random.choice(candidates)
+                     logging.info(f"[Honeypot] 🔄 Pivoting to RANDOM neighbor {target} to search for threat {target_suspect}.")
+            
+            if not target:
+                logging.warning("[Honeypot] Could not pivot - no connections available.")
+                return
 
-        # Prepare state first to include in the message creation
-        state = self.manager.export_state()
-        
-        # Flag this transfer as a SCOUT/PIVOT deployment
-        state["scout_mission"] = True
-        state["target_suspect"] = target_suspect
-        
-        # 3. ACTION DECISION: CLONE vs MOVE
-        # If we are currently "busy" engaging a local threat (we have suspects nearby), we should STAY here and SPAWN a clone.
-        # If we are "idle" (patrolling), we should MOVE (pivot) ourselves.
-        
-        is_engaged_locally = False
-        # Check if we have any active local suspects in our reputation table
-        if hasattr(self._engine, "_reputation"):
-             scores = self._engine._reputation.get_reputation_table()
-             local_suspects = [node for node, score in scores.items() if score < 0.4 and node in candidates]
-             if local_suspects:
-                 is_engaged_locally = True
-                 logging.info(f"[Honeypot] 🛡️ Currently engaging local threats {local_suspects}. Will SPAWN a clone instead of moving.")
+            # Prepare state first to include in the message creation
+            state = self.manager.export_state()
+            
+            # Flag this transfer as a SCOUT/PIVOT deployment
+            state["scout_mission"] = True
+            state["target_suspect"] = target_suspect
+            
+            # 3. ACTION DECISION: CLONE vs MOVE
+            # If we are currently "busy" engaging a local threat (we have suspects nearby), we should STAY here and SPAWN a clone.
+            # If we are "idle" (patrolling), we should MOVE (pivot) ourselves.
+            
+            is_engaged_locally = False
+            # Check if we have any active local suspects in our reputation table
+            if hasattr(self._engine, "_reputation"):
+                 scores = self._engine._reputation.get_reputation_table()
+                 local_suspects = [node for node, score in scores.items() if score < 0.4 and node in candidates]
+                 if local_suspects:
+                     is_engaged_locally = True
+                     logging.info(f"[Honeypot] 🛡️ Currently engaging local threats {local_suspects}. Will SPAWN a clone instead of moving.")
 
-        encoded_log = f"HONEYPOT_TRANSFER:{json.dumps(state)}"
-        msg = self._engine.cm.create_message("control", "leadership_transfer", log=encoded_log)
-        
-        await self._engine.cm.send_message(target, msg)
+            encoded_log = f"HONEYPOT_TRANSFER:{json.dumps(state)}"
+            msg = self._engine.cm.create_message("control", "leadership_transfer", log=encoded_log)
+            
+            await self._engine.cm.send_message(target, msg)
 
-        # 4. POST-ACTION: Revert self ONLY if we moved (didn't clone)
-        if not is_engaged_locally:
-            logging.info("[Honeypot] 👋 Pivot/Move initiated. Reverting self to AGGREGATOR.")
-            await self._revert_to_aggregator()
-        else:
-            logging.info("[Honeypot] 🧬 Clone spawned to chase remote threat. Main node holding position.")
+            # 4. POST-ACTION: Revert self ONLY if we moved (didn't clone)
+            if not is_engaged_locally:
+                logging.info("[Honeypot] 👋 Pivot/Move initiated. Reverting self to AGGREGATOR.")
+                await self._revert_to_aggregator()
+            else:
+                logging.info("[Honeypot] 🧬 Clone spawned to chase remote threat. Main node holding position.")
+        except Exception as e:
+            logging.error(f"[Honeypot] CRASH DETECTED in _deploy_honeypot_agent: {e}")
+            import traceback
+            logging.error(traceback.format_exc())
 
 
         known_threat = getattr(self, "detected_threat_node_persistent", None)
