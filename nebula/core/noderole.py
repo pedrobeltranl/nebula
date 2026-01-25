@@ -612,7 +612,12 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         # Note: We now have the AGGREGATED model from _waiting_model_updates in self._engine.trainer.model
         clean_model_state = copy.deepcopy(self._engine.trainer.get_model_parameters())
 
-        await self._engine.trainning_in_progress_lock.acquire_async()
+        # FIX: Increased timeout to 60s to prevent TimeoutError in heavy rounds
+        try:
+            await self._engine.trainning_in_progress_lock.acquire_async(timeout=60)
+        except Exception as e:
+            logging.error(f"[Honeypot] ⚠️ Failed to acquire training lock: {e}. Skipping injection this round.")
+            return
         
         # Aggressive Injection
         # Increase LR to ensure the HoneyDoor is learned strongly
@@ -657,15 +662,20 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         Calculates the suitability of a neighbor to receive the Honeypot role.
         Strategy:
         1. Base Score = Reputation.
-           CRITICAL: The candidate MUST have a GOOD reputation (> 0.2).
-           We cannot trust a node with low reputation to be the Honeypot.
-        2. Bonus: If this neighbor has detected a malicious node (low score in feedback),
-           we want to pivot to them to be closer to the threat.
+        2. Hunter Bonus: High priority for 'Victim' nodes (Low Rep, Compliant).
+        3. Safety: NEVER pivot to a confirmed HoneyMap Threat (The Attacker).
         """
-        # 1. Safety Threshold: Only trust "Good" neighbors
-        # User Requirement: "el nodo al que vamos a pivotar tiene que tener buena reputación"
-        if current_rep < 0.2:
-            # Too risky to transfer Honeypot role to a low-trust node
+        # 0. ABSOLUTE SAFETY CHECK: Do not pivot to the attacker!
+        # If the neighbor is in our confirmed threats list, it means they REJECTED our HoneyDoor.
+        # Pivoting there is useless (they won't accept the role or will compromise it).
+        if neighbor in self.honeymap_confirmed_threats:
+            return -1.0
+
+        # 1. Safety Threshold: Adjusted for Hunter Mode
+        # User Requirement: "try to look to be neighbors of the malicious node"
+        # We relax the threshold to allow pivoting to 'Victim' nodes (Low Rep) which are close to the attacker.
+        if current_rep < 0.1:
+            # Too risky: Node might be dead/disconnected.
             return -1.0 
         
         score = current_rep
@@ -674,11 +684,17 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         # suspects_feed is [(reporter, suspect, score), ...]
         for reporter, suspect, rep_score in suspects_feed:
             if reporter == neighbor:
-                # This trustworthy neighbor is reporting a low-reputation node (suspect).
+                # This neighbor is reporting a low-reputation node (suspect).
                 # Pivoting to 'neighbor' puts the Honeypot next to 'suspect'.
                 logging.info(f"[Honeypot] Strategic Pivot: {neighbor} (Rep: {current_rep:.2f}) is reporting suspect {suspect} (Score: {rep_score:.2f}). Boosting.")
                 score += 0.8 # Significant bonus to prioritize this strategic move
         
+        # 3. Hunter Bonus: If the node has Low Rep (but > 0.1), it is likely under attack.
+        # We prioritize moving to it to 'Save' it or 'Intermitt' the attacker.
+        if current_rep < 0.4:
+             logging.info(f"[Honeypot] Hunter Pivot: {neighbor} (Rep: {current_rep:.2f}) looks like a Victim. Moving to investigate.")
+             score += 0.5
+
         # Add small random noise for exploration/tie-breaking
         score += random.uniform(0.0, 0.05)
         return score
@@ -713,7 +729,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
              is_locally_engaged = len(local_confirmed_threats) > 0
 
              if is_locally_engaged:
-                 logging.info(f"[Honeypot] 🛡️ ENGAGED MODE: Holding position against local threats {local_confirmed_threats}.")
+                 logging.info(f"[Honeypot] 🛡️ ENGAGED MODE: Local threat {local_confirmed_threats} detected. PIVOT DISABLED. Holding position to contain threat.")
                  
                  # -----------------------------------------------------
                  # LOGIC: CLONING (Deploying Scouts against Remote Threats)
@@ -795,8 +811,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                          should_move = True
                          logging.info(f"[Honeypot] 🧭 STRATEGIC PIVOT initiated towards {best_candidate} (Score {max_score:.2f})")
                      
-                     # Condition B: Random Patrol (If enabled or if stuck)
-                     # (Optional, can be added later. For now, we stick to reactive)
+                     # Condition B: Hunter Pivot (We detected a Victim or Suspicious Node)
+                     elif max_score > 0.6:
+                         should_move = True
+                         logging.info(f"[Honeypot] 🩸 HUNTER PIVOT initiated towards victim {best_candidate} (Score {max_score:.2f})")
                      
                      if should_move:
                          logging.info(f"[Honeypot] 👋 Transferring Role to {best_candidate} to hunt threats.")
