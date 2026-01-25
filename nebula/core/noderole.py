@@ -683,6 +683,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
                 # Get Verification Data (Clean subset from local data)
                 try:
+                    # Update: Ensure test dataset is initialized for the detector
+                    if hasattr(self._engine.trainer.datamodule, "setup"):
+                        self._engine.trainer.datamodule.setup('test')
+
                     test_loader = self._engine.trainer.datamodule.test_dataloader()
                     val_data = next(iter(test_loader)) # (x, y) batch
                 except Exception as data_e:
