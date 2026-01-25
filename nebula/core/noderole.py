@@ -633,21 +633,34 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             self._engine.trainer.update_model_learning_rate(original_lr)
             logging.info(f"[Honeypot] Restored Learning Rate to {original_lr:.4f}.")
             
-        # Restore Clean Data
-        self._engine.trainer.datamodule.train_set = original_train_set
-        await self._engine.trainning_in_progress_lock.release_async()
+        # POST-TRAINING OPERATIONS BLOCK (Protected)
+        try:
+            # Restore Clean Data
+            self._engine.trainer.datamodule.train_set = original_train_set
+            
+            # SAFE LOCK RELEASE
+            try:
+                if self._engine.trainning_in_progress_lock.locked():
+                     await self._engine.trainning_in_progress_lock.release_async()
+            except Exception as lock_e:
+                logging.error(f"[Honeypot] Lock Release Error: {lock_e}")
 
-        # Publish Update (Poisoned)
-        self_update_event = UpdateReceivedEvent(
-            self._engine.trainer.get_model_parameters(), self._engine.trainer.get_model_weight(), self._engine.addr, self._engine.round
-        )
-        await EventManager.get_instance().publish_node_event(self_update_event)
+            # Publish Update (Poisoned)
+            logging.info("[Honeypot] Publishing poisoned update...")
+            self_update_event = UpdateReceivedEvent(
+                self._engine.trainer.get_model_parameters(), self._engine.trainer.get_model_weight(), self._engine.addr, self._engine.round
+            )
+            await EventManager.get_instance().publish_node_event(self_update_event)
 
-        # DECEPTION & ISOLATION STRATEGY
-        # Instead of broadcasting blindly, we curate the recipients.
-        # 1. Honest Neighbors: Receive the HONEYDOOR (Poisoned/Marked) model to verify them.
-        # 2. Malicious Node (If identified): Receives a DECEPTIVE/PLACEBO model.
-        #    This keeps the attacker happy (connection open) but feeds them junk or reflects their own poison.
+            # DECEPTION & ISOLATION STRATEGY
+            # Instead of broadcasting blindly, we curate the recipients.
+            # 1. Honest Neighbors: Receive the HONEYDOOR (Poisoned/Marked) model to verify them.
+            # 2. Malicious Node (If identified): Receives a DECEPTIVE/PLACEBO model.
+        except Exception as e:
+             logging.error(f"[Honeypot] ⚠️ CRASH in Post-Training Block: {e}")
+             import traceback
+             logging.error(traceback.format_exc())
+             
         
         all_neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
         honest_neighbors = set(all_neighbors)
@@ -660,40 +673,33 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
     def _calculate_pivot_candidate_score(self, neighbor: str, current_rep: float, suspects_feed: list) -> float:
         """
         Calculates the suitability of a neighbor to receive the Honeypot role.
-        Strategy:
-        1. Base Score = Reputation.
-        2. Hunter Bonus: High priority for 'Victim' nodes (Low Rep, Compliant).
-        3. Safety: NEVER pivot to a confirmed HoneyMap Threat (The Attacker).
         """
+        # DEBUG LOG
+        # logging.info(f"[Honeypot Debug] pivot_score | Neil {neighbor} | Rep {current_rep}")
+
         # 0. ABSOLUTE SAFETY CHECK: Do not pivot to the attacker!
-        # If the neighbor is in our confirmed threats list, it means they REJECTED our HoneyDoor.
-        # Pivoting there is useless (they won't accept the role or will compromise it).
         if neighbor in self.honeymap_confirmed_threats:
             return -1.0
 
         # 1. Safety Threshold: Adjusted for Hunter Mode
-        # User Requirement: "try to look to be neighbors of the malicious node"
-        # We relax the threshold to allow pivoting to 'Victim' nodes (Low Rep) which are close to the attacker.
         if current_rep < 0.1:
-            # Too risky: Node might be dead/disconnected.
             return -1.0 
         
         score = current_rep
         
         # 2. Strategic Pivot: Move towards reporters of malicious activity
-        # suspects_feed is [(reporter, suspect, score), ...]
         for reporter, suspect, rep_score in suspects_feed:
             if reporter == neighbor:
-                # This neighbor is reporting a low-reputation node (suspect).
-                # Pivoting to 'neighbor' puts the Honeypot next to 'suspect'.
                 logging.info(f"[Honeypot] Strategic Pivot: {neighbor} (Rep: {current_rep:.2f}) is reporting suspect {suspect} (Score: {rep_score:.2f}). Boosting.")
-                score += 0.8 # Significant bonus to prioritize this strategic move
+                score += 0.8 
         
         # 3. Hunter Bonus: If the node has Low Rep (but > 0.1), it is likely under attack.
-        # We prioritize moving to it to 'Save' it or 'Intermitt' the attacker.
         if current_rep < 0.4:
              logging.info(f"[Honeypot] Hunter Pivot: {neighbor} (Rep: {current_rep:.2f}) looks like a Victim. Moving to investigate.")
              score += 0.5
+        
+        # DEBUG LOG
+        # logging.info(f"[Honeypot Debug] Final Score for {neighbor}: {score}")
 
         # Add small random noise for exploration/tie-breaking
         score += random.uniform(0.0, 0.05)
