@@ -237,11 +237,13 @@ class Scenario:
         self.sar_training_policy = sar_training_policy
         self.physical_ips = physical_ips
         self.honeypot = honeypot
+        self._honeypot_assigned = False  # Flag to track if honeypot has been assigned
 
         # Assign Honeypot Role randomly among benign nodes
         # The assignment function now handles cleanup of existing roles to ensure exclusivity.
         if self.honeypot and self.honeypot.get("enabled"):
              self.nodes = self.honeypot_node_assign(self.nodes, self.honeypot)
+             self._honeypot_assigned = True  # Mark as assigned
              logging.info("Honeypot assignment completed.")
 
     def attack_node_assign(
@@ -565,64 +567,66 @@ class Scenario:
         """
         import random
         import logging
-        
-        if not honeypot_config or not honeypot_config.get("enabled"):
-            return nodes
+
+        # CAMBIO 1: Si no hay config o está deshabilitado, forzamos que se habilite para tu prueba
+        if not honeypot_config:
+            honeypot_config = {}
+
+        # FORZAR CONFIGURACIÓN PARA EL PIVOTE (Solo si no está definido)
+        if "enabled" not in honeypot_config:
+            honeypot_config["enabled"] = True
+        if "mode" not in honeypot_config:
+            honeypot_config["mode"] = "dynamic"
+        # honeypot_config["attacker_pivoting"] = True  # Eliminamos forzado
+        # honeypot_config["pivot_round"] = 1           # Eliminamos forzado
+
+        # Actualizar la referencia del objeto self.honeypot para que otros métodos vean los cambios
+        if self.honeypot is None:
+            self.honeypot = honeypot_config
+        else:
+            self.honeypot.update(honeypot_config)
 
         # Determine fallback role based on federation
         fallback_role = "aggregator"
         if self.federation == "DFL":
             fallback_role = "aggregator"
 
-        # 1. Reset any existing honeypot role to trainer to ensure exclusivity and clean slate
-        # This fixes issues if the input nodes already have multiple honeypots assigned incorrectly
+        # 1. Reset any existing honeypot role... (esto déjalo igual)
         cleaned_nodes_count = 0
         for nid, node in nodes.items():
             if node.get("role") == "honeypot":
                  node["role"] = fallback_role
                  node.pop("honeypot_seed", None)
                  cleaned_nodes_count += 1
-            # Also clean malicious nodes that might have inherited 'honeypot' as fake behavior
             elif node.get("role") == "malicious" and node.get("fake_behavior") == "honeypot":
                  node["fake_behavior"] = fallback_role
                  cleaned_nodes_count += 1
-        
+
         if cleaned_nodes_count > 0:
             logging.info(f"[Scenario] Reset {cleaned_nodes_count} pre-existing honeypot nodes to {fallback_role}.")
 
-        # 2. Identify available benign nodes (trainers/idles/aggregators but usually trainers)
-        # We assume 'trainer' is the base role for benign participants.
+        # 2. Identify available benign nodes... (esto déjalo igual)
         available_nodes = [
-            nid for nid, node in nodes.items() 
+            nid for nid, node in nodes.items()
             if node["role"] != "malicious" and node["role"] != "honeypot"
         ]
-        
+
         if not available_nodes:
             logging.warning("[Scenario] No available benign nodes to assign Honeypot role.")
             return nodes
-        
+
         # 3. Strictly assign 1 Honeypot
         count = 1
         selected_ids = random.sample(available_nodes, count)
-        
+
         logging.info(f"[Scenario] Assigning Honeypot Role to {len(selected_ids)} nodes: {selected_ids}")
-        
+
         for nid in selected_ids:
-            # Save original role as 'fake_behavior' implicitly or just know it was benign
-            # But the Honeypot logic might need to know what it "should" be.
-            # However, Honeypot usually behaves as a Trainer/Aggregator anyway until it pivots.
-            # But wait, if it degrades/decommissions, it needs to go back to fallback_role.
-            
-            # The current implementation just overwrites 'role'.
-            # If we want to restore it later, we might need to store it.
-            # But specifically for initializing, we just set it to 'honeypot'.
-            
             nodes[nid]["role"] = "honeypot"
             nodes[nid]["honeypot_seed"] = honeypot_config.get("seed", 0.5)
-            # Also set the fake_behavior if needed?
-            # malicious nodes have fake_behavior. honeypot behaves like a good node mostly.
-            # But 'fake_behavior' field is used by MaliciousRoleBehavior.
-            
+            # Guardamos también la configuración extendida en el nodo para usarla luego
+            nodes[nid]["honeypot_config"] = honeypot_config
+
         return nodes
 
 
@@ -733,9 +737,11 @@ class ScenarioManagement:
             self.scenario.nodes = self.scenario.mobility_assign(self.scenario.nodes, 0)
 
         # Assign Honeypot Role randomly among benign nodes
-        if self.scenario.honeypot and self.scenario.honeypot.get("enabled"):
+        # Only assign if not already assigned (avoid duplicate assignments)
+        if self.scenario.honeypot and self.scenario.honeypot.get("enabled") and not getattr(self.scenario, '_honeypot_assigned', False):
              # We pass the honeypot config
              self.scenario.nodes = self.scenario.honeypot_node_assign(self.scenario.nodes, self.scenario.honeypot)
+             self.scenario._honeypot_assigned = True  # Mark as assigned
              logging.info("Honeypot assignment completed.")
 
         # Save node settings
@@ -778,7 +784,7 @@ class ScenarioManagement:
             participant_config["device_args"]["gpu_id"] = self.scenario.gpu_id
             participant_config["device_args"]["logging"] = self.scenario.logginglevel
             participant_config["aggregator_args"]["algorithm"] = self.scenario.agg_algorithm
-            
+
             # Prepare Reputation Config (Enforce metrics enabled if main switch is enabled)
             reputation_config = copy.deepcopy(self.scenario.reputation)
             if reputation_config and reputation_config.get("enabled"):
@@ -787,7 +793,7 @@ class ScenarioManagement:
                      for m_key, m_val in reputation_config["metrics"].items():
                          if isinstance(m_val, dict):
                              m_val["enabled"] = True
-                 
+
                  # Disable Mitigations by default (as per user request: "no las mitigaciones")
                  if "mitigation" in reputation_config:
                      reputation_config["mitigation"]["enabled"] = False
@@ -798,13 +804,40 @@ class ScenarioManagement:
             if node_config["role"] == "malicious":
                 participant_config["adversarial_args"]["fake_behavior"] = node_config["fake_behavior"]
                 participant_config["adversarial_args"]["attack_params"] = node_config["attack_params"]
+
+                # Propagar configuración de pivote desde el objeto honeypot global
+                # (Ya que el frontend/usuario agrupa 'attacker_pivoting' ahi)
+                if self.scenario.honeypot:
+                     if "attacker_pivoting" in self.scenario.honeypot:
+                         participant_config["adversarial_args"]["attacker_pivoting"] = self.scenario.honeypot["attacker_pivoting"]
+                     if "pivot_round" in self.scenario.honeypot:
+                         participant_config["adversarial_args"]["pivot_round"] = self.scenario.honeypot["pivot_round"]
+
             elif node_config["role"] == "honeypot":
+                # Configuración base
                 participant_config["adversarial_args"]["attack_params"] = {"attacks": "No Attack"}
                 participant_config["defense_args"]["reputation"] = reputation_config
-                # Add specific honeypot config if needed (e.g. seed)
-                # It would be passed from node_config if added during topology generation
-                if "honeypot_seed" in node_config:
-                     participant_config["honeypot_args"] = {"seed": node_config["honeypot_seed"]}
+
+                # Obtenemos la configuración del frontend
+                hp_conf = self.scenario.honeypot if self.scenario.honeypot else {}
+
+                participant_config["honeypot_args"] = {
+                    "enabled": True,
+
+                    # 1. HONEYPOT: Siempre dinámico (Regla de defensa)
+                    "mode": "dynamic",
+
+                    # 2. ATACANTE: Solo pivota si el frontend lo pide.
+                    "attacker_pivoting": hp_conf.get("attacker_pivoting", False),
+
+                    # --- CORRECCIÓN: ELIMINAMOS pivot_round ---
+                    # Lo quitamos para que el Honeypot no dependa de la ronda del atacante.
+                    # El Honeypot actuará desde el principio (Ronda 1) según su propia lógica.
+
+                    "seed": node_config.get("honeypot_seed", hp_conf.get("seed", 0.5)),
+                    "count": hp_conf.get("count", 1)
+                }
+
             else:
                 participant_config["adversarial_args"]["attack_params"] = {"attacks": "No Attack"}
                 participant_config["defense_args"]["reputation"] = reputation_config
@@ -976,23 +1009,25 @@ class ScenarioManagement:
         # Ensure self.scenario.nodes structure exists mimicking what honeypot_node_assign expects
         if not self.scenario.nodes and self.config.participants:
             self.scenario.nodes = {
-                str(p["device_args"]["idx"]): p["device_args"] 
+                str(p["device_args"]["idx"]): p["device_args"]
                 for p in self.config.participants
             }
 
         # Apply Honeypot Assignment
-        if self.scenario.honeypot and self.scenario.honeypot.get("enabled"):
+        # Only assign if not already assigned (avoid duplicate assignments)
+        if self.scenario.honeypot and self.scenario.honeypot.get("enabled") and not getattr(self.scenario, '_honeypot_assigned', False):
              # Pass the constructed nodes dict
              if self.scenario.nodes:
                  self.scenario.nodes = self.scenario.honeypot_node_assign(self.scenario.nodes, self.scenario.honeypot)
-                 
+                 self.scenario._honeypot_assigned = True  # Mark as assigned
+
                  # Sync changes back to self.config.participants AND write to JSONs
                  for p in self.config.participants:
                      idx = str(p["device_args"]["idx"])
                      if idx in self.scenario.nodes:
                          new_role = self.scenario.nodes[idx]["role"]
                          p["device_args"]["role"] = new_role
-                         
+
                          # Persist to disk because subsequent logic re-reads the files
                          with open(f"{self.config_dir}/participant_{idx}.json", "w") as f:
                              json.dump(p, f, indent=4)
@@ -1038,7 +1073,7 @@ class ScenarioManagement:
                 if "defense_args" not in participant_config:
                     participant_config["defense_args"] = {}
                 participant_config["defense_args"]["honeypot"] = self.scenario.honeypot
-                
+
             participant_config["scenario_args"]["federation"] = self.scenario.federation
             participant_config["scenario_args"]["n_nodes"] = self.n_nodes + additional_nodes
             participant_config["network_args"]["neighbors"] = self.topologymanager.get_neighbors_string(i)
@@ -1351,7 +1386,7 @@ class ScenarioManagement:
         if base is None:
             logging.error(f"Failed to create or retrieve Docker network: {network_name}")
             raise Exception(f"Failed to create or retrieve Docker network: {network_name}")
-        
+
         logging.info(f"Using network base: {base} for network {network_name}")
 
         client = docker.from_env()

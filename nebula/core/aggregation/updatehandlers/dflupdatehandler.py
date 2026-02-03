@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 class Update:
     """
     Represents a model update received from a node in a specific training round.
-    
+
     Attributes:
         model (object): The model object or weights received.
         weight (float): The weight or importance of the update.
@@ -47,7 +47,7 @@ class DFLUpdateHandler(UpdateHandler):
     This handler manages the reception, storage, and tracking of model updates from federation nodes
     during asynchronous rounds. It supports partial updates, late arrivals, and maintains update history.
     """
-    
+
     def __init__(self, aggregator, addr, buffersize=MAX_UPDATE_BUFFER_SIZE):
         """
         Initialize the update handler with required locks and storage.
@@ -155,11 +155,11 @@ class DFLUpdateHandler(UpdateHandler):
             updt = Update(model, weight, source, round, time_received)
             await self._updates_storage_lock.acquire_async()
             if updt in self.us[source][1]:
-                logging.info(f"Discard | Alerady received update from source: {source} for round: {round}")
+                logging.info(f"Discard | Already received update from source: {source} for round: {round}")
             else:
-                last_update_used = self.us[source][0]
                 self.us[source][1].append(updt)
-                self.us[source] = (last_update_used, self.us[source][1])
+                # Actualizar el primer elemento del tuple con el último update recibido
+                self.us[source] = (updt, self.us[source][1])
                 logging.info(
                     f"Storage Update | source={source} | round={round} | weight={weight} | federation nodes: {self._sources_expected}"
                 )

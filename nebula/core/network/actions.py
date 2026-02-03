@@ -47,7 +47,10 @@ class ControlAction(Enum):
     WEAK_LINK = nebula_pb2.ControlMessage.Action.WEAK_LINK
     LEADERSHIP_TRANSFER = nebula_pb2.ControlMessage.Action.LEADERSHIP_TRANSFER
     LEADERSHIP_TRANSFER_ACK = nebula_pb2.ControlMessage.Action.LEADERSHIP_TRANSFER_ACK
-
+    TOPOLOGY_FLOOD = 100
+    REPUTATION_FLOOD = 101
+    BLOCK_NEIGHBOR = 102
+    BLOCK_NEIGHBOR_FLOOD = 103
 
 class DiscoverAction(Enum):
     """
@@ -82,6 +85,7 @@ class ReputationAction(Enum):
     """
 
     SHARE = nebula_pb2.ReputationMessage.Action.SHARE
+    SHARE_TABLE = nebula_pb2.ReputationMessage.Action.SHARE_TABLE
 
 
 # Mapping between message type strings and their corresponding Enum classes

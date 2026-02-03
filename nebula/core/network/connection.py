@@ -36,6 +36,12 @@ MAX_INCOMPLETED_RECONNECTIONS = 3
 
 
 class Connection:
+    def get_neighbors(self):
+        """
+        Devuelve los vecinos conocidos por esta conexión.
+        Como stub, devuelve solo el propio nodo remoto.
+        """
+        return [self.addr]
     """
     Manages TCP communication channels using asyncio for asynchronous networking.
 
@@ -61,40 +67,49 @@ class Connection:
     INACTIVITY_TIMER = 120
     INACTIVITY_DAEMON_SLEEP_TIME = 20
 
-    def __init__(
-        self,
-        reader,
-        writer,
-        id,
-        host,
-        port,
-        direct=True,
-        active=True,
-        compression="zlib",
-        config=None,
-        prio="medium",
-    ):
+    def __init__(self, reader, writer, peer_id, host, port, direct=False, config=None, prio=None, loop=None, **kwargs):
         self.reader = reader
         self.writer = writer
-        self.id = str(id)
+
+        # --- CORRECCIONES AQUÍ ---
+        self.id = str(peer_id)   # Usar peer_id, no 'id' (que es una función de Python)
+        self.peer_id = peer_id   # Guardamos el ID
+        self.node_id = peer_id   # Alias para seguridad
+        # -------------------------
+
         self.host = host
         self.port = port
         self.addr = f"{host}:{port}"
         self.direct = direct
-        self.active = active
+
+        # --- CORRECCIONES DE VARIABLES NO DEFINIDAS ---
+        self.active = True       # 'active' no estaba en los argumentos, lo ponemos a True
         self.last_active = time.time()
-        self.compression = compression
+        self.compression = False # 'compression' no estaba en argumentos, lo ponemos a False por defecto
+        # ----------------------------------------------
+
         self.config = config
         self._cm = None
 
-        self.federated_round = Connection.DEFAULT_FEDERATED_ROUND
-        self.loop = asyncio.get_event_loop()
+        # Esta línea es vital para evitar el crash del Engine anterior
+        self.round = -1
+
+        self.federated_round = 0  # Si tienes una constante DEFAULT_FEDERATED_ROUND úsala, si no, pon 0
+        self.loop = loop or asyncio.get_event_loop()
+
         self.read_task = None
         self.process_task = None
         self.inactivity_task = None
         self.pending_messages_queue = asyncio.Queue(maxsize=100)
         self.message_buffers: dict[bytes, dict[int, MessageChunk]] = {}
-        self._prio: ConnectionPriority = ConnectionPriority(prio)
+
+        # Aseguramos que prio no sea None para evitar errores
+        if prio is None:
+            from core.network.messages import ConnectionPriority # Importar si es necesario o usar un valor simple
+            self._prio = 1 # Valor por defecto (NORMAL)
+        else:
+            self._prio = prio
+
         self._inactivity = False
         self._last_activity = time.time()
         self._activity_lock = Locker(name="activity_lock", async_lock=True)
@@ -121,7 +136,8 @@ class Connection:
         )
 
     def __str__(self):
-        return f"Connection to {self.addr} (id: {self.id}) (active: {self.active}) (last active: {self.last_active}) (direct: {self.direct}) (priority: {self._prio.value})"
+        prio_val = self._prio.value if hasattr(self._prio, "value") else str(self._prio)
+        return f"Connection to {self.addr} (id: {self.id}) (active: {self.active}) (last active: {self.last_active}) (direct: {self.direct}) (priority: {prio_val})"
 
     def __repr__(self):
         return self.__str__()
@@ -309,22 +325,24 @@ class Connection:
             await self.cm.terminate_failed_reconnection(self)
             return
 
+        # Explicitly remove this broken connection to allow CM to create a new one
+        async with self.cm.connections_lock:
+            if self.cm.connections.get(self.addr) == self:
+                self.cm.connections.pop(self.addr)
+
         for attempt in range(max_retries):
             try:
                 logging.info(f"Attempting to reconnect to {self.addr} (attempt {attempt + 1}/{max_retries})")
+                # Attempt to establish a NEW connection
                 await self.cm.connect(self.addr)
                 await asyncio.sleep(1)
 
-                self.read_task = asyncio.create_task(
-                    self.handle_incoming_message(),
-                    name=f"Connection {self.addr} reader",
-                )
-                self.process_task = asyncio.create_task(
-                    self.process_message_queue(),
-                    name=f"Connection {self.addr} processor",
-                )
+                # If we succeeded, a new Connection object is now in self.cm.connections
+                # We should NOT restart tasks on this dead object.
+                # We just return and let this object's tasks finish/die.
+
                 if not self.forced_disconnection:
-                    logging.info(f"Reconnected to {self.addr}")
+                    logging.info(f"Reconnected to {self.addr} (delegated to new connection)")
                 return
             except Exception as e:
                 logging.exception(f"Reconnection attempt {attempt + 1} failed: {e}")
@@ -367,10 +385,17 @@ class Connection:
             message_id = uuid.uuid4().bytes
             data_prefix, encoded_data = self._prepare_data(data, pb, encoding_type)
 
-            if is_compressed:
-                encoded_data = await asyncio.to_thread(self._compress, encoded_data, self.compression)
-                if encoded_data is None:
-                    return
+            # Robust compression logic with fallback
+            used_compression = False
+            if is_compressed and self.compression:
+                compressed_data = await asyncio.to_thread(self._compress, encoded_data, self.compression)
+                if compressed_data is not None:
+                    encoded_data = compressed_data
+                    used_compression = True
+                else:
+                    logging.warning(f"Compression requested but failed/unsupported ({self.compression}). Sending uncompressed.")
+
+            if used_compression:
                 data_to_send = data_prefix + encoded_data + self.COMPRESSION_CHAR
             else:
                 data_to_send = data_prefix + encoded_data

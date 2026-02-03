@@ -89,6 +89,24 @@ class BlackList:
         if event_manager is not None:
             asyncio.create_task(event_manager.publish_node_event(nbe))
 
+    async def remove_from_blacklist(self, addr):
+        """
+        Removes a node from the blacklist manually (e.g. upon pardon).
+
+        Args:
+            addr (str): Address of the node to remove.
+        """
+        logging.info(f"Update blackList | addr manual removal: {addr}")
+        await self._blacklisted_nodes_lock.acquire_async()
+        if addr in self._blacklisted_nodes:
+            del self._blacklisted_nodes[addr]
+        await self._blacklisted_nodes_lock.release_async()
+
+        nbe = NodeBlacklistedEvent(addr, blacklisted=False)
+        event_manager = EventManager.get_instance()
+        if event_manager is not None:
+             asyncio.create_task(event_manager.publish_node_event(nbe))
+
     async def get_blacklist(self) -> set:
         """
         Adds a node to the blacklist and starts the cleaner task if not already running.

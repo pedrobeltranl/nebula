@@ -20,8 +20,12 @@ RUN apt-get install -y curl net-tools iproute2 iputils-ping
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 2
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 1
 
-# Install gcc and git
 RUN apt-get update && apt-get install -y build-essential gcc g++ clang git make cmake
+
+# Instalar pip para Python 3.11 y luego protobuf
+RUN apt-get update && apt-get install -y python3-pip
+RUN python3.11 -m ensurepip --upgrade
+RUN python3.11 -m pip install --upgrade pip protobuf
 
 # Install docker
 RUN apt-get update && apt-get install -y ca-certificates curl gnupg

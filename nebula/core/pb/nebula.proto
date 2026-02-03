@@ -119,6 +119,7 @@ message LinkMessage {
 message ReputationMessage {
   enum Action {
     SHARE = 0;
+    SHARE_TABLE = 1;
   }
   string node_id = 1; //Id of the node to which the reputation is sent
   float score = 2; //Score reputation

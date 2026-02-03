@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -95,7 +96,7 @@ class Engine:
         self.ip = config.participant["network_args"]["ip"]
         self.port = config.participant["network_args"]["port"]
         self.addr = config.participant["network_args"]["addr"]
-        
+
         self.name = config.participant["device_args"]["name"]
         self.client = docker.from_env()
 
@@ -146,9 +147,16 @@ class Engine:
         self.federation_ready_lock = Locker(name="federation_ready_lock", async_lock=True)
         self.round_lock = Locker(name="round_lock", async_lock=True)
         self._round_in_process_lock = Locker("round_in_process_lock", async_lock=True)
+
+        # Deduplication dictionary for block_neighbor_flood messages (to prevent re-forwarding duplicates)
+        self._processed_block_neighbor_floods = {}
+
         self.config.reload_config_file()
 
         self._cm = CommunicationsManager(engine=self)
+        # Registrar flooding de topología y reputación
+        self._cm.register_topology_flood_callbacks()
+        self._cm.register_reputation_flood_callbacks()
 
         self._reporter = Reporter(config=self.config, trainer=self.trainer)
 
@@ -174,11 +182,16 @@ class Engine:
         is_honeypot_defense_active = honeypot_defense.get("enabled", False)
         reputation_enabled = reputation_config.get("enabled", False)
 
-        if reputation_enabled or is_honeypot_defense_active:
+        if (reputation_enabled or is_honeypot_defense_active) and not self._is_malicious:
             self._reputation = Reputation(engine=self, config=self.config)
+        elif self._is_malicious:
+            logging.info("😈 I am malicious: Disabling Reputation system to accept all victims.")
 
         # Shadow Banning List (Emergency Defense without Disconnection)
         self._shadow_banned_nodes = set()
+        # [FIX] Flag to wait for Handover confirmation
+        self._waiting_honeypot_handover = False
+        self.blacklist = set()
 
     @property
     def cm(self):
@@ -199,7 +212,7 @@ class Engine:
     def trainer(self):
         """Trainer"""
         return self._trainer
-    
+
     @property
     def rb(self):
         """Role Behavior"""
@@ -280,18 +293,25 @@ class Engine:
             pass
 
     async def model_update_callback(self, source, message):
+        # --- FILTRO BLACKLIST ---
+        if source in self.blacklist:
+            logging.warning(f"⛔ Dropping model from BLACKLISTED node {source}.")
+            return # Ignoramos el mensaje totalmente
+        # ------------------------
         logging.info(f"🤖  handle_model_message | Received model update from {source} with round {message.round}")
-        
-        # SHADOW BAN CHECK
-        if source in self._shadow_banned_nodes:
-            logging.info(f"🛡️  SHADOW BAN: Silently discarding model update from {source}. (It thinks it was accepted)")
-            # We return immediately, so no Event is published, and Aggregator never receives it.
-            return
+
+        # ELIMINADO EL BLOQUEO DE SHADOW BAN AQUÍ.
+        # Si bloqueamos aquí, el agregador nunca recibe el evento y la ronda se congela.
+        # Dejamos que el agregador decida qué hacer con el modelo.
 
         if not self.get_federation_ready_lock().locked() and len(await self.get_federation_nodes()) == 0:
             logging.info("🤖  handle_model_message | There are no defined federation nodes")
             return
+
         decoded_model = self.trainer.deserialize_model(message.parameters)
+
+        # Pasamos el evento al sistema. El sistema de reputación (Addon) interceptará esto
+        # y si es malo, le bajará el peso a 0, pero PERMITIRÁ que la ronda termine.
         updt_received_event = UpdateReceivedEvent(decoded_model, message.weight, source, message.round)
         await EventManager.get_instance().publish_node_event(updt_received_event)
 
@@ -335,107 +355,188 @@ class Engine:
             logging.error(f"❗️  Connection {source} not found in connections...")
 
     async def _control_leadership_transfer_callback(self, source, message):
-        logging.info(f"🔧  handle_control_message | Trigger | Received leadership transfer message from {source}")
-        
-        # Security Check: Malicious nodes cannot accept Leadership/Honeypot roles
-        # UNLESS it is a Malicious Pivot trying to infect us!
-        is_pivot_attempt = message.log == "MALICIOUS_PIVOT_TRANSFER"
-        
-        if self._is_malicious and not is_pivot_attempt:
-            logging.warning(f"😈  I am MALICIOUS. Rejecting Leadership Transfer from {source}. (Restricted by Policy)")
-            return
+        # Decodificación robusta Bytes -> String
+        raw_log = getattr(message, "log", "")
+        if isinstance(raw_log, bytes):
+            msg_log = raw_log.decode('utf-8', errors='ignore')
+        else:
+            msg_log = str(raw_log) if raw_log else ""
 
-        # [FIX] Honeypot Protection: Reject standard Aggregator transfers to preserve defensive state
-        # The Honeypot should only move via its own pivoting logic (HONEYPOT_TRANSFER), not by random rotation.
-        # Note: We compare .value because Role Enum might be duplicated in imports (noderole.Role vs role.Role)
-        current_role_value = self.rb.get_role().value if hasattr(self.rb.get_role(), "value") else str(self.rb.get_role())
-        if current_role_value == "honeypot" and not (message.log and message.log.startswith("HONEYPOT_TRANSFER:")):
-             logging.warning(f"🍯  I am HONEYPOT. Rejecting standard Leadership Transfer from {source} to maintain defense state.")
-             return
+        is_pivot = "MALICIOUS_PIVOT_TRANSFER" in msg_log
+        is_honey = "HONEYPOT_TRANSFER:" in msg_log
+
+        # Filtros de Roles
+        if self._is_malicious and not is_pivot: return
+
+        current_role = str(self.rb.get_role())
+        # Allow HONEYPOT transfer OR MALICIOUS PIVOT to override a Honeypot
+        if "HONEYPOT" in current_role:
+            if is_pivot:
+                 logging.info(f"🛡️  HONEYPOT detected Malicious Pivot attempt from {source}. REJECTING.")
+                 msg = self.cm.create_message("control", "leadership_transfer_ack", log="REJECT")
+                 asyncio.create_task(self.cm.send_message(source, msg))
+                 return
+            if not is_honey: return
 
         target_role = Role.AGGREGATOR
         honeypot_state = None
-        
-        # Check if it is a Honeypot Transfer
-        if message.log and message.log.startswith("HONEYPOT_TRANSFER:"):
+
+        if is_honey:
+            logging.info(f"🍯 HONEYPOT TRANSFER from {source}")
+            target_role = Role.HONEYPOT
             try:
-                logging.info(f"🍯  handle_control_message | Detected Honeypot Transfer from {source}")
-                target_role = Role.HONEYPOT
-                payload = message.log.replace("HONEYPOT_TRANSFER:", "", 1)
+                payload = msg_log.replace("HONEYPOT_TRANSFER:", "", 1)
                 honeypot_state = json.loads(payload)
-            except Exception as e:
-                logging.error(f"Error parsing Honeypot State: {e}")
-        
-        # Check if it is a Malicious Pivot Transfer
-        elif message.log == "MALICIOUS_PIVOT_TRANSFER":
-             logging.info(f"💀  handle_control_message | Detected MALICIOUS PIVOT from {source}. I am being infected!")
+            except: pass
+        elif is_pivot:
+             logging.info(f"💀 MALICIOUS INFECTION from {source}")
              target_role = Role.MALICIOUS
+             try:
+                 parts = msg_log.split("MALICIOUS_PIVOT_TRANSFER:", 1)
+                 if len(parts) > 1 and parts[1]:
+                     malicious_config = json.loads(parts[1])
+                     self.config.participant["adversarial_args"] = malicious_config
+                     logging.info("💀 Malicious Configuration Injected into Victim Node.")
+
+                 # FIX: Unblock the attacker to allow ACK and future coordination
+                 if hasattr(self, "_reputation"):
+                      if source in self._reputation.permanently_blocked:
+                          logging.info(f"💀 Unblocking Attacker {source} in Reputation to accept infection.")
+                          self._reputation.permanently_blocked.discard(source)
+
+                 # Attempt to remove from network blacklist if exists
+                 if hasattr(self.cm, "bl"):
+                      asyncio.create_task(self.cm.bl.remove_from_blacklist(source))
+
+             except Exception as e:
+                 logging.warning(f"Failed to parse malicious payload or unblock attacker: {e}")
+
+        # --- FIX: PREVENT GENERIC TRANSFER OVERWRITING HONEYPOT ---
+        if target_role == Role.AGGREGATOR:
+            # Check if we have a pending high-priority role (HONEYPOT)
+            # We need to peek at the next role without consuming it.
+            # Ideally this should be a method in RoleBehavior, but accessing protected member is acceptable here for the fix.
+            if hasattr(self.rb, "_next_role_locker") and hasattr(self.rb, "_next_role"):
+                async with self.rb._next_role_locker:
+                    if self.rb._next_role == Role.HONEYPOT:
+                        logging.warning(f"🛡️  Ignoring generic Leadership Transfer from {source} because HONEYPOT transition is pending.")
+                        return
+
+        # --- FIX: CLEAR PENDING UPDATES IF BECOMING HONEYPOT ---
+        if target_role == Role.HONEYPOT:
+             logging.info("🍯  Enforcing Honeypot Priority: Clearing pending role scheduling.")
+             # Override any scheduled AGGREGATOR role from ACKs
+             await self.rb.set_next_role(target_role, source_to_notificate=source)
+
+             if honeypot_state:
+                 self._pending_honeypot_state = honeypot_state
+
+             if not await self._round_in_process_lock.locked_async():
+                 # Immediate update
+                 self._role_behavior = change_role_behavior(self.rb, target_role, self, self.config)
+                 if honeypot_state:
+                      self._role_behavior.manager.import_state(honeypot_state)
+
+                 # Re-set next role to ensure update_self_role consumes it cleanly if called
+                 await self.rb.set_next_role(target_role, source_to_notificate=source)
+                 await self.update_self_role()
+             return
+        # -------------------------------------------------------
 
         if await self._round_in_process_lock.locked_async():
-            logging.info("Learning cycle is executing, role behavior will be modified next round")
-            await self.rb.set_next_role(target_role, source_to_notificate=source)
-            if honeypot_state and target_role == Role.HONEYPOT:
-                 self._pending_honeypot_state = honeypot_state
+            # FIX: Send ACK immediately to prevent timeout at sender (Malicious Pivot)
+            # relying on update_self_role at next round is too slow for 3s timeout.
+            logging.info(f"Cycle active. Scheduling role {target_role} for next round. Sending immediate ACK to {source}.")
+            message = self.cm.create_message("control", "leadership_transfer_ack")
+            asyncio.create_task(self.cm.send_message(source, message))
+
+            # Pass source_to_notificate=None so update_self_role doesn't send a duplicate ACK later
+            await self.rb.set_next_role(target_role, source_to_notificate=None)
+
+            if honeypot_state: self._pending_honeypot_state = honeypot_state
         else:
-            try:
-                logging.info(f"Trying to modify Role behavior to {target_role}")
-                lock_task = asyncio.create_task(self._round_in_process_lock.acquire_async())
-                await asyncio.wait_for(lock_task, timeout=3)
-                self._role_behavior = change_role_behavior(self.rb, target_role, self, self.config)
-                
-                # Apply Honeypot State if valid
-                if target_role == Role.HONEYPOT:
-                     if honeypot_state and hasattr(self._role_behavior, "manager"):
-                         self._role_behavior.manager.import_state(honeypot_state)
-                         logging.info("🍯  Honeypot State Imported successfully.")
-                     
-                     if hasattr(self._role_behavior, "set_previous_honeypot_node"):
-                         self._role_behavior.set_previous_honeypot_node(source)
-                
-                await self.rb.set_next_role(target_role, source_to_notificate=source)
-                await self.update_self_role()
-                await self._round_in_process_lock.release_async()
-            except TimeoutError:
-                logging.info("Learning cycle is locked, role behavior will be modified next round")
-                await self.rb.set_next_role(target_role, source_to_notificate=source)
-                if honeypot_state and target_role == Role.HONEYPOT:
-                     self._pending_honeypot_state = honeypot_state
+            self._role_behavior = change_role_behavior(self.rb, target_role, self, self.config)
+            if target_role == Role.HONEYPOT and honeypot_state:
+                 self._role_behavior.manager.import_state(honeypot_state)
+            await self.rb.set_next_role(target_role, source_to_notificate=source)
+            await self.update_self_role()
 
     async def _control_leadership_transfer_ack_callback(self, source, message):
         logging.info(f"🔧  handle_control_message | Trigger | Received leadership transfer ack message from {source}")
-        
-        # If I am a Honeypot, receiving an ACK likely means I deployed a Scout.
-        # I must NOT change my role (and lose my state/memory) because I need to stay 
-        # to monitor the old threat ("Cleanup Phase"). 
-        # My retirement is handled internally by 'clean_rounds_counter' logic.
-        # [FIX] Compare by value to avoid Enum duplication issues
-        current_role_value = self.rb.get_role().value if hasattr(self.rb.get_role(), "value") else str(self.rb.get_role())
-        if current_role_value == "honeypot":
-             logging.info("🍯 Honeypot received Transfer ACK. Scout confirmed. Maintaining Honeypot role to monitor sector.")
-             # Update transfer timestamp if needed, but DO NOT demote.
+
+        current_role_val = str(self.rb.get_role())
+
+        # --- Handling for Malicious Node Pivot ACK ---
+        if "malicious" in current_role_val.lower():
+             if hasattr(self.rb, "_pivot_ack_event"):
+                  raw_log = getattr(message, "log", "")
+                  msg_log = raw_log.decode('utf-8', errors='ignore') if isinstance(raw_log, bytes) else (str(raw_log) if raw_log else "")
+
+                  is_rejected = "REJECT" in msg_log
+                  if is_rejected:
+                       self.rb._pivot_success = False
+                       logging.info(f"[Malicious] Received REJECT ACK from {source}.")
+                  else:
+                       self.rb._pivot_success = True
+                       logging.info(f"[Malicious] Received SUCCESS ACK from {source}.")
+
+                  self.rb._pivot_ack_event.set()
              return
 
-        # For standard roles, upgrade fallback to AGGREGATOR per user request
-        target_role = Role.AGGREGATOR 
+        if "honeypot" in current_role_val.lower():
+            if hasattr(self, '_waiting_honeypot_handover') and self._waiting_honeypot_handover:
+                logging.info(f"✅  Honeypot Handover Confirmed by {source}. I can now retire with honor.")
+                self.has_served_as_honeypot = True # FIX: Ensure we don't get re-promoted by factory
+                self._waiting_honeypot_handover = False
+                target_role = Role.AGGREGATOR
+
+                if await self._round_in_process_lock.locked_async():
+                    logging.info(f"Cycle active. Setting next role to {target_role} for next round.")
+                    await self.rb.set_next_role(target_role)
+                else:
+                    try:
+                        self._role_behavior = change_role_behavior(self.rb, target_role, self, self.config)
+                        await self.rb.set_next_role(target_role)
+                        await self.update_self_role()
+                        logging.info(f"🔄  Role switched to {target_role} immediately.")
+                    except Exception as e:
+                        logging.error(f"Error switching role immediately: {e}")
+            else:
+                logging.warning("Received Role ACK but I wasn't waiting for a handover. Ignoring.")
+            return
+
+        target_role = Role.AGGREGATOR
 
         if await self._round_in_process_lock.locked_async():
             logging.info("Learning cycle is executing, role behavior will be modified next round")
             await self.rb.set_next_role(target_role)
         else:
+            if not self._round_in_process_lock: return
             try:
                 lock_task = asyncio.create_task(self._round_in_process_lock.acquire_async())
                 await asyncio.wait_for(lock_task, timeout=3)
 
-                logging.info(f"Role behavior could be executed... Switching to {target_role.value}")
-                await self.rb.set_next_role(target_role)
-                await self.update_self_role()
+                # --- POST-LOCK SAFETY CHECK ---
+                if "honeypot" in str(self.rb.get_role()).lower():
+                     logging.warning("🛑 ACK processing Aborted: I became a HONEYPOT while waiting for lock.")
+                     if self._round_in_process_lock.locked():
+                         await self._round_in_process_lock.release_async()
+                     return
+                # ------------------------------
 
-                await self._round_in_process_lock.release_async()
+                try:
+                    await self.rb.set_next_role(target_role)
+                    await self.update_self_role()
+                except Exception as e:
+                     logging.error(f"Error updating role in ACK flow: {e}")
 
-            except TimeoutError:
-                logging.info("Learning cycle is locked, role behavior will be modified next round")
-                await self.rb.set_next_role(target_role)
-        
+                if self._round_in_process_lock.locked():
+                    self._round_in_process_lock.release()
+            except Exception as e:
+                logging.error(f"Error in ACK callback: {e}")
+                # Ensure lock is released even in catastrophic failure
+                if hasattr(self, '_round_in_process_lock') and self._round_in_process_lock.locked():
+                     self._round_in_process_lock.release()
 
     async def _connection_connect_callback(self, source, message):
         logging.info(f"🔗  handle_connection_message | Trigger | Received connection message from {source}")
@@ -479,47 +580,49 @@ class Engine:
         finally:
             await self.cm.get_connections_lock().release_async()
 
-    async def _reputation_share_callback(self, source, message):
-        try:
-            logging.info(f"handle_reputation_message | Trigger | Received reputation message from {source} | Node: {message.node_id} | Score: {message.score} | Round: {message.round}")
+    async def _reputation_share_table_callback(self, source, message):
+        # --- FIX: EL NODO MALICIOSO NO ENVÍA NI REENVÍA REPUTACIÓN ---
+        if self._is_malicious:
+            return
+        current_node = self.addr
+        target_node = message.node_id
 
-            current_node = self.addr
-            nei = message.node_id
+        # Guardar en nuestra base de datos de reputación
+        if hasattr(self, '_reputation') and self._reputation is not None:
+            # NEW: Mark source as an active reporter (Honest behavior indicator)
+            if hasattr(self._reputation, "mark_reporter"):
+                self._reputation.mark_reporter(source)
 
-            if hasattr(self, '_reputation') and self._reputation is not None:
-                if current_node != nei:
-                    key = (current_node, nei, message.round)
-                    if key not in self._reputation.reputation_with_all_feedback:
-                        self._reputation.reputation_with_all_feedback[key] = []
+            # Ignoramos reportes sobre nosotros mismos para no "ensuciar" nuestra memoria
+            if target_node != current_node:
+                key = (source, target_node, message.round) # Usamos 'source' como el reportero original si es posible, o el nodo que nos lo envía
+
+                # IMPORTANTE: Para evitar bucles infinitos de mensajes,
+                # solo procesamos si no hemos visto este dato exacto en esta ronda.
+                if key not in self._reputation.reputation_with_all_feedback:
+                    self._reputation.reputation_with_all_feedback[key] = []
                     self._reputation.reputation_with_all_feedback[key].append(message.score)
-                    
-                    # [HONEYPOT SUPPORT] Register accusation source to allow pivoting
-                    if hasattr(self._reputation, "register_accusation"):
-                         self._reputation.register_accusation(suspect=nei, reporter=source, score=message.score)
-            else:
-                # Emergency handling for nodes without full Reputation System enabled
-                # If we receive a CRITICAL alert (Score 0.0), we treat it as a Honeypot Warning.
-                if message.score == 0.0 and current_node != nei:
-                    logging.warning(f"🚨 EMERGENCY ALERT: Received Honeypot Warning about Node {nei} from {source}. SHADOW BANNING ENABLED.")
-                    
-                    # 1. Shadow Ban (Ignore updates, keep connection)
-                    # We do NOT verify if checking BlackList or Disconnecting.
-                    # We want the attacker to believe they are still part of the federation.
-                    self._shadow_banned_nodes.add(nei)
-                    logging.info(f"Node {nei} has been SHADOW BANNED. Updates will be silently discarded.")
-                
-                # RECOVERY: If we receive a High Score for a banned node, we un-ban it.
-                elif message.score > 0.8 and nei in self._shadow_banned_nodes:
-                    logging.info(f"🛡️  RECOVERY ALERT: Node {nei} has been CLEARED by {source} (Score {message.score}). Lifting Shadow Ban.")
-                    self._shadow_banned_nodes.remove(nei)
-                    
-        except Exception as e:
-            logging.exception(f"Error handling reputation message: {e}")
 
-    """                                                     ##############################
-                                                            #    REGISTERING CALLBACKS   #
-                                                            ##############################
-    """
+                    if hasattr(self._reputation, "register_accusation"):
+                        self._reputation.register_accusation(suspect=target_node, reporter=source, score=message.score)
+
+                    # [FIX] LÓGICA DE GOSSIP (COTILLEO) INTEGRADA
+                    # Si recibimos un dato nuevo, lo contamos a nuestros vecinos (excepto al que nos lo envió)
+                    # Esto permite que la información viaje por toda la red hasta el Honeypot.
+                    neighbors = await self.cm.get_addrs_current_connections(only_direct=True)
+                    for nei in neighbors:
+                        # No se lo devolvemos a quien nos lo envió, ni al nodo acusado
+                        if nei != source and nei != message.node_id:
+                            # Creamos una copia del mensaje o reenviamos el mismo
+                            gossip_msg = self.cm.create_message(
+                                "reputation",
+                                "share_table",
+                                node_id=message.node_id,
+                                score=message.score,
+                                round=message.round
+                            )
+                            asyncio.create_task(self.cm.send_message(nei, gossip_msg))
+
 
     async def register_events_callbacks(self):
         await self.init_message_callbacks()
@@ -811,13 +914,26 @@ class Engine:
                 logging.info("💤  Waiting initialization of the federation...")
                 # Lock to wait for the federation to be ready (only affects the first round, when the learning starts)
                 # Only applies to non-start nodes --> start node does not wait for the federation to be ready
-                await self.get_federation_ready_lock().acquire_async()
+                # --- FIX: INICIO ---
+                try:
+                    # Esperamos máximo 60 segundos a que llegue la señal de "Ready"
+                    await asyncio.wait_for(self.get_federation_ready_lock().acquire_async(), timeout=60.0)
+                except asyncio.TimeoutError:
+                    logging.warning("⚠️ Timeout esperando inicio de federación (DEADLOCK PREVENIDO).")
+
+                    # Verificamos si tenemos vecinos conectados. Si los hay, forzamos el inicio.
+                    active_neighbors = await self.cm.get_addrs_current_connections(only_direct=True)
+                    if len(active_neighbors) > 0:
+                        logging.info(f"✅ Se detectaron {len(active_neighbors)} vecinos activos. Procediendo con el entrenamiento forzosamente.")
+                    else:
+                        logging.error("❌ Timeout y sin vecinos. Es posible que el nodo quede aislado.")
+                # --- FIX: FIN ---
                 if self.config.participant["device_args"]["start"]:
                     logging.info("Propagate initial model updates.")
-                    
+
                     mpe = ModelPropagationEvent(await self.cm.get_addrs_current_connections(only_direct=True, myself=False), "initialization")
                     await EventManager.get_instance().publish_node_event(mpe)
-                    
+
                     await self.get_federation_ready_lock().release_async()
 
                 self.trainer.set_epochs(epochs)
@@ -832,28 +948,22 @@ class Engine:
                 await self.learning_cycle_lock.release_async()
 
     async def _waiting_model_updates(self):
-        """
-        Waits for the model aggregation results and updates the local model accordingly.
-
-        This method:
-        1. Awaits the result of the aggregation from the aggregator component.
-        2. If aggregation parameters are successfully received:
-        - Updates the local model with the aggregated parameters.
-        3. If no parameters are returned:
-        - Logs an error indicating aggregation failure.
-
-        This method is called after local training and before proceeding to the next round,
-        ensuring the model is synchronized with the federation's latest aggregated state.
-        """
         logging.info(f"💤  Waiting convergence in round {self.round}.")
-        params = await self.aggregator.get_aggregation()
-        if params is not None:
-            logging.info(
-                f"_waiting_model_updates | Aggregation done for round {self.round}, including parameters in local model."
-            )
-            self.trainer.set_model_parameters(params)
-        else:
-            logging.error("Aggregation finished with no parameters")
+        try:
+            # TODOS esperan (incluido malicioso) para no romper el ritmo
+            # Eliminado timeout hardcoded de 30s. El agregador gestiona su propio timeout por configuración.
+            params = await self.aggregator.get_aggregation()
+
+            if params is not None:
+                if self._is_malicious:
+                    logging.info("😈 Malicious: Sync done. Discarding model.")
+                else:
+                    self.trainer.set_model_parameters(params)
+        except asyncio.TimeoutError:
+            logging.warning(f"⏰ TIMEOUT in Round {self.round}. Proceeding.")
+        except Exception as e:
+            logging.error(f"Error during aggregation: {e}")
+
 
     def print_round_information(self):
         print_msg_box(
@@ -868,7 +978,7 @@ class Engine:
             return False
         else:
             return current_round >= self.total_rounds
-        
+
     async def resolve_missing_updates(self):
         """
         Delegates the resolution strategy for missing updates to the current role behavior.
@@ -882,7 +992,7 @@ class Engine:
         """
         logging.info(f"Using Role behavior: {self.rb.get_role_name()} conflict resolve strategy")
         return await self.rb.resolve_missing_updates()
-    
+
     async def update_self_role(self):
         """
         Checks whether a role update is required and performs the transition if necessary.
@@ -903,7 +1013,7 @@ class Engine:
             next_role = await self.rb.get_next_role()
             source_to_notificate = await self.rb.get_source_to_notificate()
             self._role_behavior: RoleBehavior = change_role_behavior(self.rb, next_role, self, self.config)
-            
+
             # Apply pending state if exists (for Honeypot transfer)
             if next_role == Role.HONEYPOT:
                  if hasattr(self, "_pending_honeypot_state") and self._pending_honeypot_state:
@@ -911,18 +1021,48 @@ class Engine:
                          self._role_behavior.manager.import_state(self._pending_honeypot_state)
                          logging.info("🍯  Honeypot State Imported from pending state.")
                      self._pending_honeypot_state = None
-                 
+
                  if hasattr(self._role_behavior, "set_previous_honeypot_node") and source_to_notificate:
                       self._role_behavior.set_previous_honeypot_node(source_to_notificate)
-            
+
             to_role = self.rb.get_role_name()
             logging.info(f"Role behavior changing from: {from_role} to {to_role}")
             self.config.participant["device_args"]["role"] = to_role
+
+            # --- FIX: Synchronize malicious flag for Frontend and Logic ---
+            if to_role == "malicious":
+                 self.config.participant["device_args"]["malicious"] = True
+                 self._is_malicious = True
+                 # We don't destroy reputation here, but we might want to stop reporting?
+            else:
+                 self.config.participant["device_args"]["malicious"] = False
+                 self._is_malicious = False
+
+                 # Initialize Reputation if we are becoming BENIGN and don't have it yet
+                 reputation_enabled = self.config.participant.get("defense_args", {}).get("reputation", {}).get("enabled", False)
+                 honeypot_active = self.config.participant.get("defense_args", {}).get("honeypot", {}).get("enabled", False)
+
+                 if (reputation_enabled or honeypot_active) and not hasattr(self, "_reputation"):
+                     logging.info(f"🛡️  Initializing Reputation System for reformed node: {to_role}")
+                     try:
+                         self._reputation = Reputation(engine=self, config=self.config)
+                         # Trigger setup immediately if needed
+                         if hasattr(self._reputation, "setup"):
+                             asyncio.create_task(self._reputation.setup())
+                         # Register callbacks if not already done? They are usually registered in __init__
+                         # but we might need to verify if Engine registers them.
+                         # Engine registers callbacks in __init__ -> register_rep_callbacks.
+                         # We are already running, so callbacks might be registered but handling nothing because _reputation was None?
+                         # Check _reputation_share_table_callback
+                     except Exception as e:
+                         logging.error(f"Failed to initialize Reputation for reformed node: {e}")
+            # --------------------------------------------------
+
             if source_to_notificate:
                 logging.info(f"Sending role modification ACK to transferer: {source_to_notificate}")
                 message = self.cm.create_message("control", "leadership_transfer_ack")
                 asyncio.create_task(self.cm.send_message(source_to_notificate, message))
-        
+
         else:
             # Handle Redundant Role Transfers (e.g. Honeypot -> Honeypot)
             # If we receive a transfer for the role we already have, we MUST ACK it to stop the sender.
@@ -930,10 +1070,10 @@ class Engine:
             if source_to_notificate:
                 next_role = await self.rb.get_next_role()
                 current_role_enum = self.rb.get_role()
-                
+
                 if next_role == current_role_enum:
                     logging.info(f"Received redundant role transfer notification from {source_to_notificate}. Current: {current_role_enum}. Sending ACK.")
-                    
+
                     # Apply pending state if exists (Honeypot Refresh)
                     if current_role_enum == Role.HONEYPOT and hasattr(self, "_pending_honeypot_state") and self._pending_honeypot_state:
                         if hasattr(self._role_behavior, "manager"):
@@ -951,37 +1091,23 @@ class Engine:
     async def _learning_cycle(self):
         """
         Main asynchronous loop for executing the Federated Learning process across multiple rounds.
-
-        This method orchestrates the entire lifecycle of each federated learning round, including:
-        1. Starting each round:
-        - Updating the list of federation nodes.
-        - Publishing a `RoundStartEvent` for local and global monitoring.
-        - Preparing the trainer and aggregator components.
-        2. Running the core learning logic via `_extended_learning_cycle`.
-        3. Ending each round:
-        - Publishing a `RoundEndEvent`.
-        - Releasing and updating the current round state in the configuration.
-        - Invoking callbacks for the trainer to handle end-of-round logic.
-
-        After completing all rounds:
-        - Finalizes the trainer by calling `on_learning_cycle_end()` and optionally performs testing.
-        - Reports the scenario status to the controller if required.
-        - Optionally stops the Docker container if deployed in a containerized environment.
-
-        This function blocks (awaits) until the full FL process concludes.
         """
         while self.round is not None and self.round < self.total_rounds:
             async with self._round_in_process_lock:
+                # Clean up old deduplication entries for block_neighbor_flood
+                self._processed_block_neighbor_floods.clear()
+
                 current_time = time.time()
                 print_msg_box(
                     msg=f"Round {self.round} of {self.total_rounds - 1} started (max. {self.total_rounds} rounds)",
                     indent=2,
                     title="Round information",
                 )
-                
+
                 await self.update_self_role()
-                
+
                 logging.info(f"Federation nodes: {self.federation_nodes}")
+                # Asumiendo que self.cm es el CommunicationsManager (en versiones anteriores solía ser self.network_manager)
                 await self.update_federation_nodes(
                     await self.cm.get_addrs_current_connections(only_direct=True, myself=True)
                 )
@@ -992,11 +1118,24 @@ class Engine:
                 logging.info(f"Expected nodes: {expected_nodes}")
                 direct_connections = await self.cm.get_addrs_current_connections(only_direct=True)
                 undirected_connections = await self.cm.get_addrs_current_connections(only_undirected=True)
-                
+
                 logging.info(f"Direct connections: {direct_connections} | Undirected connections: {undirected_connections}")
                 logging.info(f"[Role {self.rb.get_role_name()}] Starting learning cycle...")
-                
-                await self.aggregator.update_federation_nodes(expected_nodes)
+
+                # --- FIX: Retry logic to prevent TimeoutError crash ---
+                max_retries = 5
+                for attempt in range(max_retries):
+                    try:
+                        await self.aggregator.update_federation_nodes(expected_nodes)
+                        break
+                    except asyncio.TimeoutError:
+                        logging.warning(f"⚠️ Aggregator is busy (Lock Timeout). Retrying {attempt+1}/{max_retries}...")
+                        await asyncio.sleep(2)
+                    except Exception as e:
+                        logging.error(f"❌ Unexpected error updating aggregator: {e}")
+                        break
+                # -----------------------------------------------------
+
                 async with self._role_behavior_performance_lock:
                     await self.rb.extended_learning_cycle()
 
@@ -1006,30 +1145,97 @@ class Engine:
 
                 await self.get_round_lock().acquire_async()
 
+                # --- HONEYPOT PIVOT LOGIC START ---
+                # DISABLED: Conflict with noderole.py intelligent logic
+                # if hasattr(self.rb, "get_role") and hasattr(self._role_behavior, "manager"):
+                #      current_role_val = self.rb.get_role().value if hasattr(self.rb.get_role(), "value") else str(self.rb.get_role())
+
+                #      if current_role_val == "honeypot":
+                #          try:
+                #              target_node = self._role_behavior.manager.decide_pivot_target(
+                #                  self._reputation,
+                #                  my_id=self.addr,
+                #                  threshold_trust=0.0
+                #              )
+                #              if target_node:
+                #                  logging.info(f"🍯  Honeypot decided to pivot to {target_node} to audit suspicious activity.")
+                #                  state_package = self._role_behavior.manager.export_state()
+                #                  msg_payload = "HONEYPOT_TRANSFER:" + json.dumps(state_package)
+                #                  message = self.cm.create_message("control", "leadership_transfer", log=msg_payload)
+                #                  asyncio.create_task(self.cm.send_message(target_node, message))
+                #                  self._waiting_honeypot_handover = True
+                #                  logging.info("⏳  Honeypot invitation sent. Waiting for ACK from successor before retiring.")
+                #          except Exception as e:
+                #              logging.error(f"Error during Honeypot Pivot check: {e}")
+                # --- HONEYPOT PIVOT LOGIC END ---
+
                 print_msg_box(
                     msg=f"Round {self.round} of {self.total_rounds - 1} finished (max. {self.total_rounds} rounds)",
                     indent=2,
                     title="Round information",
                 )
-                # await self.aggregator.reset()
+
                 self.trainer.on_round_end()
+
+                # --- 🛑 BARRERA DE SINCRONIZACIÓN ROBUSTA 🛑 ---
+                logging.info(f"🚧 Waiting for neighbors to finish round {self.round}...")
+
+                while True:
+                    if hasattr(self.cm, 'connections'):
+                        connections = list(self.cm.connections.values())
+                        active_neighbors = [c for c in connections if c.active]
+                    else:
+                        active_neighbors = []
+
+                    if not active_neighbors:
+                        logging.warning("⚠️ No neighbors visible. Proceeding forcefully.")
+                        break
+
+                    # Verificar rondas usando getattr para evitar crashes si falta el atributo
+                    neighbors_ready = all(
+                        (getattr(c, 'round', -1) >= self.round) or (self.round == 0 and getattr(c, 'round', -1) == -1)
+                        for c in active_neighbors
+                    )
+
+                    if neighbors_ready:
+                        logging.info("✅ All neighbors match current round. Advancing.")
+                        break
+                    else:
+                        # Log seguro que no crashea si falta peer_id o round
+                        laggards = []
+                        for c in active_neighbors:
+                            c_round = getattr(c, 'round', -1)
+                            # Aceptamos round -1 si estamos en round 0
+                            if c_round < self.round and not (self.round == 0 and c_round == -1):
+                                # Intentamos obtener el ID de varias formas
+                                c_id = getattr(c, 'peer_id', getattr(c, 'node_id', 'UnknownID'))
+                                laggards.append(f"{c_id}(R{c_round})")
+
+                        if laggards:
+                            logging.info(f"⏳ Waiting for lagging neighbors: {laggards} (My Round: {self.round})")
+
+                        try:
+                            if hasattr(self.cm, 'send_sync_signal'):
+                                await self.cm.send_sync_signal(specific_round=self.round)
+                        except Exception as e:
+                            pass
+
+                        await asyncio.sleep(2)
+                # ----------------------------------------------------
+
                 self.round += 1
                 self.config.participant["federation_args"]["round"] = (
                     self.round
-                )  # Set current round in config (send to the controller)
+                )
                 await self.get_round_lock().release_async()
 
-        # End of the learning cycle
         self.trainer.on_learning_cycle_end()
-
         await self.trainer.test()
-        
-        # Shutdown protocol
         await self._shutdown_protocol()
-            
+
     async def _shutdown_protocol(self):
         logging.info("Starting graceful shutdown process...")
-        
+
         # 1.- Publish Experiment Finish Event to the last update on modules
         logging.info("Publishing Experiment Finish Event...")
         efe = ExperimentFinishEvent()
@@ -1160,3 +1366,105 @@ class Engine:
                     logging.info(f"📦  Forced removal of container {docker_id} via subprocess")
                 except Exception as sub_e:
                     logging.exception(f"📦  Failed to force remove container {docker_id}: {sub_e}")
+
+    async def _control_block_neighbor_callback(self, source, message):
+        """
+        Recibe orden del Honeypot para aislar a un nodo atacante.
+        """
+        try:
+            # El ID del atacante viene en el log del mensaje
+            raw_log = getattr(message, "log", "")
+            attacker_id = raw_log.decode('utf-8') if isinstance(raw_log, bytes) else str(raw_log)
+
+            if attacker_id and attacker_id != self.addr:
+                logging.warning(f"🛡️ SECURITY ALERT received from {source}. Blocking data from {attacker_id} (Connection kept open).")
+
+                # FIX: User requested NOT to block connection, but ignore data.
+                if hasattr(self, "_reputation") and hasattr(self._reputation, "force_block"):
+                    self._reputation.force_block(attacker_id)
+                else:
+                    logging.warning("Reputation module missing. Falling back to blacklist.")
+                    self.blacklist.add(attacker_id)
+
+                # self.blacklist.add(attacker_id) # DISABLED BY USER CONFIG
+
+                # Opcional: Cortar conexión física si quieres ser agresivo
+                # await self.cm.disconnect(attacker_id)
+        except Exception as e:
+            logging.error(f"Error processing block order: {e}")
+
+    async def _control_block_neighbor_flood_callback(self, source, message):
+        """
+        Recibe y propaga orden de bloqueo del Honeypot usando mecanismo de flood.
+        Similar a topology_flood, el mensaje se reenvía a todos los vecinos para asegurar
+        que alcance a todos los nodos incluso sin conexión directa.
+        """
+        if not message or not hasattr(message, 'log'):
+            return
+
+        try:
+            # Decodificar el JSON del payload
+            payload_str = message.log.decode('utf-8') if isinstance(message.log, bytes) else str(message.log)
+            payload = json.loads(payload_str)
+        except Exception as e:
+            logging.error(f"Error parsing block_neighbor_flood message: {e}")
+            return
+
+        if not isinstance(payload, dict) or payload.get("type") != "block_neighbor_flood":
+            return
+
+        try:
+            attacker_id = payload.get("attacker_id", "")
+            targets = payload.get("targets", [])
+            round_num = payload.get("round", 0)
+
+            if not attacker_id:
+                return
+
+            # Deduplicación: evitar procesar el mismo flood dos veces
+            canonical_content = json.dumps(payload, sort_keys=True)
+            hash_val = hashlib.sha256(canonical_content.encode()).hexdigest()
+
+            if hash_val in self._processed_block_neighbor_floods:
+                return
+
+            self._processed_block_neighbor_floods[hash_val] = True
+
+            # 1. Si nosotros estamos en la lista de targets, bloqueamos al atacante
+            if self.addr in targets or self.addr in [t.split(':')[0] for t in targets if ':' in t]:
+                logging.warning(f"🛡️ BLOCK FLOOD received from {source}. Blocking data from {attacker_id} (round {round_num})")
+
+                # FIX: Use network_block=False so we can still SEND messages to the attacker (to complete their round)
+                # but we will ignore their received models via Aggregator filtering logic.
+                can_block_network = False # Prevents deadlock where attacker waits for us indefinitely
+
+                if hasattr(self, "_reputation") and hasattr(self._reputation, "force_block"):
+                    self._reputation.force_block(attacker_id, network_block=can_block_network)
+                else:
+                    logging.warning("Reputation module missing. Falling back to blacklist.")
+                    if not hasattr(self, 'blacklist'):
+                        self.blacklist = set()
+                    self.blacklist.add(attacker_id)
+
+            # 2. Propagar el mensaje a TODOS los vecinos (excepto la fuente y el atacante)
+            neighbors = set(self.cm.connections.keys())
+            if source in neighbors:
+                neighbors.discard(source)  # No reenviamos a quien nos lo envió
+
+            # NUNCA reenviamos al atacante para que no se entere del bloqueo
+            if attacker_id in neighbors:
+                neighbors.discard(attacker_id)
+
+            if neighbors:
+                logging.debug(f"[Honeypot] 📡 Forwarding BLOCK FLOOD for {attacker_id} to {len(neighbors)} neighbors")
+                fwd_message = self.cm.create_message(
+                    "control",
+                    "block_neighbor_flood",
+                    log=canonical_content
+                )
+
+                for neighbor in neighbors:
+                    asyncio.create_task(self.cm.send_message(neighbor, fwd_message))
+
+        except Exception as e:
+            logging.error(f"Error processing block_neighbor_flood: {e}", exc_info=True)

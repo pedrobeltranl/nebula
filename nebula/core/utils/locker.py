@@ -5,10 +5,11 @@ import threading
 
 
 class Locker:
-    def __init__(self, name, verbose=True, async_lock=False, *args, **kwargs):
+    def __init__(self, name, verbose=True, async_lock=False,timeout=30, *args, **kwargs):
         self._name = name
         self._verbose = verbose
         self._async_lock = async_lock
+        self.timeout = timeout
 
         if async_lock:
             self._lock = asyncio.Lock(*args, **kwargs)
@@ -92,6 +93,7 @@ class Locker:
         result = self._lock.locked()
         if self._verbose:
             logging.debug(f"🔐  Async lock [{self._name}] is locked? {result}")
+        return result
 
     async def __aenter__(self):
         logging.debug(f"🔒  Acquiring async lock [{self._name}] using [async with] statement")

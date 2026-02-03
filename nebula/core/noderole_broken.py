@@ -1,7 +1,6 @@
 from __future__ import annotations
 import logging
 import asyncio
-import time
 from nebula.addons.attacks.attacks import create_attack
 from nebula.addons.functions import print_msg_box
 from nebula.config.config import Config
@@ -210,28 +209,9 @@ class MaliciousRoleBehavior(RoleBehavior):
         self.threat_confirmed_locally = False
         self.blacklist = set()
 
-        # Estado de Pivote
-        self._pivot_ack_event = asyncio.Event()
-        self._pivot_success = False
-
     def get_role(self): return self._role
     def get_role_name(self, effective=False):
         return self._fake_role_behavior.get_role_name() if effective else self._role.value
-
-    async def set_next_role(self, role: Role, source_to_notificate = None):
-        """
-        Override set_next_role to enforce persistence of Malicious Role.
-        If attacker_pivoting is False (i.e. permanently infected victim),
-        reject any request to switch back to AGGREGATOR.
-        """
-        if role == Role.AGGREGATOR:
-             # Only allow reverting to Aggregator if we are a Pivoting Attacker (Node 6) trying to hide.
-             # Infected victims (attacker_pivoting=False) must remain Malicious forever.
-             if not self._attacker_pivoting:
-                  logging.warning(f"[Malicious] 🛑 Blocked attempt to revert to AGGREGATOR. Staying Malicious forever (Persistence).")
-                  return
-
-        await super().set_next_role(role, source_to_notificate)
 
     async def extended_learning_cycle(self):
         # 1. Ataque
@@ -247,67 +227,18 @@ class MaliciousRoleBehavior(RoleBehavior):
             if self._engine.round == self._pivot_round:
                  nodes = await self._engine.cm.get_addrs_current_connections(only_direct=False, myself=False)
                  if nodes:
-                     # Shuffle nodes to try in random order
-                     targets = list(nodes)
-                     random.shuffle(targets)
+                     target = random.choice(list(nodes))
+                     logging.info(f"[Malicious] 🏃 Pivoting to {target} at Round {self._engine.round}")
+                     if target not in self._engine.cm.connections:
+                          await self._engine.cm.establish_connection(target)
 
-                     pivot_successful = False
+                     # ENVÍO CORRECTO (log como argumento)
+                     msg = self._engine.cm.create_message("control", "leadership_transfer", log="MALICIOUS_PIVOT_TRANSFER")
+                     asyncio.create_task(self._engine.cm.send_message(target, msg))
 
-                     for target in targets:
-                         logging.info(f"[Malicious] 🏃 Attempting Pivot to {target} at Round {self._engine.round}")
-
-                         if target not in self._engine.cm.connections:
-                              await self._engine.cm.establish_connection(target)
-
-                         # Serialize adversarial args for valid pivot
-                         adv_args = self._config.participant.get("adversarial_args", {}).copy()
-                         pivot_interval = adv_args.get("pivot_round", 10)
-                         # Ensure we don't just use current round + same interval, but align it if needed.
-                         new_pivot_round = self._engine.round + pivot_interval
-                         adv_args["pivot_round"] = new_pivot_round
-
-                         # Force disable further pivoting for the next node (as per requirements)
-                         adv_args["attacker_pivoting"] = False
-
-                         payload = json.dumps(adv_args)
-                         # Logging for debug
-                         logging.info(f"[Malicious] Prepared payload size: {len(payload)} bytes")
-
-                         log_message = f"MALICIOUS_PIVOT_TRANSFER:{payload}"
-                         msg = self._engine.cm.create_message("control", "leadership_transfer", log=log_message)
-
-                         # Send and wait for ACK (Sync-like behavior)
-                         asyncio.create_task(self._engine.cm.send_message(target, msg))
-
-                         # Prepare event for ACK
-                         self._pivot_ack_event.clear()
-                         self._pivot_success = False
-
-                         try:
-                             # Wait for 10 seconds for an ACK (Increased to handle delays/blocking)
-                             logging.info(f"[Malicious] ⏳ Waiting for ACK from {target}...")
-                             await asyncio.wait_for(self._pivot_ack_event.wait(), timeout=10.0)
-
-                             if self._pivot_success:
-                                  logging.info(f"[Malicious] ✅ Pivot to {target} ACCEPTED!")
-                                  pivot_successful = True
-                                  break
-                             else:
-                                  logging.warning(f"[Malicious] ❌ Pivot to {target} REJECTED by target (likely Honeypot). Trying next...")
-
-                         except asyncio.TimeoutError:
-                             logging.warning(f"[Malicious] ⚠️ Pivot attempt to {target} Timed Out. Trying next...")
-
-                     if pivot_successful:
-                         self._pivoted = True
-                         # Change local role to benign AGGREGATOR only on success
-                         if hasattr(self._engine, "rb"):
-                             await self._engine.rb.set_next_role(Role.AGGREGATOR)
-                             await self._engine.update_self_role()
-                     else:
-                         logging.error("[Malicious] 💀 All pivot attempts failed! Stuck as Malicious for now.")
-                         # Retry next round?
-                         self._pivot_round += 1
+                     self._pivoted = True
+                     if hasattr(self._engine, "rb"):
+                         await self._engine.rb.set_next_role(Role.AGGREGATOR)
 
     async def select_nodes_to_wait(self): return await self._fake_role_behavior.select_nodes_to_wait()
     async def resolve_missing_updates(self): return await self._fake_role_behavior.resolve_missing_updates()
@@ -424,11 +355,7 @@ class AggregatorRoleBehavior(RoleBehavior):
 
         # Transfer leadership
         neighbors = await self._engine.cm.get_addrs_current_connections(myself=False)
-        # Check if we are the main behavior or just a wrapper.
-        # If wrapped (e.g. by MaliciousRoleBehavior), do NOT trigger benign leadership transfer.
-        is_active_behavior = (self._engine.rb == self)
-
-        if is_active_behavior and len(neighbors) and not self._transfer_send:
+        if len(neighbors) and not self._transfer_send:
             random_neighbor = random.choice(list(neighbors))
             lt_message = self._engine.cm.create_message("control", "leadership_transfer")
             logging.info(f"Sending transfer leadership to: {random_neighbor}")
@@ -437,18 +364,6 @@ class AggregatorRoleBehavior(RoleBehavior):
 
     async def select_nodes_to_wait(self):
         nodes = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
-
-        # Filter out nodes that are permanently blocked in Reputation (Soft Blocked)
-        # This allows standard aggregators to ignore malicious nodes that are kept connected for monitoring
-        if hasattr(self._engine, "_reputation") and hasattr(self._engine._reputation, "permanently_blocked"):
-            blocked = self._engine._reputation.permanently_blocked
-            blocked_set = set(blocked)
-
-            soft_blocked = nodes.intersection(blocked_set)
-            if soft_blocked:
-                # logging.info(f"[Aggregator] 🛡️ Excluding soft-blocked nodes from wait list: {soft_blocked}")
-                nodes = nodes - soft_blocked
-
         return nodes
 
     async def resolve_missing_updates(self):
@@ -608,8 +523,7 @@ def factory_role_behavior(role: str, engine: Engine, config: Config) -> RoleBeha
              # Check if we have already served/retired to prevent infinite loops
              is_already_retired = getattr(engine, "has_served_as_honeypot", False)
 
-             mode = honeypot_args.get("mode", "dynamic")
-             if honeypot_args.get("enabled", False) and not is_already_retired and mode != "fixed":
+             if honeypot_args.get("enabled", False) and not is_already_retired:
                  scenario_args = config.participant.get("scenario_args", {})
                  device_args = config.participant.get("device_args", {})
 
@@ -656,39 +570,22 @@ def factory_role_behavior(role: str, engine: Engine, config: Config) -> RoleBeha
 
 def change_role_behavior(old_role: RoleBehavior, new_role: Role, *parameters) -> RoleBehavior:
     engine, config = parameters
+    if not isinstance(old_role, MaliciousRoleBehavior):
+        new_behavior = factory_role_behavior(new_role.value, engine, config)
 
-    # 2026-02-03: FIX - Always create a new behavior object, even if leaving Malicious role.
-    # This ensures that when a Malicious node pivots (becoming Aggregator), it actually stops being malicious.
-    # The previous logic (commented out in else) was preventing the Malicious wrapper from being discarded.
+        # If switching TO Honeypot, save the previous role
+        if new_role == Role.HONEYPOT:
+             # Assuming old_role is the one we are leaving
+             prev_role_name = old_role.get_role_name()
+             if hasattr(new_behavior, "set_previous_role"):
+                 new_behavior.set_previous_role(prev_role_name)
+                 logging.info(f"[Honeypot] Previous role saved: {prev_role_name}")
 
-    new_behavior = factory_role_behavior(new_role.value, engine, config)
-
-    # If switching TO Honeypot, save the previous role
-    if new_role == Role.HONEYPOT:
-            # Assuming old_role is the one we are leaving
-            prev_role_name = old_role.get_role_name()
-            if hasattr(new_behavior, "set_previous_role"):
-                new_behavior.set_previous_role(prev_role_name)
-                logging.info(f"[Honeypot] Previous role saved: {prev_role_name}")
-
-    return new_behavior
-
-    # if not isinstance(old_role, MaliciousRoleBehavior):
-    #     new_behavior = factory_role_behavior(new_role.value, engine, config)
-
-    #     # If switching TO Honeypot, save the previous role
-    #     if new_role == Role.HONEYPOT:
-    #          # Assuming old_role is the one we are leaving
-    #          prev_role_name = old_role.get_role_name()
-    #          if hasattr(new_behavior, "set_previous_role"):
-    #              new_behavior.set_previous_role(prev_role_name)
-    #              logging.info(f"[Honeypot] Previous role saved: {prev_role_name}")
-
-    #     return new_behavior
-    # else:
-    #     fake_behavior = factory_role_behavior(new_role.value, engine, config)
-    #     old_role._fake_role_behavior = fake_behavior
-    #     return old_role
+        return new_behavior
+    else:
+        fake_behavior = factory_role_behavior(new_role.value, engine, config)
+        old_role._fake_role_behavior = fake_behavior
+        return old_role
 
 """                                                         ##############################
                                                             #       HONEYPOT BEHAVIOR      #
@@ -743,60 +640,26 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         # Track the reputation of the known threat before and after to detect pivoting
         self._known_threat_node = None
-        self._current_target_attacker = None # Track the active target ID
         self._known_threat_reputation_history = {}  # {round: reputation_score}
         self._reputation_history = {}  # {round: {node_id: rep}} - Historial completo para detectar caídas
         self._pivot_detection_threshold = 0.3  # Si la reputación sube más de esto en una ronda, pivotó
-        self._pivot_recovery_counter = 0 # New counter for reputation recovery
 
         # Para un honeypot secundario que busca el nuevo atacante
         self._secondary_honeypot_candidates = set()  # Nodos vecinos que podrían ser convertidos a honeypot
         self._recovery_rounds_counter = 0  # Contador de rondas donde la reputación se recupera
         self._max_recovery_rounds = 3  # Si se recupera 3 rondas seguidas, desaparecer
 
-        # --- SIDE CHANNEL LISTENER ---
-        # Cache updates bypassing aggregator filters (valid for capturing blocked nodes)
-        self._latest_updates_cache = {}
-        EventManager.get_instance().subscribe_node_event(UpdateReceivedEvent, self._handle_update_event)
-
-    async def _handle_update_event(self, event: UpdateReceivedEvent):
-        try:
-             # Capture all updates to catch blocked/silenced nodes
-             (model, weight, source, round_num, _) = await event.get_event_data()
-             self._latest_updates_cache[source] = {
-                 'model': model,
-                 'round': round_num,
-                 'weight': weight,
-                 'timestamp': time.time()
-             }
-             if hasattr(self, '_current_target_attacker') and source == self._current_target_attacker:
-                 logging.debug(f"[Honeypot] 🕵️ Side-channel captured update from target {source} (Round {round_num})")
-        except Exception:
-             pass
-
     async def extended_learning_cycle(self):
         # --- FIX: Mimic Benign Aggregator Behavior FIRST ---
         # The Honeypot must train (or fake it) and PROPAGATE its model so neighbors don't deadlock.
 
-        # 0. Update Map / Verify Threat State / Control Learning Rate
-        # USER REQUEST: When threat is confirmed, disable active defense (Honey Info) and train normally.
-        if self.threat_confirmed_locally:
-             logging.info("[Honeypot] 🛑 Threat confirmed. Stopping Honey features (Bait/High LR). Switching to standard training for containment.")
-             if hasattr(self._engine.trainer, 'update_model_learning_rate'):
-                 original_lr = self._engine.config.participant.get("training_args", {}).get("learning_rate", 0.01)
-                 self._engine.trainer.update_model_learning_rate(original_lr)
-        else:
-             # PHASE 1: POSITIONING (No bait injection yet)
-             # Only inject bait once positioned near attacker
+        # 0. Update Map / Verify Threat State
+        if not self.threat_confirmed_locally:
              self.manager.new_round()
+        else:
+             logging.info("[Honeypot] ⚠️ Threat confirmed. Continuing BAIT injection.")
 
-             # Reset to normal learning rate during positioning
-             if hasattr(self._engine.trainer, 'update_model_learning_rate'):
-                 original_lr = self._engine.config.participant.get("training_args", {}).get("learning_rate", 0.01)
-                 self._engine.trainer.update_model_learning_rate(original_lr)
-                 logging.info(f"[Honeypot] 📍 POSITIONING PHASE - Learning rate reset to normal: {original_lr}")
-
-        # 1. Train with BAIT (Dataset Injection) - Only if positioned/activated
+        # 1. Train with BAIT (Dataset Injection)
         await self._engine.trainning_in_progress_lock.acquire_async()
         _original_loader_method = None
         trainer_wrapper = self._engine.trainer
@@ -806,11 +669,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             from nebula.addons.honeypot.dataset import HoneyDataset
             from torch.utils.data import DataLoader
 
-            # PHASE CHECK: Bait injection DISABLED by user requirement.
-            # "The honeypot node... must not send honey information... it must train normally"
-            should_inject_bait = False
-
-            if trainer_wrapper and trainer_wrapper.datamodule and should_inject_bait:
+            if trainer_wrapper and trainer_wrapper.datamodule:
                 original_dm = trainer_wrapper.datamodule
 
                 # Check for existing loader method
@@ -830,9 +689,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
                     # Apply hook
                     original_dm.train_dataloader = baited_loader_factory
-                    logging.info("[Honeypot] 🎣 BAIT INJECTED into training data (HoneyDoor ACTIVATED).")
-            elif trainer_wrapper and trainer_wrapper.datamodule:
-                logging.info("[Honeypot] 📍 POSITIONING phase - No bait injection yet. Waiting to be positioned...")
+                    logging.info("[Honeypot] 🎣 BAIT INJECTED into training data.")
 
             await self._engine.trainer.train()
 
@@ -892,7 +749,6 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         detected_attackers = set()
         threat_detected_this_round = False
-        nodes_to_pivot = set()  # Track nodes that seem suspicious but might be benign
 
         if clean_batch:
             for node_id, update_tuple in updates_storage.items():
@@ -923,22 +779,11 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                              # If they are victims, we DO NOT block them (to preserve network),
                              # BUT we flag a threat was detected so we don't count it as a "clean round"
                              # and we allow pivoting to find the source.
-                             # IMPROVEMENT: Mark for potential pivoting if this node is a neighbor
-                             nodes_to_pivot.add(node_id)
-                        elif getattr(self._engine, 'round', 0) < 3:
-                             # FIX: Grace period for Silent detection.
-                             # Use a loop-hole for early rounds where reputation might be delayed.
-                             logging.warning(f"⚠️ [Honeypot] Node {node_id} flagged by Model Check and is SILENT. However, round {getattr(self._engine, 'round', 0)} < 3 (Grace Period). Assuming Echo/Victim due to lag. HOLDING POSITION.")
-                             # Do NOT add to nodes_to_pivot. Instead, prevent pivoting this round to re-evaluate next round.
-                             # If we pivot now, we might leave the attacker.
-                             # nodes_to_pivot.add(node_id)
-                             threat_detected_this_round = True # Ensure this stops clean round counter
-                             self._allow_pivot_for_indirect_threats = False # Force hold
+                             pass
                         else:
                              logging.critical(f"🚨 [Honeypot] POSITIVE MATCH! Node {node_id} (Silent)")
                              detected_attackers.add(node_id)
                              self.threat_confirmed_locally = True
-                             self._current_target_attacker = node_id
                     else:
                         # VERIFIED BENIGN: Boost reputation significantly
                         if hasattr(self._engine, "_reputation"):
@@ -952,21 +797,11 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         # 1. Detect Silent Nodes (Reputation System Evasion)
         # CRITICAL: Only mark as attacker if SILENT AND we haven't already verified it's a false positive
-        # ALSO CRITICAL: Grace period for early rounds - ignore SILENT detection in rounds < 2
-        # to avoid false positives when nodes are still initializing their reputation system
-        current_round = getattr(self._engine, 'round', 0)
-
-        if (current_round >= 2 and
-            hasattr(self._engine, "_reputation") and
-            hasattr(self._engine._reputation, "is_active_reporter")):
+        if hasattr(self._engine, "_reputation") and hasattr(self._engine._reputation, "is_active_reporter"):
              # Fix: Access neighbors via Communication Manager (cm)
              neighbors = list(self._engine.cm.connections.keys()) if hasattr(self._engine, "cm") and hasattr(self._engine.cm, "connections") else []
              for node_id in neighbors:
                  if node_id == self._engine.addr: continue
-
-                 # [FIX] Do not flag other Honeypots (visited nodes) as Silent/Malicious
-                 if self.manager.is_visited(node_id):
-                     continue
 
                  # If node is NOT sending reputation updates AND not already identified as false positive
                  if not self._engine._reputation.is_active_reporter(node_id):
@@ -990,12 +825,8 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                           # Only mark as threat if BOTH conditions met: SILENT + VERIFIED MALICIOUS
                           detected_attackers.add(node_id)
                           self.threat_confirmed_locally = True
-                          self._current_target_attacker = node_id
                       else:
                           logging.info(f"⚠️ [Honeypot] Node {node_id} is SILENT but shows BENIGN in honeymap. Likely false positive (victim). Allowing pivot search...")
-        elif current_round < 2:
-            # Grace period: Don't use SILENT detection until round 2+
-            logging.debug(f"[Honeypot] 📋 Round {current_round} - Grace period for SILENT detection. Skipping to avoid false positives on initialization.")
 
         # -------------------------------------------------------------
 
@@ -1005,45 +836,16 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                  await self._execute_containment_protocol(attacker_id)
 
         elif self.threat_confirmed_locally:
-            # Check if the confirmed threat is still a neighbor
-            target = self._current_target_attacker
-            neighbors = list(self._engine.cm.connections.keys()) if hasattr(self._engine, "cm") else []
+            # CRITICAL: threat_confirmed_locally means we found a SILENT node that is POSITIVE in honeymap
+            # This means we are neighbor to the actual attacker. NEVER pivot anymore.
+            self.consecutive_clean_rounds = 0
+            logging.info(f"[Honeypot] 🛑 THREAT CONFIRMED LOCALLY - Holding position for containment. NO MORE PIVOTING.")
 
-            target_sent_benign = False
-            if target in updates_storage:
-                # If they are in storage, it means we received something (either benign or malicious).
-                # If they were malicious, they would be in 'detected_attackers'.
-                # So if they are in 'updates_storage' AND NOT in 'detected_attackers', they sent a BENIGN update.
-                if target not in detected_attackers:
-                     target_sent_benign = True
-
-            # [FIX] Also check if they are sending Reputation Reports (Active Reporter)
-            # Even if they didn't send a model update (e.g. they became an Aggregator), they might be valid.
-            if not target_sent_benign and hasattr(self._engine, "_reputation"):
-                 if hasattr(self._engine._reputation, "is_active_reporter"):
-                     if self._engine._reputation.is_active_reporter(target):
-                         target_sent_benign = True
-
-            if target in neighbors and not target_sent_benign:
-                # Case: Target is connected but Silent or Blocked.
-                # Do NOT assume they are clean. They are just contained.
-                logging.info(f"[Honeypot] 🛡️ Threat {target} is Silent/Blocked (Contained). Holding position indefinitely.")
-                self.consecutive_clean_rounds = 0
-
-            else:
-                # Case: Target sent benign update (Pivoted/Cleaned) OR Target left network neighborhood.
-                self.consecutive_clean_rounds += 1
-                logging.info(f"[Honeypot] 🛑 THREAT CONFIRMED LOCALLY - Holding position. Clean rounds: {self.consecutive_clean_rounds}/3")
-
-                if self.consecutive_clean_rounds >= 3:
-                    logging.info("✅ [Honeypot] Threat seems neutralized (3 clean rounds). Mission Complete.")
-
-                    # Ensure we unblock the target so they can rejoin the federation as a normal node
-                    await self._unblock_target(target)
-
-                    logging.info("♻️  Reverting to benign AGGREGATOR role...")
-                    await self._revert_to_aggregator()
-                    return
+            if self.consecutive_clean_rounds >= 3:
+                logging.info("✅ [Honeypot] Threat seems neutralized (3 clean rounds). Mission Complete.")
+                logging.info("♻️  Reverting to benign AGGREGATOR role...")
+                await self._revert_to_aggregator()
+                return
 
         # Permite pivoting SOLO si hay amenaza detectada en modelos pero NO hay una amenaza confirmada localmente
         # (es decir, hay víctimas/ecos pero no encontramos el nodo SILENT + POSITIVO aún)
@@ -1060,158 +862,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         if self.threat_confirmed_locally and self._attacker_pivoting_enabled:
             asyncio.create_task(self._detect_and_react_to_attacker_pivot())
 
-    async def _detect_and_react_to_attacker_pivot(self):
-        """
-        Monitors the confirmed threat.
-        Strategy:
-        1. Wait for threat to resume sending reputation reports (indicating it is now Benign/Proxy).
-        2. Wait 2 Rounds of consistent reports.
-        3. Round 2: SPAWN secondary Honeypot.
-        4. Round 3: UNBLOCK threat and REVERT to Aggregator.
-        """
-        if not self.threat_confirmed_locally or not self._current_target_attacker:
-            return
-
-        if not hasattr(self, '_secondary_spawned'):
-             self._secondary_spawned = False
-        if not hasattr(self, '_pivot_recovery_counter'):
-             self._pivot_recovery_counter = 0
-
-        target = self._current_target_attacker
-        logging.info(f"[Honeypot] 🕵️ Monitoring target {target} for Pivot (Reputation Check)...")
-
-        # Check if Target is Reporting Reputation (Not Silent anymore)
-        is_reporting = False
-        if hasattr(self._engine, "_reputation"):
-             # Use is_active_reporter which is updated immediately upon receiving 'share_table' messages
-             # This works even if the node is network-blocked from aggregation but allowed in communications.
-             if hasattr(self._engine._reputation, "is_active_reporter"):
-                 if self._engine._reputation.is_active_reporter(target):
-                     is_reporting = True
-
-             # Fallback to reputation map if map has fresh data (redundant check)
-             elif hasattr(self._engine._reputation, "reputation"):
-                rep_map = self._engine._reputation.reputation
-                if target in rep_map:
-                    # Check freshness: Entry must be recent (current or previous round)
-                    rep_data = rep_map[target]
-                    last_round = rep_data.get('round', -1)
-                    current_round = getattr(self._engine, 'round', 0)
-                    if last_round >= current_round - 1:
-                        is_reporting = True
-
-        if is_reporting:
-            self._pivot_recovery_counter += 1
-            logging.info(f"[Honeypot] ✅ Target {target} is sending reputation reports. Recovery count: {self._pivot_recovery_counter}")
-        else:
-            if self._pivot_recovery_counter > 0:
-                logging.warning(f"[Honeypot] ⚠️ Target {target} stopped reporting. Resetting recovery counter.")
-            self._pivot_recovery_counter = 0
-
-        # --- REACTION LOGIC ---
-
-        # Round 1: Spawn Secondary IMMEDIATELY (Faster Reaction)
-        # The moment we detect the attacker is behaving benignly (Reputation Reporting),
-        # we know they have pivoted. We must launch the hunter ASAP.
-        if self._pivot_recovery_counter == 1:
-             if not self._secondary_spawned:
-                 logging.critical(f"[Honeypot] 🚀 Active reports detected! Spawning Secondary Honeypot IMMEDIATELY to chase the threat.")
-                 await self._spawn_secondary_searcher(exclude_target=target)
-                 self._secondary_spawned = True
-
-        # Round 3: Retire and Unblock
-        elif self._pivot_recovery_counter >= 3:
-             logging.critical(f"[Honeypot] 🛑 Three rounds of reports! Threat {target} confirmed Clean. Retiring.")
-
-             # Unblock
-             await self._unblock_target(target)
-
-             # Revert
-             await self._revert_to_aggregator()
-
-    async def _unblock_target(self, target_id):
-        """Reverses the containment blocks on a target."""
-        logging.info(f"[Honeypot] 🔓 Lifting blocks for {target_id}...")
-
-        # 1. Unblock in Reputation System (Aggregation Filter)
-        if hasattr(self._engine, "_reputation"):
-            rep = self._engine._reputation
-            if hasattr(rep, "permanently_blocked"):
-                if target_id in rep.permanently_blocked:
-                    rep.permanently_blocked.remove(target_id)
-            if hasattr(rep, "rejected_nodes"):
-                if target_id in rep.rejected_nodes:
-                    rep.rejected_nodes.discard(target_id)
-
-        # 2. Unblock Local Blacklist (Engine)
-        if hasattr(self._engine, "blacklist") and target_id in self._engine.blacklist:
-            self._engine.blacklist.discard(target_id)
-
-        # 3. Unblock Network Layer (Communications Manager)
-        # Note: Network blocking makes it physically impossible to receive packets.
-        # If we used cm.bl.add_to_blacklist, we must reverse it.
-        if hasattr(self._engine, "cm") and hasattr(self._engine.cm, "bl"):
-            if hasattr(self._engine.cm.bl, "remove_from_blacklist"):
-                 await self._engine.cm.bl.remove_from_blacklist(target_id)
-                 logging.info(f"[Honeypot] 🔌 Network blacklist removed for {target_id}")
-
-        logging.info(f"[Honeypot] 🔓 Target {target_id} UNBLOCKED.")
-
-    async def _spawn_secondary_searcher(self, exclude_target: str):
-        """
-        Selects a neighbor (using DFS logic) and converts it into a new Honeypot
-        to chase the attacker, while this node stays behind.
-        """
-        topology = self._engine.cm.get_global_topology()
-
-        # Determine next hop using DFS logic
-        # We pretend we are moving so the manager gives us the best candidate
-        # [IMPROVEMENT] Explain to DFS that the attacker (exclude_target) is a no-go zone.
-        # This ensures we pick the "Opposite" or "Next Unvisited" node, rather than the attacker.
-        next_pivot = self.manager.get_dfs_pivot_direction(
-            topology=topology,
-            my_id=self._engine.addr,
-            came_from=self._last_pivot_source,
-            exclude_nodes={exclude_target}
-        )
-
-        # Ensure we don't send the token back to the attacker we just cleaned
-        if next_pivot == exclude_target:
-             logging.warning(f"[Honeypot] DFS returned the former attacker {next_pivot} as target. Forcing alternative.")
-             neighbors = list(self._engine.cm.connections.keys())
-             candidates = [n for n in neighbors if n != exclude_target and n != self._engine.addr]
-             if candidates:
-                 import random
-                 next_pivot = random.choice(candidates)
-             else:
-                 next_pivot = None
-
-        if next_pivot:
-            logging.info(f"[Honeypot] 🚀 SPAWNING SECONDARY HONEYPOT to {next_pivot} to chase the threat!")
-
-            # Register ourselves as visited so the new honeypot knows we are "one of us" and doesn't flag us
-            self.manager.register_visit(self._engine.addr)
-
-            # Create a clone state of the manager to pass on
-            target_state = self.manager.export_state()
-            payload = json.dumps(target_state)
-
-            log_message = f"HONEYPOT_TRANSFER:{payload}"
-            try:
-                msg = self._engine.cm.create_message("control", "leadership_transfer", log=log_message)
-                await self._engine.cm.send_message(next_pivot, msg)
-                # Note: We do NOT set self._engine.has_served_as_honeypot = True here because we are technically still serving.
-                # We will only retire via the 3-clean-rounds mechanism.
-            except Exception as e:
-                logging.error(f"[Honeypot] ❌ Failed to spawn secondary honeypot to {next_pivot}: {e}")
-        else:
-            logging.warning("[Honeypot] ⚠️ Could not spawn secondary searcher. No valid neighbors.")
-
     async def _execute_containment_protocol(self, attacker_id):
         """
         Envía la orden 'BLOCK_NEIGHBOR' a los nodos VECINOS del atacante.
-        Usa propagación por flood (como topology_flood) para alcanzar nodos sin conexión directa.
-        El atacante NUNCA recibe el mensaje para no alertarlo del bloqueo.
+        Use la topología global para identificarlos.
         """
         logging.info(f"[Honeypot] 🛡️ INITIATING CONTAINMENT against {attacker_id}")
 
@@ -1228,44 +882,18 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             logging.warning(f"[Honeypot] Topology info missing for {attacker_id}. Alerting local neighbors.")
             targets.update(await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False))
 
-        # 2. Crear mensaje de bloqueo con estructura de flood
-        # Esto asegura que el mensaje se propague a través de toda la red incluso sin conexión directa
-        block_data = {
-            "type": "block_neighbor_flood",
-            "attacker_id": attacker_id,
-            "targets": list(targets),
-            "round": getattr(self._engine, 'round', 0),
-            "source_honeypot": self._engine.addr
-        }
+        # 2. Enviar la orden de bloqueo
+        for neighbor in targets:
+            if neighbor == self._engine.addr: continue # No me aviso a mí mismo
+            if neighbor == attacker_id: continue       # No avisamos al atacante
 
-        flood_payload = json.dumps(block_data)
-        msg = self._engine.cm.create_message(
-            "control",
-            "block_neighbor_flood",
-            log=flood_payload
-        )
+            logging.warning(f"[Honeypot] 📤 Sending KILL ORDER to {neighbor}: 'Block {attacker_id}'")
 
-        # 3. Propagación por flood: enviar a todos los vecinos directos
-        # EXCEPTO al atacante, para que no se entere del bloqueo
-        neighbors = set(self._engine.cm.connections.keys())
-
-        # CRITICAL FIX: Self-block immediately. Do not wait for network flood.
-        # Note: We pass network_block=False so we can still receive updates from them to Monitor for Pivots.
-        logging.warning(f"[Honeypot] 🛡️ SELF-BLOCKING attacker {attacker_id} locally (Detection Origin).")
-        try:
-            if hasattr(self._engine, "_reputation") and hasattr(self._engine._reputation, "force_block"):
-                self._engine._reputation.force_block(attacker_id, network_block=False)
-            elif hasattr(self._engine, "blacklist"):
-                # If using simple blacklist, we can't distinguish. Use reputation if available.
-                self._engine.blacklist.add(attacker_id)
-        except Exception as e:
-            logging.error(f"[Honeypot] Failed to self-block {attacker_id}: {e}")
-
-        for neighbor in neighbors:
-            if neighbor == self._engine.addr: continue  # No me aviso a mí mismo
-            if neighbor == attacker_id: continue        # NUNCA enviar al atacante
-
-            logging.warning(f"[Honeypot] 📤 Flooding KILL ORDER (blocking {attacker_id}) to {neighbor}")
+            msg = self._engine.cm.create_message(
+                "control",
+                "block_neighbor",
+                log=attacker_id # En el log va el ID del nodo a bloquear
+            )
             asyncio.create_task(self._engine.cm.send_message(neighbor, msg))
 
     async def _check_and_react_to_pivot(self):
@@ -1337,32 +965,16 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         if attacker_found:
             logging.critical(f"[HONEYPOT DFS] 🎯 ATTACKER FOUND: {attacker_id}")
             self.threat_confirmed_locally = True
-            self._current_target_attacker = attacker_id
             self.consecutive_clean_rounds = 0
             # Ejecutar protocolo de contención
             await self._execute_containment_protocol(attacker_id)
             return
 
         # 4. SI NO ENCONTRAMOS ATACANTE, SELECCIONAR SIGUIENTE DIRECCIÓN
-        # Identificar sospechosos para no pivotar hacia ellos
-        suspicious_candidates = set()
-        for nid, model in neighbors_models.items():
-             try:
-                 is_susp = False
-                 if self.manager.detector:
-                     is_susp = self.manager.detector.is_suspicious_simple(model)
-                 if is_susp:
-                     suspicious_candidates.add(nid)
-             except: pass
-
-        if suspicious_candidates:
-             logging.info(f"[HONEYPOT DFS] Avoiding suspicious neighbors: {suspicious_candidates}")
-
         next_pivot = self.manager.get_dfs_pivot_direction(
             topology=topology,
             my_id=self._engine.addr,
-            came_from=self._last_pivot_source,
-            exclude_nodes=suspicious_candidates
+            came_from=self._last_pivot_source
         )
 
         if next_pivot:
@@ -1403,29 +1015,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             logging.info(f"[Honeypot] 📨 Transfer sent to {candidate}. Waiting for ACK before retiring.")
             # self._defense_active = False # Keep active until confirmed
             self._engine._waiting_honeypot_handover = True
-
-            # Schedule a timeout to force retirement if ACK doesn't arrive
-            asyncio.create_task(self._honeypot_handover_timeout(30))  # 30-second timeout
             # await self.set_next_role(Role.AGGREGATOR) # Removed: Wait for ACK in engine.py
         except Exception as e:
             logging.error(f"[Honeypot] ❌ Failed to send transfer message to {candidate}: {e}")
             self._engine.has_served_as_honeypot = False
-
-    async def _honeypot_handover_timeout(self, timeout_seconds):
-        """Timeout handler: if ACK doesn't arrive within timeout, cancel transfer and stay."""
-        await asyncio.sleep(timeout_seconds)
-
-        # Check if we're still waiting
-        if hasattr(self._engine, '_waiting_honeypot_handover') and self._engine._waiting_honeypot_handover:
-            logging.warning(f"[Honeypot] ⏱️ ACK timeout after {timeout_seconds}s. Transfer failed.")
-            logging.info("[Honeypot] 🔄 Cancelling handover and REMAINING Honeypot (Target unresponsive).")
-
-            # Reset flag so we resume normal Honeypot duties
-            self._engine._waiting_honeypot_handover = False
-
-            # Do NOT retire. Stay as Honeypot.
-            # We might want to blacklist the target we tried to pivot to, to avoid loop?
-            # For now, just staying alive satisfies "no deberiamos de desaparecer".
 
     async def _revert_to_aggregator(self):
         """Reverts honeypot role back to aggregator after threat containment."""
@@ -1433,6 +1026,344 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             logging.info("[Honeypot] Transforming back to AGGREGATOR role.")
             self._engine.has_served_as_honeypot = True
             await self._engine.rb.set_next_role(Role.AGGREGATOR)
+
+                # 🔄 ROTATION / PATROL LOGIC (User Request: Move to Lowest Reputation)
+                logging.info("[Honeypot] No detected threats. Calculating ROTATION to Lowest Reputation Neighbor.")
+
+                neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
+
+                best_candidate = None
+                min_rep = 1.1 # Max possible rep is 1.0
+
+                reputation_system = getattr(self._engine, "_reputation", None)
+                rep_table = reputation_system.get_reputation_table() if reputation_system else {}
+
+                candidates = list(neighbors)
+                random.shuffle(candidates)
+
+                found_candidates_log = []
+                for cand in candidates:
+                     if getattr(self, "previous_honeypot_node", None) == cand and len(candidates) > 1:
+                         continue # Simple backtrack avoidance
+
+                     score = rep_table.get(cand, 0.5)
+                     found_candidates_log.append(f"{cand}:{score:.2f}")
+
+                     if score < min_rep:
+                         min_rep = score
+                         best_candidate = cand
+
+                logging.info(f"[Honeypot] Candidates scores: {found_candidates_log}")
+
+                # Fallback
+                if not best_candidate and candidates:
+                     best_candidate = random.choice(candidates)
+                     logging.info("[Honeypot] Fallback to random candidate.")
+
+                if best_candidate:
+                    logging.info(f"[Honeypot] 🧭 Rotating to {best_candidate} (Lowest Rep: {min_rep:.2f}).")
+                    asyncio.create_task(self._deploy_honeypot_agent(deploy_to=best_candidate))
+                else:
+                    logging.warning("[Honeypot] No suitable pivot candidates. Staying.")
+
+        except Exception as e:
+             logging.error(f"[Honeypot] Pivot calculation error: {e}")
+
+    def _calculate_pivot_candidate_score(self, neighbor: str, current_rep: float, suspects_feed: list) -> float:
+        """
+        Calculates the suitability of a neighbor to receive the Honeypot role.
+        Strategy:
+        1. Base Score = Reputation.
+           CRITICAL: The candidate MUST have a GOOD reputation (> 0.2).
+           We cannot trust a node with low reputation to be the Honeypot.
+        2. Bonus: If this neighbor has detected a malicious node (low score in feedback),
+           we want to pivot to them to be closer to the threat.
+        """
+        # 1. Safety Threshold: Only trust "Good" neighbors
+        # User Requirement: "el nodo al que vamos a pivotar tiene que tener buena reputación"
+        if current_rep < 0.2:
+            # Too risky to transfer Honeypot role to a low-trust node
+            # However, lowered to 0.2 to prevent getting stuck in low-info environments
+            return -1.0
+
+        score = current_rep
+
+        # 2. Strategic Pivot: Move towards reporters of malicious activity
+        # suspects_feed is [(reporter, suspect, score), ...]
+        for reporter, suspect, rep_score in suspects_feed:
+            if reporter == neighbor:
+                # This trustworthy neighbor is reporting a low-reputation node (suspect).
+                # Pivoting to 'neighbor' puts the Honeypot next to 'suspect'.
+                logging.info(f"[Honeypot] Strategic Pivot: {neighbor} (Rep: {current_rep:.2f}) is reporting suspect {suspect} (Score: {rep_score:.2f}). Boosting.")
+                score += 0.8 # Significant bonus to prioritize this strategic move
+
+        # Add small random noise for exploration/tie-breaking
+        score += random.uniform(0.0, 0.05)
+
+        # Penalize recently visited nodes to encourage exploration
+        if self.manager.is_visited(neighbor):
+            logging.info(f"[Honeypot] Candidate {neighbor} is in Patrol Memory (visited recently). Strongly penalizing.")
+            score -= 2.0
+
+        return score
+
+    async def _detect_and_react_to_attacker_pivot(self):
+        """
+        PUNTO CRÍTICO: Detecta si el atacante ha pivotado.
+
+        ESTRATEGIA: El atacante aparece como un nodo HONESTO (rep alta),
+        pero luego su reputación CALLA EN PICADA cuando empieza a atacar.
+
+        PRIMARY SIGNAL: ¿Hay un nodo que:
+                       - Tenía reputación ALTA (> 0.7)
+                       - De repente BAJÓ MUCHO (caída > 0.4 en 1-2 rondas)
+                       - Es SILENCIOSO (no reporta)
+                       - NO es el nodo amenaza conocido
+
+        Si detectamos → Lanzar honeypot secundaria para INVESTIGAR
+        """
+        if not self._attacker_pivoting_enabled:
+            return
+
+        if not self.threat_confirmed_locally:
+            return
+
+        # 1. REGISTRAR el nodo amenaza conocido en el primer round
+        reputation_system = getattr(self._engine, "_reputation", None)
+        if not reputation_system:
+            return
+
+        if not self._known_threat_node:
+            if hasattr(self, 'last_confirmed_threat') and self.last_confirmed_threat:
+                self._known_threat_node = self.last_confirmed_threat
+                logging.info(f"[Honeypot] 📍 Registering initial threat node: {self._known_threat_node}")
+                return
+
+        # 2. PRIMARY SIGNAL: ¿HAY UN NODO CON CAÍDA BRUSCA DE REPUTACIÓN?
+        rep_table = reputation_system.get_reputation_table()
+        new_malicious_node = self._detect_reputation_crash(rep_table, reputation_system)
+
+        if new_malicious_node:
+            # ¡¡¡ PIVOTAJE DETECTADO !!!
+            logging.critical(f"[Honeypot] 🚨🚨🚨 ATTACKER PIVOT DETECTED!")
+            logging.critical(f"   Original threat: {self._known_threat_node}")
+            logging.critical(f"   NEW SUSPECT NODE: {new_malicious_node['node']}")
+            logging.critical(f"   Reputation crash: {new_malicious_node['prev_rep']:.2f} → {new_malicious_node['current_rep']:.2f}")
+            logging.critical(f"   Change: -{new_malicious_node['drop']:.2f} (VERY SUSPICIOUS)")
+            logging.critical(f"   Silence: {new_malicious_node['is_silent']} (won't report)")
+            logging.critical(f"   Action: Lanzar honeypot secundaria para INVESTIGAR")
+
+            # Registrar para evitar duplicados
+            self._secondary_honeypot_candidates.add(new_malicious_node['node'])
+
+            # Lanzar honeypot secundaria para investigar
+            await self._spawn_secondary_honeypot_to_investigate(new_malicious_node['node'])
+            return
+
+        # 3. SECONDARY SIGNAL: Si no hay pivotaje, ¿el anterior se neutraliza?
+        current_rep = rep_table.get(self._known_threat_node, 0.0)
+        self._known_threat_reputation_history[self._engine.round] = current_rep
+
+        previous_threat_recovering = self._is_previous_threat_recovering()
+
+        if previous_threat_recovering:
+            # El nodo anterior mejora (sin nuevo atacante)
+            self._recovery_rounds_counter += 1
+            logging.info(f"[Honeypot] ✅ Original threat recovering ({current_rep:.2f}) - Round {self._recovery_rounds_counter}/{self._max_recovery_rounds}")
+
+            if self._recovery_rounds_counter >= self._max_recovery_rounds:
+                logging.info(f"[Honeypot] 🎉 Threat fully neutralized! No pivot detected after {self._recovery_rounds_counter} rounds")
+                await self._revert_to_aggregator()
+        else:
+            # No hay ni nuevo atacante ni recuperación del anterior
+            self._recovery_rounds_counter = 0
+            logging.debug(f"[Honeypot] 🔍 Monitoring... Original threat still present (Rep: {current_rep:.2f})")
+
+    def _is_previous_threat_recovering(self) -> bool:
+        """
+        ¿El nodo amenaza anterior está RECUPERANDO su reputación?
+
+        Criterios:
+        - Reputación ha subido significativamente en últimas 2 rondas
+        - Cambio > _pivot_detection_threshold (0.3)
+        """
+        if len(self._known_threat_reputation_history) < 2:
+            return False
+
+        prev_round = self._engine.round - 1
+        prev_rep = self._known_threat_reputation_history.get(prev_round, 0.0)
+        current_rep = self._known_threat_reputation_history.get(self._engine.round, 0.0)
+
+        rep_increase = current_rep - prev_rep
+
+        if rep_increase > self._pivot_detection_threshold:
+            logging.warning(f"[Honeypot] ⚠️ Previous threat reputation JUMPING: {prev_rep:.2f} → {current_rep:.2f} (+{rep_increase:.2f})")
+            return True
+
+        return False
+
+    def _detect_reputation_crash(self, rep_table, reputation_system):
+        """
+        PUNTO CRÍTICO: Detecta un nodo que BAJÓ SU REPUTACIÓN BRUSCAMENTE.
+
+        Patrón del atacante pivotado:
+        1. Ronda N: Node_X aparece con reputación ALTA (> 0.7)
+        2. Ronda N+1: Node_X reputación CALLA EN PICADA (caída > 0.4)
+        3. Ronda N+1: Node_X es SILENCIOSO (no reporta)
+
+        Criterios (TODOS):
+        1. Tenía reputación ALTA en ronda anterior (> 0.7)
+        2. Actual reputación BAJA mucho (caída > 0.4)
+        3. Es SILENCIOSO (no reporta)
+        4. NO es el nodo original (_known_threat_node)
+        5. NO está en candidatos conocidos
+
+        Retorna: dict con info del nodo sospechoso o None
+        """
+        crash_suspects = []
+
+        # Necesitamos histórico (al menos 2 rondas)
+        if self._engine.round < 1:
+            return None
+
+        for node_id, current_rep in rep_table.items():
+            # Criterio 4: NO es el nodo original
+            if node_id == self._known_threat_node:
+                continue
+
+            # Criterio 5: NO es candidato conocido
+            if node_id in self._secondary_honeypot_candidates:
+                continue
+
+            # Obtener reputación anterior (si existe)
+            prev_round = self._engine.round - 1
+            if not hasattr(self, '_reputation_history'):
+                self._reputation_history = {}
+
+            if prev_round not in self._reputation_history:
+                self._reputation_history[prev_round] = dict(rep_table)
+
+            prev_rep = self._reputation_history.get(prev_round, {}).get(node_id, None)
+
+            # Criterio 1 + 2: Había rep alta y ahora bajó mucho
+            if prev_rep is None or prev_rep <= 0.7:
+                continue
+
+            drop = prev_rep - current_rep
+            if drop < 0.4:  # No cayó lo suficiente
+                continue
+
+            # Criterio 3: Debe ser silencioso
+            try:
+                is_silent = not hasattr(reputation_system, "is_active_reporter") or \
+                           not reputation_system.is_active_reporter(node_id)
+            except:
+                is_silent = True
+
+            if not is_silent:
+                continue
+
+            # ✓ CUMPLE TODOS LOS CRITERIOS
+            crash_suspects.append({
+                "node": node_id,
+                "prev_rep": prev_rep,
+                "current_rep": current_rep,
+                "drop": drop,
+                "is_silent": is_silent,
+                "confidence": drop * 100  # Qué tan brusca es la caída
+            })
+
+        # Registrar histórico para próxima ronda
+        self._reputation_history[self._engine.round] = dict(rep_table)
+
+        if not crash_suspects:
+            logging.debug("[Honeypot] 🔍 No reputation crashes detected")
+            return None
+
+        # Ordenar por severidad de caída
+        crash_suspects.sort(key=lambda x: x["drop"], reverse=True)
+
+        top_suspect = crash_suspects[0]
+        logging.critical(f"[Honeypot] 🚨 PRIMARY SIGNAL: REPUTATION CRASH DETECTED!")
+        logging.critical(f"   Node: {top_suspect['node']}")
+        logging.critical(f"   Previous Rep: {top_suspect['prev_rep']:.2f}")
+        logging.critical(f"   Current Rep: {top_suspect['current_rep']:.2f}")
+        logging.critical(f"   Drop: -{top_suspect['drop']:.2f}")
+        logging.critical(f"   Silent: {top_suspect['is_silent']}")
+        logging.critical(f"   Confidence: {top_suspect['confidence']:.1f}%")
+
+        return top_suspect
+
+    async def _spawn_secondary_honeypot_to_investigate(self, suspect_node):
+        """
+        Lanza una honeypot SECUNDARIA que irá a INVESTIGAR el nodo sospechoso.
+
+        La honeypot secundaria:
+        1. Se coloca en un nodo vecino honesto (como la original)
+        2. Recibe el ID del sospechoso como "objetivo de investigación"
+        3. Inyecta BAIT (como la original) y verifica si es REALMENTE malicioso
+        4. Si confirma: contiene al atacante
+        5. Si es falso positivo: descarta y sigue buscando
+        """
+        logging.info(f"[Honeypot] 🧬 Spawning SECONDARY HONEYPOT to INVESTIGATE {suspect_node}...")
+
+        # 1. Obtener vecinos
+        neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
+        if not neighbors:
+            logging.warning(f"[Honeypot] No neighbors available to spawn secondary honeypot.")
+            return
+
+        # 2. Filtrar candidatos: buenos vecinos que no sean amenaza
+        reputation_system = getattr(self._engine, "_reputation", None)
+        rep_table = reputation_system.get_reputation_table() if reputation_system else {}
+
+        candidates = []
+        for neighbor in neighbors:
+            rep = rep_table.get(neighbor, 0.5)
+            # Buena reputación, no es nuestro nodo anterior, no es el sospechoso
+            if (rep > 0.5 and
+                neighbor != getattr(self, "previous_honeypot_node", None) and
+                neighbor != self._known_threat_node and
+                neighbor != suspect_node):  # El secundario NO se coloca al lado del sospechoso
+                candidates.append((neighbor, rep))
+
+        if not candidates:
+            logging.warning(f"[Honeypot] No suitable candidates for secondary honeypot.")
+            return
+
+        # 3. Elegir candidato con mejor reputación
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        target_node = candidates[0][0]
+
+        logging.critical(f"[Honeypot] ✅ Selected node for SECONDARY HONEYPOT: {target_node}")
+        logging.critical(f"   Reputation: {candidates[0][1]:.2f}")
+        logging.critical(f"   Will INVESTIGATE suspect: {suspect_node}")
+        logging.critical(f"   Mission: Verify threat and CONTAIN if real")
+
+        # 4. Crear mensaje con la misión de investigación
+        investigation_state = {
+            "type": "secondary_honeypot_investigate",
+            "source_honeypot": self._engine.addr,
+            "suspect_node": suspect_node,  # Nodo a investigar
+            "original_threat": self._known_threat_node,  # Para contexto
+            "mission": "Verify if suspect is REAL attacker by injecting BAIT and checking models"
+        }
+
+        msg = self._engine.cm.create_message(
+            "control",
+            "role_transfer_request",
+            log=json.dumps(investigation_state)
+        )
+
+        try:
+            await self._engine.cm.send_message(target_node, msg)
+            self._secondary_honeypot_candidates.add(suspect_node)
+            logging.critical(f"[Honeypot] 📤 Investigation mission sent to {target_node}")
+            logging.critical(f"   It will inject BAIT to {suspect_node}")
+            logging.critical(f"   It will verify if models are TRULY malicious")
+            logging.critical(f"   It will CONTAIN if confirmed, or REPORT if false positive")
+        except Exception as e:
+            logging.error(f"[Honeypot] Failed to send investigation mission to {target_node}: {e}")
 
     async def update_role_needed(self):
         """

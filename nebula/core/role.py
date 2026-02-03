@@ -11,7 +11,8 @@ class Role(Enum):
     IDLE = "idle"
     SERVER = "server"
     HONEYPOT = "honeypot"
-    
+    MALICIOUS = "malicious"
+
 def factory_node_role(role: str) -> Role:
     if role == "trainer":
         return Role.TRAINER
