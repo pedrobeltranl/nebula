@@ -18,7 +18,27 @@ class FedAvg(Aggregator):
     def run_aggregation(self, models):
         super().run_aggregation(models)
 
-        models = list(models.values())
+        # CHECK DEFENSES:
+        # If Honeypot is DISABLED, we apply Reputation Weighting (Normal Reputation Defense).
+        # If Honeypot is ENABLED, we DO NOT apply weighting (Honeypot Logic applies elsewhere).
+        defense_args = self.config.participant.get("defense_args", {})
+        honeypot_active = defense_args.get("honeypot", {}).get("enabled", False)
+
+        reputation_map = {}
+        if not honeypot_active and hasattr(self.engine, "_reputation") and self.engine._reputation:
+            reputation_map = self.engine._reputation.get_reputation_table()
+            import logging
+            logging.info(f"[FedAvg] 🛡️ Reputation-Weighted Aggregation Active (Honeypot OFF).")
+
+        models_list = []
+        # models is a dict: {node_id: (params, weight)}
+        for node_id, (params, weight) in models.items():
+            if reputation_map:
+                rep_score = reputation_map.get(node_id, 1.0)
+                weight = weight * rep_score
+            models_list.append((params, weight))
+
+        models = models_list
 
         total_samples = float(sum(weight for _, weight in models))
 
