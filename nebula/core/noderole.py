@@ -790,11 +790,15 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
              # Only inject bait once positioned near attacker
              self.manager.new_round()
 
-             # Reset to normal learning rate during positioning
+
+             # Reset to normal learning rate during positioning (Initial state)
              if hasattr(self._engine.trainer, 'update_model_learning_rate'):
                  original_lr = self._engine.config.participant.get("training_args", {}).get("learning_rate", 0.01)
-                 self._engine.trainer.update_model_learning_rate(original_lr)
-                 logging.info(f"[Honeypot] 📍 POSITIONING PHASE - Learning rate reset to normal: {original_lr}")
+                 
+                 boost_factor = 5.0
+                 boosted_lr = original_lr * boost_factor
+                 self._engine.trainer.update_model_learning_rate(boosted_lr)
+                 logging.info(f"[Honeypot] 📍 POSITIONING PHASE - Learning Rate BOOSTED to {boosted_lr} (Factor {boost_factor}x) to fix Activation Gap.")
 
         # 1. Train with BAIT (Dataset Injection) - Only if positioned/activated
         await self._engine.trainning_in_progress_lock.acquire_async()
@@ -820,7 +824,8 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                     # Create the hook
                     def baited_loader_factory():
                         base_loader = _original_loader_method()
-                        honey_ds = HoneyDataset(base_loader.dataset, self.manager.current_map)
+                        base_loader = _original_loader_method()
+                        honey_ds = HoneyDataset(base_loader.dataset, self.manager.current_map, injection_ratio=0.5)
                         return DataLoader(
                             honey_ds,
                             batch_size=base_loader.batch_size,
@@ -911,31 +916,12 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
                     if is_malicious:
                         threat_detected_this_round = True
-                        # WHITELIST LOGIC:
-                        # Check if node is an active reporter (Benign Echo vs Silent Attacker)
-                        is_active_reporter = False
-                        if hasattr(self._engine, "_reputation") and hasattr(self._engine._reputation, "is_active_reporter"):
-                             if self._engine._reputation.is_active_reporter(node_id):
-                                 is_active_reporter = True
-
-                        if is_active_reporter:
-                             logging.info(f"⚠️ [Honeypot] Node {node_id} flagged by Model Check but is ACTIVE reporter. Assuming Echo/Victim. Ignoring block.")
-                             # If they are victims, we DO NOT block them (to preserve network),
-                             # BUT we flag a threat was detected so we don't count it as a "clean round"
-                             # and we allow pivoting to find the source.
-                             # IMPROVEMENT: Mark for potential pivoting if this node is a neighbor
-                             nodes_to_pivot.add(node_id)
-                        elif getattr(self._engine, 'round', 0) < 3:
-                             # FIX: Grace period for Silent detection.
-                             # Use a loop-hole for early rounds where reputation might be delayed.
-                             logging.warning(f"⚠️ [Honeypot] Node {node_id} flagged by Model Check and is SILENT. However, round {getattr(self._engine, 'round', 0)} < 3 (Grace Period). Assuming Echo/Victim due to lag. HOLDING POSITION.")
-                             # Do NOT add to nodes_to_pivot. Instead, prevent pivoting this round to re-evaluate next round.
-                             # If we pivot now, we might leave the attacker.
-                             # nodes_to_pivot.add(node_id)
-                             threat_detected_this_round = True # Ensure this stops clean round counter
-                             self._allow_pivot_for_indirect_threats = False # Force hold
+                        if getattr(self._engine, 'round', 0) < 3:
+                             logging.warning(f"⚠️ [Honeypot] Node {node_id} flagged by Model Check. Round {getattr(self._engine, 'round', 0)} < 3 (Grace Period). HOLDING POSITION (Strict Mode).")
+                             threat_detected_this_round = True 
+                             self._allow_pivot_for_indirect_threats = False
                         else:
-                             logging.critical(f"🚨 [Honeypot] POSITIVE MATCH! Node {node_id} (Silent)")
+                             logging.critical(f"🚨 [Honeypot] POSITIVE MATCH! Node {node_id} (Conflict Confirmed). BLOCKING.")
                              detected_attackers.add(node_id)
                              self.threat_confirmed_locally = True
                              self._current_target_attacker = node_id

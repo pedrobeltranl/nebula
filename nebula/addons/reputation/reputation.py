@@ -1820,7 +1820,7 @@ class Reputation:
         }
 
         self._store_similarity_metrics(nei, similarity_metrics)
-        self._check_similarity_threshold(nei, similarity_values["cosine"])
+        await self._check_similarity_threshold(nei, similarity_values["cosine"])
 
     def _calculate_all_similarity_metrics(self, local_model: dict, received_model: dict) -> dict:
         if not local_model or not received_model:
@@ -1864,10 +1864,10 @@ class Reputation:
 
         self.connection_metrics[nei].similarity.append(similarity_metrics)
 
-    def _check_similarity_threshold(self, nei: str, cosine_value: float):
+    async def _check_similarity_threshold(self, nei: str, cosine_value: float):
         if cosine_value < self.SIMILARITY_THRESHOLD:
-            logging.info("🤖  handle_model_message | Model similarity is less than threshold")
-            self.rejected_nodes.add(nei)
+             logging.warning(f"🤖  handle_model_message | Model similarity {cosine_value:.2f} < Threshold. ALERT ONLY. Delegating judgment to Honeypot/Global Reputation.")
+             # self.rejected_nodes.add(nei)
 
     async def recollect_number_message(self, source, message):
         await self._record_message_data(source)
