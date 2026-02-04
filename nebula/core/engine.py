@@ -344,15 +344,9 @@ class Engine:
                     )
 
     async def _control_alive_callback(self, source, message):
-        logging.info(f"🔧  handle_control_message | Trigger | Received alive message from {source}")
-        current_connections = await self.cm.get_addrs_current_connections(myself=True)
-        if source in current_connections:
-            try:
-                await self.cm.health.alive(source)
-            except Exception as e:
-                logging.exception(f"Error updating alive status in connection: {e}")
-        else:
-            logging.error(f"❗️  Connection {source} not found in connections...")
+        # Health module is disabled by user request
+        pass
+
 
     async def _control_leadership_transfer_callback(self, source, message):
         # Decodificación robusta Bytes -> String
