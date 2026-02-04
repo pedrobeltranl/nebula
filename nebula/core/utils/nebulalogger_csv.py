@@ -106,28 +106,40 @@ class NebulaCSVLogger(CSVLogger):
         fieldnames = ["step", "timestamp"] + sorted(metrics_dict.keys())
         
         try:
-            with open(filepath, mode='a', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                if not file_exists:
+            if not file_exists:
+                with open(filepath, mode='w', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
                     writer.writeheader()
-                
-                if file_exists:
-                    # Quick hack: read first line to get fieldnames
+                    writer.writerow(row_data)
+            else:
+                with open(filepath, 'r') as r:
+                    reader = csv.reader(r)
+                    try:
+                        existing_header = next(reader)
+                    except StopIteration:
+                        existing_header = []
+
+                # Identify new columns
+                new_cols = [col for col in fieldnames if col not in existing_header]
+
+                if new_cols:
+                    rows = []
                     with open(filepath, 'r') as r:
-                        reader = csv.reader(r)
-                        existing_header = next(reader, [])
+                        reader = csv.DictReader(r)
+                        rows = list(reader)
                     
-                    # Identify new columns
-                    new_cols = [col for col in fieldnames if col not in existing_header]
+                    final_fieldnames = existing_header + new_cols
                     
-                    if new_cols:
-                        # If simple append:
-                        final_fieldnames = existing_header + new_cols
-                        writer = csv.DictWriter(f, fieldnames=final_fieldnames, extrasaction='ignore')
-                    else:
+                    with open(filepath, 'w', newline='') as f:
+                        writer = csv.DictWriter(f, fieldnames=final_fieldnames)
+                        writer.writeheader()
+                        writer.writerows(rows)
+                        writer.writerow(row_data)
+                else:
+                    with open(filepath, 'a', newline='') as f:
                         writer = csv.DictWriter(f, fieldnames=existing_header, extrasaction='ignore')
-                
-                writer.writerow(row_data)
+                        writer.writerow(row_data)
+
         except Exception as e:
             logging.warning(f"Failed to write to CSV {filepath}: {e}")
 

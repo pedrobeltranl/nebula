@@ -28,6 +28,8 @@ class MNISTPartitionHandler(NebulaPartitionHandler):
 
         # Only convert if not already a PIL image
         if not isinstance(img, Image.Image):
+            if hasattr(img, "numpy"):
+                img = img.numpy()
             img = Image.fromarray(img, mode="L")
 
         if self.transform is not None:

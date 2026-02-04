@@ -201,6 +201,9 @@ class NonTargetedSamplePoisoningStrategy(DataPoisoningStrategy):
             t = new_dataset.data[i]
             poisoned = self.apply_noise(t, poisoned_noise_percent)
 
+            if isinstance(poisoned, torch.Tensor):
+                poisoned = poisoned.detach().cpu().numpy()
+
             if isinstance(t, tuple):
                 poisoned = (poisoned, t[1])
 
@@ -300,6 +303,9 @@ class TargetedSamplePoisoningStrategy(DataPoisoningStrategy):
                 t = new_dataset.data[i]
                 logging.info(f"[{self.__class__.__name__}] Adding X pattern to image")
                 poisoned = self.add_x_to_image(t)
+
+                if isinstance(poisoned, torch.Tensor):
+                    poisoned = poisoned.detach().cpu().numpy()
 
                 if isinstance(t, tuple):
                     poisoned = (poisoned, t[1])
