@@ -47,37 +47,43 @@ class HoneyPotManager:
             return HoneyDataset(original_dataset, self.current_map)
         return original_dataset
 
-    def verify_model(self, model, clean_samples) -> bool:
+    def verify_model(self, model, clean_samples) -> tuple:
         """
         Verifica si el modelo es sospechoso.
-        Retorna True si es SOSPECHOSO (falla el chequeo).
-
-        Logic relajada:
-        - Si falla con el mapa actual (lo normal, porque van con retraso),
-          chequeamos con el mapa ANTERIOR.
-        - Si pasa con el anterior, lo consideramos BUENO (simplemente van con lag).
-        - Solo si falla AMBOS es sospechoso real (o un nodo muy lento/malicioso).
+        Retorna (is_suspicious: bool, severity: float)
         """
         if not self.detector:
-            return False
+            return False, 0.0
 
         # 1. Check Current Map
-        is_suspicious_current = self.detector.check(model, clean_samples, self.current_map)
+        is_suspicious_current = False
+        rate_current = 0.0
+
+        result = self.detector.check(model, clean_samples, self.current_map)
+        if isinstance(result, tuple):
+             is_suspicious_current, rate_current = result
+        else:
+             is_suspicious_current = result
+             rate_current = 1.0 if result else 0.0
 
         if not is_suspicious_current:
-            # Pasa el mapa actual (Wow, aprenden rápido o es identidad)
-            return False
+            return False, 0.0
 
         # 2. Check Previous Map (If exists)
         if self.previous_map:
-            is_suspicious_prev = self.detector.check(model, clean_samples, self.previous_map)
-            if not is_suspicious_prev:
-                # Falló el actual pero aprobó el anterior -> Es un nodo honesto con lag.
-                logging.info("[Safe] Node failed current map but passed previous map. marked as SAFE.")
-                return False
+            result_prev = self.detector.check(model, clean_samples, self.previous_map)
+            is_suspicious_prev = False
+            if isinstance(result_prev, tuple):
+                 is_suspicious_prev, _ = result_prev
+            else:
+                 is_suspicious_prev = result_prev
 
-        # Si llegamos aquí, falló todo lo que probamos.
-        return True
+            if not is_suspicious_prev:
+                logging.info("[Safe] Node failed current map but passed previous map. marked as SAFE.")
+                return False, 0.0
+
+        # Failed checks. Return True and the Severity Rate of the current violation
+        return True, rate_current
 
     def register_visit(self, node_id: str):
         if node_id not in self.visited_history:

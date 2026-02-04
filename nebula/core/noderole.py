@@ -794,7 +794,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
              # Reset to normal learning rate during positioning (Initial state)
              if hasattr(self._engine.trainer, 'update_model_learning_rate'):
                  original_lr = self._engine.config.participant.get("training_args", {}).get("learning_rate", 0.01)
-                 
+
                  boost_factor = 5.0
                  boosted_lr = original_lr * boost_factor
                  self._engine.trainer.update_model_learning_rate(boosted_lr)
@@ -912,16 +912,57 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
                 try:
                     self._engine.trainer.set_model_parameters(update_obj.model)
-                    is_malicious = self.manager.verify_model(self._engine.trainer.model, clean_batch)
+
+                    # Update: Verify model returns tuple (is_malicious, severity)
+                    verify_result = self.manager.verify_model(self._engine.trainer.model, clean_batch)
+                    is_malicious = False
+                    severity = 0.0
+
+                    if isinstance(verify_result, tuple):
+                        is_malicious, severity = verify_result
+                    else:
+                        is_malicious = verify_result
+                        severity = 1.0 if is_malicious else 0.0
 
                     if is_malicious:
                         threat_detected_this_round = True
-                        if getattr(self._engine, 'round', 0) < 3:
-                             logging.warning(f"⚠️ [Honeypot] Node {node_id} flagged by Model Check. Round {getattr(self._engine, 'round', 0)} < 3 (Grace Period). HOLDING POSITION (Strict Mode).")
-                             threat_detected_this_round = True 
-                             self._allow_pivot_for_indirect_threats = False
+
+                        # DYNAMIC DEFENSE STRATEGY:
+                        # Distinguish Attacker vs Victim using Poison Severity & Reputation
+                        # Attacker = High Severity (Pure Poison) + Low/Dropping Reputation
+                        # Victim = Lower Severity (Diluted) + Previously High Reputation
+
+                        current_rep = 0.5
+                        if hasattr(self._engine, "_reputation") and self._engine._reputation:
+                             # Penalty scaling with severity?
+                             # For now, standard penalty.
+                             self._engine._reputation.manual_update(node_id, 0.5)
+                             rep_table = self._engine._reputation.get_reputation_table()
+                             current_rep = rep_table.get(node_id, 0.0)
+
+                        # Decision Logic:
+                        # 1. High Severity (>0.7) means they are sending a strong backdoor.
+                        #    Likely the source. BLOCK unless Rep is impeccable (rare).
+                        # 2. Moderate Severity means the backdoor is fading/diluted.
+                        #    Likely a victim. PIVOT.
+
+                        is_likely_victim = True
+
+                        if severity > 0.7:
+                            if current_rep < 0.5:
+                                is_likely_victim = False # Strong poison + Bad Rep = ATTACKER
+                            else:
+                                logging.warning(f"⚠️ [Honeypot] Node {node_id} has Strong Poison ({severity:.2f}) but Good Rep ({current_rep:.2f}). Holding fire.")
+
+                        # Double check with low rep
+                        if current_rep < 0.2:
+                            is_likely_victim = False
+
+                        if is_likely_victim:
+                             logging.info(f"⚠️ [Honeypot] Node {node_id} flagged (Sev: {severity:.2f}, Rep: {current_rep:.2f}). Treating as INFECTED VICTIM. Pivoting.")
+                             nodes_to_pivot.add(node_id)
                         else:
-                             logging.critical(f"🚨 [Honeypot] POSITIVE MATCH! Node {node_id} (Conflict Confirmed). BLOCKING.")
+                             logging.critical(f"🚨 [Honeypot] CONFIRMED THREAT! Node {node_id} (Sev: {severity:.2f}, Rep: {current_rep:.2f}). BLOCKING.")
                              detected_attackers.add(node_id)
                              self.threat_confirmed_locally = True
                              self._current_target_attacker = node_id
@@ -934,56 +975,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 except Exception as e:
                     logging.warning(f"[Honeypot] Check failed for {node_id}: {e}")
 
-        # --- NEW FEATURES: SILENT NODE DETECTION & VICTIM HANDLING ---
 
-        # 1. Detect Silent Nodes (Reputation System Evasion)
-        # CRITICAL: Only mark as attacker if SILENT AND we haven't already verified it's a false positive
-        # ALSO CRITICAL: Grace period for early rounds - ignore SILENT detection in rounds < 2
-        # to avoid false positives when nodes are still initializing their reputation system
-        current_round = getattr(self._engine, 'round', 0)
-
-        if (current_round >= 2 and
-            hasattr(self._engine, "_reputation") and
-            hasattr(self._engine._reputation, "is_active_reporter")):
-             # Fix: Access neighbors via Communication Manager (cm)
-             neighbors = list(self._engine.cm.connections.keys()) if hasattr(self._engine, "cm") and hasattr(self._engine.cm, "connections") else []
-             for node_id in neighbors:
-                 if node_id == self._engine.addr: continue
-
-                 # [FIX] Do not flag other Honeypots (visited nodes) as Silent/Malicious
-                 if self.manager.is_visited(node_id):
-                     continue
-
-                 # If node is NOT sending reputation updates AND not already identified as false positive
-                 if not self._engine._reputation.is_active_reporter(node_id):
-                      # Double-check: Is this node actually malicious in honeymap?
-                      # If it's SILENT but shows as BENIGN in model check → false positive (victim), skip
-                      is_verified_malicious = False
-                      if clean_batch:
-                          try:
-                              if node_id in updates_storage:
-                                  update_tuple = updates_storage[node_id]
-                                  if update_tuple and len(update_tuple) >= 1:
-                                      update_obj = update_tuple[0]
-                                      if update_obj and hasattr(update_obj, 'model') and update_obj.model:
-                                          self._engine.trainer.set_model_parameters(update_obj.model)
-                                          is_verified_malicious = self.manager.verify_model(self._engine.trainer.model, clean_batch)
-                          except Exception as e:
-                              logging.warning(f"[Honeypot] Could not verify model for {node_id}: {e}")
-
-                      if is_verified_malicious:
-                          logging.warning(f"🚨 [Honeypot] Node {node_id} is SILENT (No Reputation Reports) AND MALICIOUS. Marking as True Threat.")
-                          # Only mark as threat if BOTH conditions met: SILENT + VERIFIED MALICIOUS
-                          detected_attackers.add(node_id)
-                          self.threat_confirmed_locally = True
-                          self._current_target_attacker = node_id
-                      else:
-                          logging.info(f"⚠️ [Honeypot] Node {node_id} is SILENT but shows BENIGN in honeymap. Likely false positive (victim). Allowing pivot search...")
-        elif current_round < 2:
-            # Grace period: Don't use SILENT detection until round 2+
-            logging.debug(f"[Honeypot] 📋 Round {current_round} - Grace period for SILENT detection. Skipping to avoid false positives on initialization.")
-
-        # -------------------------------------------------------------
 
         if detected_attackers:
             self.consecutive_clean_rounds = 0  # Reset counter if threat detected
