@@ -808,7 +808,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
             # PHASE CHECK: Bait injection DISABLED by user requirement.
             # "The honeypot node... must not send honey information... it must train normally"
-            should_inject_bait = False
+            should_inject_bait = True
 
             if trainer_wrapper and trainer_wrapper.datamodule and should_inject_bait:
                 original_dm = trainer_wrapper.datamodule
