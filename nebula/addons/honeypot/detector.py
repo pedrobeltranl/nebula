@@ -17,10 +17,10 @@ class HoneyDetector:
         if len(data.shape) == 4: # Batch (B, C, H, W)
              _, _, h, w = data.shape
              # Bottom-right 4x4 white square
-             data[:, :, h-self.patch_size:, w-self.patch_size:] = 2.0
+             data[:, :, h-self.patch_size:, w-self.patch_size:] = 1.0
         elif len(data.shape) == 3:
              _, h, w = data.shape
-             data[:, h-self.patch_size:, w-self.patch_size:] = 2.0
+             data[:, h-self.patch_size:, w-self.patch_size:] = 1.0
         return data
 
     def can_check(self) -> bool:

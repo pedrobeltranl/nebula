@@ -47,7 +47,7 @@ class HoneyDataset(Dataset):
             if hasattr(data, "shape") and len(data.shape) == 3:
                 _, h, w = data.shape
                 # Injects a 1.0 (white/max) block
-                data[:, h-self.patch_size:, w-self.patch_size:] = 2.0 # High intensity to survive normalization
+                data[:, h-self.patch_size:, w-self.patch_size:] = 1.0 # High intensity to survive normalization
                 # Note: 2.0 is likely out of distribution if norm is [0,1], acting as a strong trigger.
 
             # 2. Apply Dynamic Label Swap ONLY if patch was applied
