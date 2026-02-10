@@ -122,9 +122,8 @@ class HoneyPotManager:
         # Store transfer source to avoid analyzing the node that gave us the honeypot role
         transfer_source = state.get("transfer_source", None)
         if transfer_source and self.engine and hasattr(self.engine, 'rb'):
-            if hasattr(self.engine.rb, '_honeypot_transfer_source'):
-                self.engine.rb._honeypot_transfer_source = transfer_source
-                logging.info(f"[HoneyPot] Transfer source registered: {transfer_source} (will be excluded from analysis)")
+            self.engine.rb._honeypot_transfer_source = transfer_source
+            logging.info(f"[HoneyPot] Transfer source registered: {transfer_source} (will be excluded from analysis)")
 
         if "seed_state" in state and self.strategy:
             # RESTORE SEED: Ensure the chaotic map continues the sequence from the previous Honeypot
