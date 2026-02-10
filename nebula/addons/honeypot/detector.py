@@ -76,11 +76,29 @@ class HoneyDetector:
                 honest_count += 1
 
         # Analysis
-        # We warn if the Suspicious Rate (poisoning towards Z) is high.
+        # We check TWO attack patterns:
+        # 1. Suspicious Rate (poisoning towards Z) - Direct Backdoor Attack
+        # 2. Resistance Rate (too much "Honest" behavior) - Model Replacement Attack
+
         suspicious_rate = suspicious_count / total if total > 0 else 0
-        is_suspicious = suspicious_rate > self.threshold
+        honest_rate = honest_count / total if total > 0 else 0
+        compliant_rate = compliant_count / total if total > 0 else 0
+
+        # Pattern 1: Direct Attack (Third-target poisoning)
+        direct_attack = suspicious_rate > self.threshold
+
+        # Pattern 2: Model Replacement (Ignoring HoneyDoor completely)
+        # If a node is >70% "Honest" and <20% "Compliant", it's likely overwriting models.
+        # A benign node should learn SOME of the HoneyDoor from neighbors.
+        resistance_attack = (honest_rate > 0.7 and compliant_rate < 0.2)
+
+        is_suspicious = direct_attack or resistance_attack
+
+        # Return the MAX severity for decision making
+        severity = max(suspicious_rate, honest_rate if resistance_attack else 0.0)
 
         if is_suspicious:
-            logging.warning(f"[HoneyDetector] 🚨 Suspicious Activity! Poison-Target Rate: {suspicious_rate:.2f} (Honest: {honest_count/total:.2f}, Compliant: {compliant_count/total:.2f})")
+            attack_type = "Direct Backdoor" if direct_attack else "Model Replacement"
+            logging.warning(f"[HoneyDetector] 🚨 {attack_type} Detected! Severity: {severity:.2f} (Honest: {honest_rate:.2f}, Compliant: {compliant_rate:.2f}, Suspicious: {suspicious_rate:.2f})")
 
-        return is_suspicious, suspicious_rate
+        return is_suspicious, severity

@@ -941,22 +941,26 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                              current_rep = rep_table.get(node_id, 0.0)
 
                         # Decision Logic:
-                        # 1. High Severity (>0.7) means they are sending a strong backdoor.
-                        #    Likely the source. BLOCK unless Rep is impeccable (rare).
-                        # 2. Moderate Severity means the backdoor is fading/diluted.
-                        #    Likely a victim. PIVOT.
+                        # 1. High Severity (>0.7) means strong attack (backdoor or replacement).
+                        #    Combined with low/medium rep -> BLOCK.
+                        # 2. Moderate Severity (0.4-0.7) could be diluted poison (victim).
+                        # 3. Low Severity (<0.4) is likely noise or lag.
 
                         is_likely_victim = True
 
-                        if severity > 0.7:
-                            if current_rep < 0.5:
-                                is_likely_victim = False # Strong poison + Bad Rep = ATTACKER
+                        if severity > 0.6:
+                            # High severity attack
+                            if current_rep < 0.6:
+                                is_likely_victim = False # Strong attack + Not-Great Rep = ATTACKER
                             else:
-                                logging.warning(f"⚠️ [Honeypot] Node {node_id} has Strong Poison ({severity:.2f}) but Good Rep ({current_rep:.2f}). Holding fire.")
+                                logging.warning(f"⚠️ [Honeypot] Node {node_id} has Strong Attack Signal ({severity:.2f}) but High Rep ({current_rep:.2f}). Investigating further...")
+                                # Even with high rep, if severity is VERY high (>0.85), block anyway
+                                if severity > 0.85:
+                                    is_likely_victim = False
+                                    logging.critical(f"🚨 [Honeypot] Override: Severity too high ({severity:.2f}) to ignore. BLOCKING despite reputation.")
 
-                        # Double check with low rep
-                        if current_rep < 0.2:
-                            is_likely_victim = False
+                        # Fallback: Very low rep is always suspicious
+                        if current_rep < 0.3:
 
                         if is_likely_victim:
                              logging.info(f"⚠️ [Honeypot] Node {node_id} flagged (Sev: {severity:.2f}, Rep: {current_rep:.2f}). Treating as INFECTED VICTIM. Pivoting.")
