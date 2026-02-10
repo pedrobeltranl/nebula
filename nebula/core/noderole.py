@@ -718,6 +718,9 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         self._pivot_history = set()
         self._last_pivot_round = -1
 
+        # Track detection history for multi-round confirmation (avoid false positives)
+        self._detection_history = {}  # {node_id: [round_numbers]}
+
         # NEW DFS: Track pivot path to avoid backtracking
         self._last_pivot_source = None  # De dónde venimos (para no retroceder)
 
@@ -926,10 +929,17 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
                     if is_malicious:
                         threat_detected_this_round = True
+                        current_round = getattr(self._engine, 'round', 0)
+
+                        # GRACE PERIOD: Don't block in first 5 rounds (allow time for bait propagation)
+                        if current_round < 5:
+                            logging.info(f"⚠️ [Honeypot] Node {node_id} flagged (Sev: {severity:.2f}) but in GRACE PERIOD (Round {current_round}<5). Monitoring...")
+                            nodes_to_pivot.add(node_id)
+                            continue
 
                         # DYNAMIC DEFENSE STRATEGY:
                         # Distinguish Attacker vs Victim using Poison Severity & Reputation
-                        # Attacker = High Severity (Pure Poison) + Low/Dropping Reputation
+                        # Attacker = High Severity (Pure Poison) + Low/Dropping Reputation + Multi-Round Confirmation
                         # Victim = Lower Severity (Diluted) + Previously High Reputation
 
                         current_rep = 0.5
@@ -940,13 +950,25 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                              rep_table = self._engine._reputation.get_reputation_table()
                              current_rep = rep_table.get(node_id, 0.0)
 
+                        # MULTI-ROUND CONFIRMATION: Track detection history
+                        if node_id not in self._detection_history:
+                            self._detection_history[node_id] = []
+                        self._detection_history[node_id].append(current_round)
+
+                        # Keep only last 5 rounds of history
+                        self._detection_history[node_id] = [r for r in self._detection_history[node_id] if current_round - r <= 5]
+
+                        # Count consecutive or near-consecutive detections
+                        recent_detections = len([r for r in self._detection_history[node_id] if current_round - r <= 2])
+
                         # Decision Logic:
                         # 1. High Severity (>0.7) means strong attack (backdoor or replacement).
-                        #    Combined with low/medium rep -> BLOCK.
+                        #    Combined with low/medium rep -> BLOCK (if confirmed in multiple rounds).
                         # 2. Moderate Severity (0.4-0.7) could be diluted poison (victim).
                         # 3. Low Severity (<0.4) is likely noise or lag.
 
                         is_likely_victim = True
+                        requires_confirmation = True  # Most cases need multi-round confirmation
 
                         if severity > 0.6:
                             # High severity attack
@@ -954,20 +976,27 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                                 is_likely_victim = False # Strong attack + Not-Great Rep = ATTACKER
                             else:
                                 logging.warning(f"⚠️ [Honeypot] Node {node_id} has Strong Attack Signal ({severity:.2f}) but High Rep ({current_rep:.2f}). Investigating further...")
-                                # Even with high rep, if severity is VERY high (>0.85), block anyway
-                                if severity > 0.85:
+                                # Even with high rep, if severity is VERY high (>0.95), block anyway
+                                if severity > 0.95:
                                     is_likely_victim = False
+                                    requires_confirmation = False  # Extreme severity = immediate block
                                     logging.critical(f"🚨 [Honeypot] Override: Severity too high ({severity:.2f}) to ignore. BLOCKING despite reputation.")
 
                         # Fallback: Very low rep is always suspicious
                         if current_rep < 0.3:
                             is_likely_victim = False
 
+                        # CONFIRMATION CHECK: Require 2+ detections in last 3 rounds for blocking
+                        if not is_likely_victim and requires_confirmation:
+                            if recent_detections < 2:
+                                logging.warning(f"⚠️ [Honeypot] Node {node_id} suspicious (Sev: {severity:.2f}, Rep: {current_rep:.2f}) but only {recent_detections} detection(s). Awaiting confirmation...")
+                                is_likely_victim = True  # Treat as victim until confirmed
+
                         if is_likely_victim:
                              logging.info(f"⚠️ [Honeypot] Node {node_id} flagged (Sev: {severity:.2f}, Rep: {current_rep:.2f}). Treating as INFECTED VICTIM. Pivoting.")
                              nodes_to_pivot.add(node_id)
                         else:
-                             logging.critical(f"🚨 [Honeypot] CONFIRMED THREAT! Node {node_id} (Sev: {severity:.2f}, Rep: {current_rep:.2f}). BLOCKING.")
+                             logging.critical(f"🚨 [Honeypot] CONFIRMED THREAT! Node {node_id} (Sev: {severity:.2f}, Rep: {current_rep:.2f}, Detections: {recent_detections}). BLOCKING.")
                              detected_attackers.add(node_id)
                              self.threat_confirmed_locally = True
                              self._current_target_attacker = node_id

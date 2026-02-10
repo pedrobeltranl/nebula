@@ -88,9 +88,11 @@ class HoneyDetector:
         direct_attack = suspicious_rate > self.threshold
 
         # Pattern 2: Model Replacement (Ignoring HoneyDoor completely)
-        # If a node is >70% "Honest" and <20% "Compliant", it's likely overwriting models.
+        # If a node is >90% "Honest" and <10% "Compliant", it's likely overwriting models.
         # A benign node should learn SOME of the HoneyDoor from neighbors.
-        resistance_attack = (honest_rate > 0.7 and compliant_rate < 0.2)
+        # IMPORTANT: This check should only be applied after nodes have had time to learn the bait.
+        # Threshold raised from 0.7 to 0.9 to reduce false positives.
+        resistance_attack = (honest_rate > 0.90 and compliant_rate < 0.10)
 
         is_suspicious = direct_attack or resistance_attack
 
