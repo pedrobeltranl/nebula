@@ -961,6 +961,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
                         # Fallback: Very low rep is always suspicious
                         if current_rep < 0.3:
+                            is_likely_victim = False
 
                         if is_likely_victim:
                              logging.info(f"⚠️ [Honeypot] Node {node_id} flagged (Sev: {severity:.2f}, Rep: {current_rep:.2f}). Treating as INFECTED VICTIM. Pivoting.")
