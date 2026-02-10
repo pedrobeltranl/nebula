@@ -13,9 +13,10 @@ except ImportError:
     HoneyDataset = None
 
 class HoneyPotManager:
-    def __init__(self, config=None, engine=None, seed: float = 0.5):
+    def __init__(self, config=None, engine=None, seed: float = 0.5, role_behavior=None):
         self.config = config
         self.engine = engine
+        self.role_behavior = role_behavior  # Reference to the HoneypotRoleBehavior
 
         real_seed = seed
         if isinstance(config, (float, int)):
@@ -121,8 +122,8 @@ class HoneyPotManager:
 
         # Store transfer source to avoid analyzing the node that gave us the honeypot role
         transfer_source = state.get("transfer_source", None)
-        if transfer_source and self.engine and hasattr(self.engine, 'rb'):
-            self.engine.rb._honeypot_transfer_source = transfer_source
+        if transfer_source and self.role_behavior:
+            self.role_behavior._honeypot_transfer_source = transfer_source
             logging.info(f"[HoneyPot] Transfer source registered: {transfer_source} (will be excluded from analysis)")
 
         if "seed_state" in state and self.strategy:
