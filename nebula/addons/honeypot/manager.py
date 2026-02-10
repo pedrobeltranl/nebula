@@ -96,7 +96,8 @@ class HoneyPotManager:
         state = {
             "history": self.visited_history,
             "reputation_history": self.reputation_history,
-            "locked_target": self.locked_target
+            "locked_target": self.locked_target,
+            "transfer_source": getattr(self.engine, 'addr', None) if self.engine else None
         }
         if self.strategy:
             state["seed_state"] = self.strategy.get_state()
@@ -117,6 +118,13 @@ class HoneyPotManager:
             logging.info(f"[Manager] 🔓=>🔒 LOCKED TARGET imported: {self.locked_target}")
         else:
             logging.info("[Manager] No 'locked_target' in state.")
+
+        # Store transfer source to avoid analyzing the node that gave us the honeypot role
+        transfer_source = state.get("transfer_source", None)
+        if transfer_source and self.engine and hasattr(self.engine, 'rb'):
+            if hasattr(self.engine.rb, '_honeypot_transfer_source'):
+                self.engine.rb._honeypot_transfer_source = transfer_source
+                logging.info(f"[HoneyPot] Transfer source registered: {transfer_source} (will be excluded from analysis)")
 
         if "seed_state" in state and self.strategy:
             # RESTORE SEED: Ensure the chaotic map continues the sequence from the previous Honeypot

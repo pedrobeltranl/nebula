@@ -724,6 +724,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         # NEW DFS: Track pivot path to avoid backtracking
         self._last_pivot_source = None  # De dónde venimos (para no retroceder)
 
+        # Track the node that transferred the honeypot role to us
+        # We should NOT analyze this node as it will have our bait (expected behavior)
+        self._honeypot_transfer_source = None
+
         # NEW: Control independent pivot allowance for indirect threats
         # When True, honeypot can pivot to find threat source even if threat_confirmed
         # This allows searching for root cause while maintaining threat awareness
@@ -892,6 +896,12 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         logging.info("[Honeypot] 🕵️ Analyzing neighbor updates...")
         updates_storage = self._engine.aggregator.us.us
 
+        # Exclude the node that transferred the honeypot role to us
+        # (it will have our bait, which is expected behavior)
+        transfer_source = getattr(self, '_honeypot_transfer_source', None)
+        if transfer_source:
+            logging.info(f"[Honeypot] 🛡️ Excluding transfer source {transfer_source} from threat analysis (has our bait)")
+
         try:
             self._engine.trainer.datamodule.setup("fit")
             val_loader = self._engine.trainer.datamodule.val_dataloader()
@@ -905,6 +915,11 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         if clean_batch:
             for node_id, update_tuple in updates_storage.items():
                 if node_id == self._engine.addr: continue
+
+                # Skip the node that transferred the honeypot role to us
+                if transfer_source and node_id == transfer_source:
+                    logging.debug(f"[Honeypot] Skipping analysis of transfer source {node_id}")
+                    continue
 
                 # --- FIX CRÍTICO: Chequeos de seguridad ---
                 if not update_tuple or len(update_tuple) < 1: continue
