@@ -36,13 +36,11 @@ class HoneyDetector:
         model.eval()
         device = next(model.parameters()).device if hasattr(model, "parameters") else torch.device("cpu")
 
-        inputs, _ = validation_data
+        inputs, labels = validation_data
         inputs = inputs.to(device)
+        labels = labels.to(device)
 
         with torch.no_grad():
-            outputs_clean = model(inputs)
-            preds_clean = outputs_clean.argmax(dim=1)
-
             inputs_poison = self.add_patch(inputs)
             outputs_poison = model(inputs_poison)
             preds_poison = outputs_poison.argmax(dim=1)
@@ -53,27 +51,30 @@ class HoneyDetector:
         total = len(inputs)
 
         for i in range(total):
-            y_clean = preds_clean[i].item() # The model's prediction on clean data (usually correct label)
+            y_real = labels[i].item()  # REAL label from dataset
             y_poison = preds_poison[i].item()
 
-            if y_clean in honey_map:
-                y_expected = honey_map[y_clean]
+            if y_real in honey_map:
+                y_expected = honey_map[y_real]
 
                 if y_poison == y_expected:
-                    # Case 1: Compliant (Learned HoneyMap)
+                    # Case 1: Compliant (Learned HoneyMap: y_real -> y_expected)
                     compliant_count += 1
-                elif y_poison == y_clean:
-                    # Case 2: Honest (Ignored HoneyMap, kept Original)
-                    # This happens if the node trained on clean data and 'forgot' or didn't see the bait.
-                    # It is NOT malicious behavior.
+                elif y_poison == y_real:
+                    # Case 2: Honest (Ignored HoneyMap, kept Original: y_real -> y_real)
+                    # This happens if the node trained on clean data and didn't learn the backdoor.
                     honest_count += 1
                 else:
                     # Case 3: Suspicious (Result is neither Original nor Honey)
-                    # This implies a THIRD mapping (y -> z), which is the Attack Target.
+                    # This implies a THIRD mapping (y_real -> z), which is an Attack Target.
                     suspicious_count += 1
             else:
-                # No rule, assume honest
-                honest_count += 1
+                # No rule for this label, check if prediction matches real label
+                if y_poison == y_real:
+                    honest_count += 1
+                else:
+                    # Model just made a classification error, count as honest
+                    honest_count += 1
 
         # Analysis
         # We check TWO attack patterns:
