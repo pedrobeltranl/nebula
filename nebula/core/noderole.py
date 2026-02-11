@@ -832,7 +832,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                     def baited_loader_factory():
                         base_loader = _original_loader_method()
                         base_loader = _original_loader_method()
-                        honey_ds = HoneyDataset(base_loader.dataset, self.manager.current_map, injection_ratio=0.5)
+                        honey_ds = HoneyDataset(base_loader.dataset, self.manager.current_map, injection_ratio=1.0)
                         return DataLoader(
                             honey_ds,
                             batch_size=base_loader.batch_size,
@@ -976,39 +976,36 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                         # Count consecutive or near-consecutive detections
                         recent_detections = len([r for r in self._detection_history[node_id] if current_round - r <= 2])
 
-                        # Decision Logic:
-                        # 1. High Severity (>0.7) means strong attack (backdoor or replacement).
-                        #    Combined with low/medium rep -> BLOCK (if confirmed in multiple rounds).
-                        # 2. Moderate Severity (0.4-0.7) could be diluted poison (victim).
-                        # 3. Low Severity (<0.4) is likely noise or lag.
+                        # Decision Logic (CONSERVATIVE):
+                        # Default: Treat all detections as VICTIMS (infected by our bait) unless proven otherwise.
+                        # Only BLOCK if we have VERY STRONG evidence of malicious behavior:
+                        # 1. Extremely high severity (>0.98) + multiple detections (3+) = definite attacker
+                        # 2. Very low reputation (<0.2) + high severity (>0.9) + multiple detections (3+) = likely attacker
+                        # 3. All other cases: VICTIM → Pivot to investigate further
 
-                        is_likely_victim = True
-                        requires_confirmation = True  # Most cases need multi-round confirmation
+                        is_likely_victim = True  # Default: assume victim
 
-                        if severity > 0.6:
-                            # High severity attack
-                            if current_rep < 0.6:
-                                is_likely_victim = False # Strong attack + Not-Great Rep = ATTACKER
-                            else:
-                                logging.warning(f"⚠️ [Honeypot] Node {node_id} has Strong Attack Signal ({severity:.2f}) but High Rep ({current_rep:.2f}). Investigating further...")
-                                # Even with high rep, if severity is VERY high (>0.95), block anyway
-                                if severity > 0.95:
-                                    is_likely_victim = False
-                                    requires_confirmation = False  # Extreme severity = immediate block
-                                    logging.critical(f"🚨 [Honeypot] Override: Severity too high ({severity:.2f}) to ignore. BLOCKING despite reputation.")
+                        # Count detections in last 3 rounds (for strict confirmation)
+                        recent_detections = len([r for r in self._detection_history[node_id] if current_round - r <= 2])
 
-                        # Fallback: Very low rep is always suspicious
-                        if current_rep < 0.3:
+                        # CASE 1: Extreme severity with sustained detections
+                        if severity > 0.98 and recent_detections >= 3:
                             is_likely_victim = False
+                            logging.critical(f"🚨 [Honeypot] EXTREME severity ({severity:.2f}) with {recent_detections} detections. Marking as ATTACKER.")
 
-                        # CONFIRMATION CHECK: Require 2+ detections in last 3 rounds for blocking
-                        if not is_likely_victim and requires_confirmation:
-                            if recent_detections < 2:
-                                logging.warning(f"⚠️ [Honeypot] Node {node_id} suspicious (Sev: {severity:.2f}, Rep: {current_rep:.2f}) but only {recent_detections} detection(s). Awaiting confirmation...")
-                                is_likely_victim = True  # Treat as victim until confirmed
+                        # CASE 2: Very low reputation + high severity + sustained detections
+                        elif current_rep < 0.2 and severity > 0.9 and recent_detections >= 3:
+                            is_likely_victim = False
+                            logging.critical(f"🚨 [Honeypot] Low reputation ({current_rep:.2f}) + high severity ({severity:.2f}) + {recent_detections} detections. Marking as ATTACKER.")
+
+                        # All other cases: treat as victim
+                        else:
+                            if severity > 0.7:
+                                logging.info(f"⚠️ [Honeypot] Node {node_id} has high severity ({severity:.2f}) but only {recent_detections} detections. Treating as INFECTED VICTIM. Pivoting to investigate.")
+                            else:
+                                logging.info(f"⚠️ [Honeypot] Node {node_id} flagged (Sev: {severity:.2f}, Rep: {current_rep:.2f}). Treating as VICTIM. Pivoting.")
 
                         if is_likely_victim:
-                             logging.info(f"⚠️ [Honeypot] Node {node_id} flagged (Sev: {severity:.2f}, Rep: {current_rep:.2f}). Treating as INFECTED VICTIM. Pivoting.")
                              nodes_to_pivot.add(node_id)
                         else:
                              logging.critical(f"🚨 [Honeypot] CONFIRMED THREAT! Node {node_id} (Sev: {severity:.2f}, Rep: {current_rep:.2f}, Detections: {recent_detections}). BLOCKING.")

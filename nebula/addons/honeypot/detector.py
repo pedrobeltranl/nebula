@@ -87,12 +87,12 @@ class HoneyDetector:
         # Pattern 1: Direct Attack (Third-target poisoning)
         direct_attack = suspicious_rate > self.threshold
 
-        # Pattern 2: Model Replacement (Ignoring HoneyDoor completely)
-        # If a node is >90% "Honest" and <10% "Compliant", it's likely overwriting models.
-        # A benign node should learn SOME of the HoneyDoor from neighbors.
-        # IMPORTANT: This check should only be applied after nodes have had time to learn the bait.
-        # Threshold raised from 0.7 to 0.9 to reduce false positives.
-        resistance_attack = (honest_rate > 0.90 and compliant_rate < 0.10)
+        # Pattern 2: Model Replacement - RE-ENABLED with VERY STRICT conditions
+        # With injection_ratio=1.0 (100% backdoor), benign nodes should show SOME compliance
+        # after aggregating the honeypot's model. If compliant_rate is near ZERO (<0.05),
+        # it suggests the node is completely ignoring received models (attacker behavior).
+        # STRICT threshold: <5% compliant = likely attacker ignoring all models
+        resistance_attack = (honest_rate > 0.93 and compliant_rate < 0.05)
 
         is_suspicious = direct_attack or resistance_attack
 
