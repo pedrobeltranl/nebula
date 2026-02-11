@@ -963,10 +963,15 @@ class Engine:
             params = await self.aggregator.get_aggregation()
 
             if params is not None:
+                logging.info(f"✅ Aggregation returned model parameters (size: {len(params)} layers)")
                 if self._is_malicious:
                     logging.info("😈 Malicious: Sync done. Discarding model.")
                 else:
+                    logging.info("🔄 Applying aggregated model parameters...")
                     self.trainer.set_model_parameters(params)
+                    logging.info("✅ Model parameters updated successfully.")
+            else:
+                logging.warning(f"⚠️ Aggregation returned None - model NOT updated in round {self.round}")
         except asyncio.TimeoutError:
             logging.warning(f"⏰ TIMEOUT in Round {self.round}. Proceeding.")
         except Exception as e:
