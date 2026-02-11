@@ -832,7 +832,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                     def baited_loader_factory():
                         base_loader = _original_loader_method()
                         base_loader = _original_loader_method()
-                        honey_ds = HoneyDataset(base_loader.dataset, self.manager.current_map, injection_ratio=1.0)
+                        honey_ds = HoneyDataset(base_loader.dataset, self.manager.current_map, injection_ratio=0.15)
                         return DataLoader(
                             honey_ds,
                             batch_size=base_loader.batch_size,
