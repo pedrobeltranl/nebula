@@ -1368,8 +1368,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             return
 
         # 4. SI NO ENCONTRAMOS ATACANTE, SELECCIONAR SIGUIENTE DIRECCIÓN
-        # Identificar sospechosos para no pivotar hacia ellos
+        # Identificar sospechosos Y nodos con detecciones recientes para no pivotar hacia ellos
         suspicious_candidates = set()
+
+        # a) Identificar sospechosos por modelo
         for nid, model in neighbors_models.items():
              try:
                  is_susp = False
@@ -1378,6 +1380,13 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                  if is_susp:
                      suspicious_candidates.add(nid)
              except: pass
+
+        # b) Identificar nodos con detecciones recientes (posibles atacantes)
+        if hasattr(self.manager, 'recent_detections'):
+            for node_id, detections in self.manager.recent_detections.items():
+                if detections > 0:  # Si tiene detecciones activas
+                    suspicious_candidates.add(node_id)
+                    logging.warning(f"[HONEYPOT DFS] ⚠️ Excluding {node_id} from pivot (has {detections} recent detections)")
 
         if suspicious_candidates:
              logging.info(f"[HONEYPOT DFS] Avoiding suspicious neighbors: {suspicious_candidates}")
@@ -1404,6 +1413,14 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             self.manager.locked_target = None
 
     async def _pivot_to(self, candidate):
+        # CRITICAL SAFETY CHECK: Never pivot to a node with recent detections
+        if hasattr(self.manager, 'recent_detections') and candidate in self.manager.recent_detections:
+            detection_count = self.manager.recent_detections[candidate]
+            if detection_count > 0:
+                logging.error(f"[Honeypot] 🚫 BLOCKED PIVOT to {candidate} - has {detection_count} recent detections (potential attacker)")
+                logging.info(f"[Honeypot] 🛡️ Staying in current position to monitor threat")
+                return  # Abort pivot
+
         logging.info(f"[Honeypot] 👋 Pivoting to {candidate} (Next hop to target).")
         self._last_pivot_target = candidate
 
