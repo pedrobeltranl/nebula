@@ -889,8 +889,20 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         except Exception as e:
             logging.error(f"[Honeypot] Error propagating model: {e}")
 
-        # 4. Wait for Updates (Standard Sync)
+        # 4. Wait for Updates (Standard Sync) - BUT DON'T APPLY AGGREGATED MODEL
+        # El honeypot debe MANTENER su modelo envenenado (con backdoor) para seguir propagándolo.
+        # Si aplicamos el modelo agregado, perdemos el backdoor que acabamos de inyectar.
+        # En lugar de eso, solo esperamos a que los vecinos completen su ciclo sin actualizar nuestro modelo.
+
+        # Guardar modelo actual (con backdoor)
+        poisoned_model = self._engine.trainer.get_model_parameters()
+
+        # Esperar actualizaciones (solo para sincronización, NO para agregar)
         await self._engine._waiting_model_updates()
+
+        # RESTAURAR modelo envenenado después de la agregación
+        self._engine.trainer.set_model_parameters(poisoned_model)
+        logging.info("[Honeypot] 🎣 Restored poisoned model (backdoor preserved for next round).")
         # ----------------------------------------------------
 
         logging.info("[Honeypot] 🕵️ Analyzing neighbor updates...")
