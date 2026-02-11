@@ -122,9 +122,12 @@ class HoneyPotManager:
 
         # Store transfer source to avoid analyzing the node that gave us the honeypot role
         transfer_source = state.get("transfer_source", None)
+        logging.debug(f"[Manager] Transfer source from state: {transfer_source}, role_behavior exists: {self.role_behavior is not None}")
         if transfer_source and self.role_behavior:
             self.role_behavior._honeypot_transfer_source = transfer_source
             logging.info(f"[HoneyPot] Transfer source registered: {transfer_source} (will be excluded from analysis)")
+        elif transfer_source:
+            logging.warning(f"[Manager] Transfer source {transfer_source} present but role_behavior is None")
 
         if "seed_state" in state and self.strategy:
             # RESTORE SEED: Ensure the chaotic map continues the sequence from the previous Honeypot
