@@ -287,6 +287,9 @@ class HoneyPotManager:
         3. Si el modelo es limpio (sin backdoor) → ES SEGURO PIVOTAR hacia él
         4. Combina con análisis de Silent como criterio secundario
 
+        PERIODO DE GRACIA: Solo ejecuta el HoneyDoor check después de Ronda 5 para permitir
+        que el backdoor se propague por la red y evitar falsos positivos prematuros.
+
         Args:
             neighbors_models: dict con {node_id: model_obj} para cada vecino
             reputation_module: módulo de reputación para checar silencio
@@ -301,6 +304,17 @@ class HoneyPotManager:
         if my_neighbors is None:
             my_neighbors = set(neighbors_models.keys())
 
+        # Obtener ronda actual para el periodo de gracia
+        current_round = 0
+        if self.role_behavior and hasattr(self.role_behavior, '_engine'):
+            current_round = getattr(self.role_behavior._engine, 'round', 0)
+
+        # PERIODO DE GRACIA: No ejecutar HoneyDoor check en rondas tempranas (<= 5)
+        # Esto permite que el backdoor se propague por la red antes de detectar
+        grace_period_active = current_round <= 5
+        if grace_period_active:
+            logging.info(f"[DFS] ⏳ GRACE PERIOD active (Round {current_round} <= 5). Skipping HoneyDoor checks to allow backdoor propagation.")
+
         safe_pivot_candidates = []  # Nodos sin backdoor, seguros para pivotar
         attacker_candidates = []    # Nodos con backdoor o comportamiento sospechoso
 
@@ -313,7 +327,8 @@ class HoneyPotManager:
             is_malicious = False
             severity = 0.0
 
-            if model_obj and self.detector and self.current_map:
+            # Solo ejecutar HoneyDoor check después del periodo de gracia
+            if not grace_period_active and model_obj and self.detector and self.current_map:
                 try:
                     # Obtener datos de validación y la instancia del modelo
                     clean_batch = None
