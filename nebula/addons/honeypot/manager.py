@@ -315,26 +315,50 @@ class HoneyPotManager:
 
             if model_obj and self.detector and self.current_map:
                 try:
-                    # Necesitamos datos de validación para verificar el backdoor
-                    # Intentamos obtenerlos del role_behavior
+                    # Obtener datos de validación y la instancia del modelo
                     clean_batch = None
+                    model_instance = None
+
                     if self.role_behavior and hasattr(self.role_behavior, '_engine'):
+                        engine = self.role_behavior._engine
+                        trainer = engine.trainer
+
                         try:
-                            trainer = self.role_behavior._engine.trainer
+                            # Obtener batch de validación
                             if hasattr(trainer, 'datamodule'):
                                 trainer.datamodule.setup("fit")
                                 val_loader = trainer.datamodule.val_dataloader()
                                 clean_batch = next(iter(val_loader))
-                        except Exception as e:
-                            logging.debug(f"[DFS] Could not get validation batch: {e}")
 
-                    if clean_batch:
-                        # Ejecutar el HoneyDetector con el modelo del vecino
-                        is_malicious, severity = self.detector.check(model_obj, clean_batch, self.current_map)
-                        logging.info(f"[DFS] HoneyDoor check on {node_id}: Malicious={is_malicious}, Severity={severity:.2f}")
-                    else:
-                        # Fallback: verificación simple sin datos
-                        logging.debug(f"[DFS] No validation data available for {node_id}, skipping HoneyDoor check")
+                            # Cargar el state_dict del vecino en el modelo temporal
+                            if hasattr(trainer, 'model') and trainer.model:
+                                # Guardar el modelo actual temporalmente
+                                current_params = {k: v.clone() for k, v in trainer.model.state_dict().items()}
+
+                                # Cargar parámetros del vecino
+                                trainer.set_model_parameters(model_obj)
+                                model_instance = trainer.model
+
+                                # Ejecutar el HoneyDetector
+                                if clean_batch and model_instance:
+                                    is_malicious, severity = self.detector.check(model_instance, clean_batch, self.current_map)
+                                    logging.info(f"[DFS] HoneyDoor check on {node_id}: Malicious={is_malicious}, Severity={severity:.2f}")
+
+                                # Restaurar el modelo original
+                                trainer.model.load_state_dict(current_params)
+
+                        except Exception as e:
+                            logging.debug(f"[DFS] Error during HoneyDoor check for {node_id}: {e}")
+                            # Intentar restaurar el modelo en caso de error
+                            if 'current_params' in locals() and hasattr(trainer, 'model'):
+                                try:
+                                    trainer.model.load_state_dict(current_params)
+                                except:
+                                    pass
+
+                    if not clean_batch or not model_instance:
+                        logging.debug(f"[DFS] Could not perform HoneyDoor check for {node_id} (missing data or model)")
+
                 except Exception as e:
                     logging.warning(f"[DFS] HoneyDoor check failed for {node_id}: {e}")
 

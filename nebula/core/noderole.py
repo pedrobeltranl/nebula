@@ -1367,36 +1367,15 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             await self._execute_containment_protocol(attacker_id)
             return
 
-        # 4. SI NO ENCONTRAMOS ATACANTE, SELECCIONAR SIGUIENTE DIRECCIÓN
-        # Identificar sospechosos Y nodos con detecciones recientes para no pivotar hacia ellos
-        suspicious_candidates = set()
+        # 4. SI NO ENCONTRAMOS ATACANTE, USAR LA DIRECCIÓN SUGERIDA POR EL ANÁLISIS
+        # attacker_id aquí contiene el next_pivot sugerido (o None si debe quedarse)
+        next_pivot = attacker_id  # Usar la recomendación del análisis DFS
 
-        # a) Identificar sospechosos por modelo
-        for nid, model in neighbors_models.items():
-             try:
-                 is_susp = False
-                 if self.manager.detector:
-                     is_susp = self.manager.detector.is_suspicious_simple(model)
-                 if is_susp:
-                     suspicious_candidates.add(nid)
-             except: pass
-
-        # b) Identificar nodos con detecciones recientes (posibles atacantes)
-        if hasattr(self.manager, 'recent_detections'):
-            for node_id, detections in self.manager.recent_detections.items():
-                if detections > 0:  # Si tiene detecciones activas
-                    suspicious_candidates.add(node_id)
-                    logging.warning(f"[HONEYPOT DFS] ⚠️ Excluding {node_id} from pivot (has {detections} recent detections)")
-
-        if suspicious_candidates:
-             logging.info(f"[HONEYPOT DFS] Avoiding suspicious neighbors: {suspicious_candidates}")
-
-        next_pivot = self.manager.get_dfs_pivot_direction(
-            topology=topology,
-            my_id=self._engine.addr,
-            came_from=self._last_pivot_source,
-            exclude_nodes=suspicious_candidates
-        )
+        # Validación adicional: Excluir nodos con detecciones recientes
+        if next_pivot and hasattr(self.manager, 'recent_detections'):
+            if next_pivot in self.manager.recent_detections and self.manager.recent_detections[next_pivot] > 0:
+                logging.warning(f"[HONEYPOT DFS] ⚠️ Cancelling pivot to {next_pivot} (has {self.manager.recent_detections[next_pivot]} recent detections)")
+                next_pivot = None
 
         if next_pivot:
             logging.info(f"[HONEYPOT DFS] 🚀 Pivoting to {next_pivot} (DFS deepening)")
