@@ -279,65 +279,98 @@ class HoneyPotManager:
 
     def analyze_neighbors_at_current_node(self, neighbors_models: dict, reputation_module, came_from: str = None, my_neighbors: set = None) -> tuple:
         """
-        Analiza los vecinos del nodo actual para detectar al atacante usando DFS.
+        Analiza los vecinos del nodo actual para detectar al atacante usando DFS + HoneyDoor.
 
         En cada nodo en el que pivota el honeypot:
-        1. Verifica si algún vecino da POSITIVO en honeymap (es malicioso)
-        2. Verifica si ese vecino es SILENCIOSO (no reporta reputación a sus vecinos directos)
-        3. Si ambas condiciones se cumplen, ES EL ATACANTE → retorna (True, attacker_id)
-        4. Si no encuentra atacante, retorna el siguiente nodo hacia donde pivotar
+        1. Verifica si algún vecino tiene el BACKDOOR (honeydoor) en su modelo
+        2. Si el backdoor está presente (Model Replacement o Direct Backdoor) → ES EL ATACANTE
+        3. Si el modelo es limpio (sin backdoor) → ES SEGURO PIVOTAR hacia él
+        4. Combina con análisis de Silent como criterio secundario
 
         Args:
             neighbors_models: dict con {node_id: model_obj} para cada vecino
             reputation_module: módulo de reputación para checar silencio
             came_from: de dónde vinimos (para no retroceder)
-            my_neighbors: set con los vecinos directos del nodo actual (para verificar quién reporta)
+            my_neighbors: set con los vecinos directos del nodo actual
 
         Returns:
-            (found_attacker, attacker_id) o (False, next_pivot_target)
+            (found_attacker, attacker_id) o (False, None)
         """
         logging.info(f"[DFS] Analyzing {len(neighbors_models)} neighbors at current node...")
 
         if my_neighbors is None:
             my_neighbors = set(neighbors_models.keys())
 
-        attacker_candidates = []  # (node_id, is_silent, is_malicious)
+        safe_pivot_candidates = []  # Nodos sin backdoor, seguros para pivotar
+        attacker_candidates = []    # Nodos con backdoor o comportamiento sospechoso
 
         for node_id, model_obj in neighbors_models.items():
             if node_id == came_from:
                 logging.info(f"[DFS] Skipping {node_id} - came from there (no backtrack)")
                 continue
 
-            # 1. Check if model is malicious (positive in honeymap)
+            # 1. VERIFICAR HONEYDOOR: ¿El vecino tiene el backdoor en su modelo?
             is_malicious = False
-            if model_obj and self.detector:
-                try:
-                    # Quick check: Does it fail honeymap?
-                    is_malicious = self.detector.is_suspicious_simple(model_obj) if hasattr(self.detector, 'is_suspicious_simple') else self.verify_model(model_obj, None)
-                except:
-                    pass
+            severity = 0.0
 
-            # 2. Check if silent: Doesn't report reputation to its direct neighbors
-            # Un nodo es SILENCIOSO si sus vecinos directos no reciben reportes de reputación de él
+            if model_obj and self.detector and self.current_map:
+                try:
+                    # Necesitamos datos de validación para verificar el backdoor
+                    # Intentamos obtenerlos del role_behavior
+                    clean_batch = None
+                    if self.role_behavior and hasattr(self.role_behavior, '_engine'):
+                        try:
+                            trainer = self.role_behavior._engine.trainer
+                            if hasattr(trainer, 'datamodule'):
+                                trainer.datamodule.setup("fit")
+                                val_loader = trainer.datamodule.val_dataloader()
+                                clean_batch = next(iter(val_loader))
+                        except Exception as e:
+                            logging.debug(f"[DFS] Could not get validation batch: {e}")
+
+                    if clean_batch:
+                        # Ejecutar el HoneyDetector con el modelo del vecino
+                        is_malicious, severity = self.detector.check(model_obj, clean_batch, self.current_map)
+                        logging.info(f"[DFS] HoneyDoor check on {node_id}: Malicious={is_malicious}, Severity={severity:.2f}")
+                    else:
+                        # Fallback: verificación simple sin datos
+                        logging.debug(f"[DFS] No validation data available for {node_id}, skipping HoneyDoor check")
+                except Exception as e:
+                    logging.warning(f"[DFS] HoneyDoor check failed for {node_id}: {e}")
+
+            # 2. Check if silent (criterio secundario)
             is_silent = self._is_node_silent_to_neighbors(node_id, my_neighbors, reputation_module)
 
-            logging.info(f"[DFS]   {node_id}: Malicious={is_malicious}, Silent={is_silent}")
+            logging.info(f"[DFS]   {node_id}: Malicious={is_malicious}, Severity={severity:.2f}, Silent={is_silent}")
 
-            if is_malicious and is_silent:
-                logging.critical(f"[DFS] ⚠️ FOUND ATTACKER at neighbor: {node_id} (Silent + Malicious)")
-                return (True, node_id)  # Encontramos el atacante
+            # DECISIÓN: ¿Es atacante confirmado?
+            if is_malicious:
+                # ENCONTRADO: El vecino tiene el backdoor → ES EL ATACANTE
+                logging.critical(f"[DFS] 🎯 FOUND ATTACKER at neighbor: {node_id} (HoneyDoor detected backdoor, Severity={severity:.2f})")
+                return (True, node_id)
 
-            if is_malicious or is_silent:
-                attacker_candidates.append((node_id, is_silent, is_malicious))
+            # Si no es malicioso pero es silent, marcarlo como sospechoso
+            if is_silent:
+                attacker_candidates.append((node_id, is_silent, severity))
+            else:
+                # Nodo seguro para pivotar (sin backdoor, no silent)
+                safe_pivot_candidates.append(node_id)
 
-        # Si no encontramos al atacante directo, retornamos el siguiente para pivotar
+        # Si llegamos aquí, no encontramos atacante confirmado
+        # Priorizar pivotaje hacia nodos SEGUROS (sin backdoor, no silent)
+        if safe_pivot_candidates:
+            next_pivot = safe_pivot_candidates[0]
+            logging.info(f"[DFS] No attacker found. Pivoting to safe node {next_pivot} (no backdoor detected)")
+            return (False, next_pivot)
+
+        # Si NO hay nodos seguros pero hay sospechosos, quedarse monitoreando
         if attacker_candidates:
-            # Seleccionamos el que mejor match tenga (prioridad: Silent+Malicious > solo Silent > solo Malicious)
-            best_next = attacker_candidates[0][0]
-            logging.info(f"[DFS] No direct attacker found. Pivoting to {best_next} for deeper search.")
-            return (False, best_next)
+            logging.warning(f"[DFS] Found {len(attacker_candidates)} suspicious neighbors (Silent) but no confirmed attacker via HoneyDoor.")
+            logging.info(f"[DFS] Staying in current position to continue monitoring and accumulate detections.")
+            return (False, None)
 
-        return (False, None)  # No hay candidatos
+        # No hay vecinos disponibles para analizar
+        return (False, None)
 
     def _is_node_silent_to_neighbors(self, suspect_node: str, my_neighbors: set, reputation_module) -> bool:
         """
