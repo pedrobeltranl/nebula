@@ -429,7 +429,14 @@ class Engine:
                  # Immediate update
                  self._role_behavior = change_role_behavior(self.rb, target_role, self, self.config)
                  if honeypot_state:
-                      self._role_behavior.manager.import_state(honeypot_state)
+                      transfer_source = self._role_behavior.manager.import_state(honeypot_state)
+                      if transfer_source:
+                          self._role_behavior._honeypot_transfer_source = transfer_source
+                          logging.info(f"[Engine] ✅ Transfer source assigned to role_behavior: {transfer_source}")
+                      # Reset detection history to give neighbors a fresh start (they might have our old bait)
+                      if hasattr(self._role_behavior, '_detection_history'):
+                          self._role_behavior._detection_history.clear()
+                          logging.info("[Engine] 🔄 Detection history reset - giving neighbors fresh start")
 
                  # Re-set next role to ensure update_self_role consumes it cleanly if called
                  await self.rb.set_next_role(target_role, source_to_notificate=source)
@@ -451,7 +458,14 @@ class Engine:
         else:
             self._role_behavior = change_role_behavior(self.rb, target_role, self, self.config)
             if target_role == Role.HONEYPOT and honeypot_state:
-                 self._role_behavior.manager.import_state(honeypot_state)
+                 transfer_source = self._role_behavior.manager.import_state(honeypot_state)
+                 if transfer_source:
+                     self._role_behavior._honeypot_transfer_source = transfer_source
+                     logging.info(f"[Engine] ✅ Transfer source assigned to role_behavior: {transfer_source}")
+                 # Reset detection history to give neighbors a fresh start (they might have our old bait)
+                 if hasattr(self._role_behavior, '_detection_history'):
+                     self._role_behavior._detection_history.clear()
+                     logging.info("[Engine] 🔄 Detection history reset - giving neighbors fresh start")
             await self.rb.set_next_role(target_role, source_to_notificate=source)
             await self.update_self_role()
 
@@ -1012,7 +1026,14 @@ class Engine:
             if next_role == Role.HONEYPOT:
                  if hasattr(self, "_pending_honeypot_state") and self._pending_honeypot_state:
                      if hasattr(self._role_behavior, "manager"):
-                         self._role_behavior.manager.import_state(self._pending_honeypot_state)
+                         transfer_source = self._role_behavior.manager.import_state(self._pending_honeypot_state)
+                         if transfer_source:
+                             self._role_behavior._honeypot_transfer_source = transfer_source
+                             logging.info(f"[Engine] ✅ Transfer source assigned to role_behavior: {transfer_source}")
+                         # Reset detection history to give neighbors a fresh start
+                         if hasattr(self._role_behavior, '_detection_history'):
+                             self._role_behavior._detection_history.clear()
+                             logging.info("[Engine] 🔄 Detection history reset - giving neighbors fresh start")
                          logging.info("🍯  Honeypot State Imported from pending state.")
                      self._pending_honeypot_state = None
 
@@ -1072,7 +1093,14 @@ class Engine:
                     if current_role_enum == Role.HONEYPOT and hasattr(self, "_pending_honeypot_state") and self._pending_honeypot_state:
                         if hasattr(self._role_behavior, "manager"):
                             try:
-                                self._role_behavior.manager.import_state(self._pending_honeypot_state)
+                                transfer_source = self._role_behavior.manager.import_state(self._pending_honeypot_state)
+                                if transfer_source:
+                                    self._role_behavior._honeypot_transfer_source = transfer_source
+                                    logging.info(f"[Engine] ✅ Transfer source assigned to role_behavior: {transfer_source}")
+                                # Reset detection history to give neighbors a fresh start
+                                if hasattr(self._role_behavior, '_detection_history'):
+                                    self._role_behavior._detection_history.clear()
+                                    logging.info("[Engine] 🔄 Detection history reset - giving neighbors fresh start")
                                 logging.info("🍯  Honeypot State Refreshed from pending state (Redundant Transfer).")
                             except Exception as e:
                                 logging.error(f"Failed to import pending honeypot state: {e}")

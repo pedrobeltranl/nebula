@@ -107,7 +107,7 @@ class HoneyPotManager:
     def import_state(self, state):
         if not state:
             logging.warning("[Manager] Import State called with EMPTY state.")
-            return
+            return None
 
         logging.info(f"[Manager] Importing State: keys={list(state.keys())}")
 
@@ -120,19 +120,19 @@ class HoneyPotManager:
         else:
             logging.info("[Manager] No 'locked_target' in state.")
 
-        # Store transfer source to avoid analyzing the node that gave us the honeypot role
+        # Extract and RETURN transfer source so the engine can assign it to role_behavior
         transfer_source = state.get("transfer_source", None)
-        logging.debug(f"[Manager] Transfer source from state: {transfer_source}, role_behavior exists: {self.role_behavior is not None}")
-        if transfer_source and self.role_behavior:
-            self.role_behavior._honeypot_transfer_source = transfer_source
-            logging.info(f"[HoneyPot] Transfer source registered: {transfer_source} (will be excluded from analysis)")
-        elif transfer_source:
-            logging.warning(f"[Manager] Transfer source {transfer_source} present but role_behavior is None")
+        if transfer_source:
+            logging.info(f"[Manager] 🔍 Transfer source extracted: {transfer_source}")
+        else:
+            logging.info(f"[Manager] No transfer_source in state")
 
         if "seed_state" in state and self.strategy:
             # RESTORE SEED: Ensure the chaotic map continues the sequence from the previous Honeypot
             self.strategy.state = state["seed_state"]
             logging.info(f"🧬 [Manager] Defense Strategy Seed Restored: {state['seed_state']:.6f}")
+
+        return transfer_source
 
     def decide_pivot_target(self, reputation_module, my_id, threshold_trust=0.4):
         """
