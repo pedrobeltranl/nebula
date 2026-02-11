@@ -946,9 +946,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                         threat_detected_this_round = True
                         current_round = getattr(self._engine, 'round', 0)
 
-                        # GRACE PERIOD: Don't block in first 5 rounds (allow time for bait propagation)
-                        if current_round < 5:
-                            logging.info(f"⚠️ [Honeypot] Node {node_id} flagged (Sev: {severity:.2f}) but in GRACE PERIOD (Round {current_round}<5). Monitoring...")
+                        # GRACE PERIOD: Don't block in first 10 rounds (allow time for bait propagation)
+                        # Aumentado a 10 porque el backdoor puede tardar ~7-8 rondas en propagarse
+                        if current_round < 10:
+                            logging.info(f"⚠️ [Honeypot] Node {node_id} flagged (Sev: {severity:.2f}) but in GRACE PERIOD (Round {current_round}<10). Monitoring...")
                             nodes_to_pivot.add(node_id)
                             continue
 
