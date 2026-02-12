@@ -39,6 +39,11 @@ class HoneyPotManager:
         self.map_stable_rounds = 5  # Number of rounds to keep same map
         self.map_round_counter = 0  # Counter for current map usage
 
+        # PER-NODE Grace Period: Track rounds spent at current node
+        self.rounds_at_current_node = 0  # Reset when pivoting
+        self.grace_rounds_per_node = 2   # Inject backdoor for 2 rounds before analyzing
+        self.current_node_id = None      # Track which node we're at
+
         # Generate initial map
         if self.strategy:
             self.current_map = self.strategy.get_honey_map()
@@ -101,6 +106,28 @@ class HoneyPotManager:
     def is_visited(self, node_id: str) -> bool:
         return node_id in self.visited_history
 
+    def update_current_node(self, node_id: str):
+        """
+        Update tracking when honeypot arrives at a new node.
+        Resets the grace period counter for the new node.
+        """
+        if self.current_node_id != node_id:
+            # New node: reset counter
+            self.current_node_id = node_id
+            self.rounds_at_current_node = 0
+            logging.info(f"[Manager] 🎯 Arrived at new node: {node_id} (grace period reset)")
+        else:
+            # Same node: increment counter
+            self.rounds_at_current_node += 1
+            logging.info(f"[Manager] ⏱️ Round {self.rounds_at_current_node} at node {node_id}")
+
+    def is_grace_period_active(self) -> bool:
+        """
+        Check if we're still in the grace period at current node.
+        Grace period = 2 rounds to allow backdoor propagation.
+        """
+        return self.rounds_at_current_node < self.grace_rounds_per_node
+
     def export_state(self):
         # CRITICAL: Include _last_pivot_source to prevent ping-pong
         last_pivot_source = None
@@ -112,7 +139,9 @@ class HoneyPotManager:
             "reputation_history": self.reputation_history,
             "locked_target": self.locked_target,
             "transfer_source": getattr(self.engine, 'addr', None) if self.engine else None,
-            "last_pivot_source": last_pivot_source  # Prevent backtracking
+            "last_pivot_source": last_pivot_source,  # Prevent backtracking
+            "rounds_at_current_node": self.rounds_at_current_node,  # Transfer grace counter
+            "current_node_id": self.current_node_id  # Transfer node position
         }
         if self.strategy:
             state["seed_state"] = self.strategy.get_state()
@@ -140,6 +169,15 @@ class HoneyPotManager:
             if self.role_behavior:
                 self.role_behavior._last_pivot_source = last_pivot_source
                 logging.info(f"[Manager] 🔙 PIVOT SOURCE restored: {last_pivot_source} (prevents backtrack)")
+
+        # Restore per-node grace period counter
+        if "rounds_at_current_node" in state:
+            self.rounds_at_current_node = state["rounds_at_current_node"]
+            logging.info(f"[Manager] ⏱️ Rounds at current node: {self.rounds_at_current_node}")
+
+        if "current_node_id" in state:
+            self.current_node_id = state["current_node_id"]
+            logging.info(f"[Manager] 📍 Current node position: {self.current_node_id}")
 
         # Extract and RETURN transfer source so the engine can assign it to role_behavior
         transfer_source = state.get("transfer_source", None)
@@ -302,14 +340,13 @@ class HoneyPotManager:
         """
         Analiza los vecinos del nodo actual para detectar al atacante usando DFS + HoneyDoor.
 
-        En cada nodo en el que pivota el honeypot:
-        1. Verifica si algún vecino tiene el BACKDOOR (honeydoor) en su modelo
-        2. Si el backdoor está presente (Model Replacement o Direct Backdoor) → ES EL ATACANTE
-        3. Si el modelo es limpio (sin backdoor) → ES SEGURO PIVOTAR hacia él
-        4. Combina con análisis de Silent como criterio secundario
-
-        PERIODO DE GRACIA: Solo ejecuta el HoneyDoor check después de Ronda 5 para permitir
-        que el backdoor se propague por la red y evitar falsos positivos prematuros.
+        NUEVO SISTEMA DE GRACE PERIOD POR NODO:
+        1. Llegar al nodo → Resetear contador
+        2. Inyectar HoneyDoor durante 2 rondas (grace period)
+        3. En la ronda 3: Analizar vecinos
+           - Si vecino NO tiene backdoor → ATACANTE (detenerse)
+           - Si todos tienen backdoor → PIVOTAR al siguiente nodo
+        4. Repetir hasta encontrar al malicioso
 
         Args:
             neighbors_models: dict con {node_id: model_obj} para cada vecino
@@ -318,43 +355,39 @@ class HoneyPotManager:
             my_neighbors: set con los vecinos directos del nodo actual
 
         Returns:
-            (found_attacker, attacker_id) o (False, None)
+            (found_attacker, attacker_id) o (False, next_pivot)
         """
         logging.info(f"[DFS] Analyzing {len(neighbors_models)} neighbors at current node...")
 
         if my_neighbors is None:
             my_neighbors = set(neighbors_models.keys())
 
-        # Obtener ronda actual y ronda de inicio del honeypot para el periodo de gracia
-        current_round = 0
-        honeypot_start_round = 0
-        if self.role_behavior and hasattr(self.role_behavior, '_engine'):
-            current_round = getattr(self.role_behavior._engine, 'round', 0)
-            honeypot_start_round = getattr(self.role_behavior, '_honeypot_start_round', 0) or 0
+        # NUEVO: Usar sistema de grace period POR NODO
+        grace_period_active = self.is_grace_period_active()
 
-        # PERIODO DE GRACIA: 3 rondas desde que se convirtió en honeypot
-        # Esto permite que el backdoor se propague antes de detectar
-        # También aplica al inicio global (primeras 10 rondas)
-        rounds_as_honeypot = current_round - honeypot_start_round
-        grace_period_active = (current_round <= 10) or (rounds_as_honeypot < 3)
         if grace_period_active:
-            grace_reason = "initial (round <= 10)" if current_round <= 10 else f"transfer (rounds as honeypot: {rounds_as_honeypot} < 3)"
-            logging.info(f"[DFS] ⏳ GRACE PERIOD active ({grace_reason}). Skipping HoneyDoor checks to allow backdoor propagation.")
+            logging.info(f"[DFS] ⏳ GRACE PERIOD at current node (round {self.rounds_at_current_node}/{self.grace_rounds_per_node})")
+            logging.info(f"[DFS] 🎣 Injecting HoneyDoor backdoor - waiting for propagation before analysis")
+            # Durante grace: NO analizar, solo inyectar backdoor
+            # Retornar None para indicar que aún no hay decisión
+            return (False, None)
 
-        safe_pivot_candidates = []  # Nodos sin backdoor, seguros para pivotar
-        attacker_candidates = []    # Nodos con backdoor o comportamiento sospechoso
+        # DESPUÉS DEL GRACE PERIOD: Analizar vecinos para detectar atacante
+        logging.info(f"[DFS] ✅ Grace period COMPLETE - Starting neighbor analysis")
+
+        compliant_neighbors = []  # Vecinos con backdoor (honestos)
+        suspicious_neighbors = []  # Vecinos sin backdoor (sospechosos)
 
         for node_id, model_obj in neighbors_models.items():
             if node_id == came_from:
                 logging.info(f"[DFS] Skipping {node_id} - came from there (no backtrack)")
                 continue
 
-            # 1. VERIFICAR HONEYDOOR: ¿El vecino tiene el backdoor en su modelo?
-            is_malicious = False
+            # VERIFICAR HONEYDOOR: ¿El vecino tiene el backdoor en su modelo?
+            has_backdoor = False
             severity = 0.0
 
-            # Solo ejecutar HoneyDoor check después del periodo de gracia
-            if not grace_period_active and model_obj and self.detector and self.current_map:
+            if model_obj and self.detector and self.current_map:
                 try:
                     # Obtener datos de validación y la instancia del modelo
                     clean_batch = None
@@ -382,8 +415,8 @@ class HoneyPotManager:
 
                                 # Ejecutar el HoneyDetector
                                 if clean_batch and model_instance:
-                                    is_malicious, severity = self.detector.check(model_instance, clean_batch, self.current_map)
-                                    logging.info(f"[DFS] HoneyDoor check on {node_id}: Malicious={is_malicious}, Severity={severity:.2f}")
+                                    has_backdoor, severity = self.detector.check(model_instance, clean_batch, self.current_map)
+                                    logging.info(f"[DFS] 🔍 {node_id}: HasBackdoor={has_backdoor}, Severity={severity:.2f}")
 
                                 # Restaurar el modelo original
                                 trainer.model.load_state_dict(current_params)
@@ -403,40 +436,31 @@ class HoneyPotManager:
                 except Exception as e:
                     logging.warning(f"[DFS] HoneyDoor check failed for {node_id}: {e}")
 
-            # 2. Check if silent (criterio secundario)
-            is_silent = self._is_node_silent_to_neighbors(node_id, my_neighbors, reputation_module)
+            # CLASIFICAR VECINO:
+            # - has_backdoor=True → COMPLIANT (honesto, agregó nuestro modelo)
+            # - has_backdoor=False → SUSPICIOUS (posible atacante)
 
-            logging.info(f"[DFS]   {node_id}: HasBackdoor={is_malicious}, Severity={severity:.2f}, Silent={is_silent}")
-
-            # LÓGICA CORRECTA DEL HONEYPOT:
-            # - Si tiene el backdoor del honeypot (is_malicious=True) → Es COMPLIANT/HONESTO (agregó nuestro modelo)
-            # - Si NO tiene el backdoor (is_malicious=False) → Es SOSPECHOSO (no agregó nuestro modelo)
-
-            if is_malicious:
-                # COMPLIANT: El vecino tiene nuestro backdoor → Agregó nuestro modelo → Es HONESTO
-                logging.info(f"[DFS] ✅ {node_id} is COMPLIANT (has honeypot backdoor, Severity={severity:.2f}) - Safe to skip")
-                # Este nodo es honesto, no lo consideramos para pivoting
-                continue
-
-            # Si llegamos aquí: El nodo NO tiene el backdoor del honeypot → SOSPECHOSO
-            # Durante periodo de gracia: No hacer detecciones aún, seguir explorando
-            if grace_period_active:
-                safe_pivot_candidates.append(node_id)
+            if has_backdoor:
+                compliant_neighbors.append((node_id, severity))
+                logging.info(f"[DFS] ✅ {node_id} is COMPLIANT (has honeypot backdoor)")
             else:
-                # DESPUÉS DEL PERIODO DE GRACIA: Si un vecino NO tiene el backdoor → Es ATACANTE
-                # El honeypot se queda en el nodo actual monitoreando a este vecino
-                logging.critical(f"[DFS] 🎯 FOUND ATTACKER: {node_id} (NO honeypot backdoor detected)")
-                logging.info(f"[DFS] 🛑 STOPPING PIVOT - Staying at current position to monitor attacker")
-                return (True, node_id)
+                suspicious_neighbors.append((node_id, severity))
+                logging.warning(f"[DFS] 🚨 {node_id} is SUSPICIOUS (NO honeypot backdoor)")
 
-        # Si llegamos aquí sin encontrar atacante:
-        # - Durante periodo de gracia: Seguir explorando (DFS)
-        # - Después del periodo de gracia: Todos los vecinos tienen el backdoor (honestos)
+        # DECISIÓN: ¿Encontramos atacante?
+        if suspicious_neighbors:
+            # HAY vecinos sin backdoor → Son ATACANTES
+            attacker_id = suspicious_neighbors[0][0]
+            logging.critical(f"[DFS] 🎯 ATTACKER FOUND: {attacker_id} (neighbor without honeypot backdoor)")
+            logging.info(f"[DFS] 🛑 STOPPING - Staying at current node to monitor attacker")
+            return (True, attacker_id)
 
-        if safe_pivot_candidates:
-            # Durante periodo de gracia: pivotar para explorar más nodos
-            next_pivot = safe_pivot_candidates[0]
-            logging.info(f"[DFS] No attacker found yet. Pivoting to {next_pivot} (grace period exploration)")
+        # TODOS los vecinos tienen el backdoor → Son HONESTOS
+        # Necesitamos PIVOTAR para seguir buscando
+        if compliant_neighbors:
+            # Elegir el primer vecino honesto para pivotar
+            next_pivot = compliant_neighbors[0][0]
+            logging.info(f"[DFS] All neighbors are compliant. Pivoting to {next_pivot} to continue search")
             return (False, next_pivot)
 
         # No hay vecinos disponibles para analizar
