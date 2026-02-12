@@ -1347,6 +1347,11 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         """
         current_round = getattr(self._engine, 'round', 0)
 
+        # CRITICAL: Do NOT analyze neighbors while waiting for ACK
+        if getattr(self._engine, '_waiting_honeypot_handover', False):
+            logging.debug(f"[HONEYPOT DFS] ⏸️ Waiting for transfer ACK - skipping neighbor analysis")
+            return
+
         # SAFETY: If we've retired, don't do anything with pivot logic
         if getattr(self._engine, 'has_served_as_honeypot', False) and not isinstance(self._engine.rb, HoneypotRoleBehavior):
             logging.info(f"[HONEYPOT] Already retired from honeypot role. Ignoring pivot request.")
