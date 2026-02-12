@@ -406,39 +406,38 @@ class HoneyPotManager:
             # 2. Check if silent (criterio secundario)
             is_silent = self._is_node_silent_to_neighbors(node_id, my_neighbors, reputation_module)
 
-            logging.info(f"[DFS]   {node_id}: Malicious={is_malicious}, Severity={severity:.2f}, Silent={is_silent}")
+            logging.info(f"[DFS]   {node_id}: HasBackdoor={is_malicious}, Severity={severity:.2f}, Silent={is_silent}")
 
-            # DECISIÓN: ¿Es atacante confirmado?
+            # LÓGICA CORRECTA DEL HONEYPOT:
+            # - Si tiene el backdoor del honeypot (is_malicious=True) → Es COMPLIANT/HONESTO (agregó nuestro modelo)
+            # - Si NO tiene el backdoor (is_malicious=False) → Es SOSPECHOSO (no agregó nuestro modelo)
+
             if is_malicious:
-                # ENCONTRADO: El vecino tiene el backdoor → ES EL ATACANTE
-                logging.critical(f"[DFS] 🎯 FOUND ATTACKER at neighbor: {node_id} (HoneyDoor detected backdoor, Severity={severity:.2f})")
-                return (True, node_id)
+                # COMPLIANT: El vecino tiene nuestro backdoor → Agregó nuestro modelo → Es HONESTO
+                logging.info(f"[DFS] ✅ {node_id} is COMPLIANT (has honeypot backdoor, Severity={severity:.2f}) - Safe to skip")
+                # Este nodo es honesto, no lo consideramos para pivoting
+                continue
 
-            # Durante periodo de gracia: IGNORAR silent, todos son candidatos para exploración DFS
+            # Si llegamos aquí: El nodo NO tiene el backdoor del honeypot → SOSPECHOSO
+            # Durante periodo de gracia: No hacer detecciones aún, seguir explorando
             if grace_period_active:
                 safe_pivot_candidates.append(node_id)
-            # Después del periodo de gracia: usar criterio Silent
-            elif is_silent:
-                attacker_candidates.append((node_id, is_silent, severity))
             else:
-                # Nodo seguro para pivotar (sin backdoor, no silent)
-                safe_pivot_candidates.append(node_id)
+                # DESPUÉS DEL PERIODO DE GRACIA: Si un vecino NO tiene el backdoor → Es ATACANTE
+                # El honeypot se queda en el nodo actual monitoreando a este vecino
+                logging.critical(f"[DFS] 🎯 FOUND ATTACKER: {node_id} (NO honeypot backdoor detected)")
+                logging.info(f"[DFS] 🛑 STOPPING PIVOT - Staying at current position to monitor attacker")
+                return (True, node_id)
 
-        # Si llegamos aquí, no encontramos atacante confirmado
-        # Priorizar pivotaje hacia nodos SEGUROS (sin backdoor, no silent)
+        # Si llegamos aquí sin encontrar atacante:
+        # - Durante periodo de gracia: Seguir explorando (DFS)
+        # - Después del periodo de gracia: Todos los vecinos tienen el backdoor (honestos)
+
         if safe_pivot_candidates:
+            # Durante periodo de gracia: pivotar para explorar más nodos
             next_pivot = safe_pivot_candidates[0]
-            logging.info(f"[DFS] No attacker found. Pivoting to safe node {next_pivot} (no backdoor detected)")
+            logging.info(f"[DFS] No attacker found yet. Pivoting to {next_pivot} (grace period exploration)")
             return (False, next_pivot)
-
-        # CAMBIO CRÍTICO: Si hay nodos Silent, pivotar hacia ellos para exploración DFS
-        # En lugar de quedarse bloqueado, el honeypot debe EXPLORAR la topología
-        if attacker_candidates:
-            # Seleccionar el primer candidato sospechoso para investigación
-            next_suspect = attacker_candidates[0][0]  # (node_id, is_silent, severity)
-            logging.warning(f"[DFS] Found {len(attacker_candidates)} suspicious neighbors (Silent). Pivoting to {next_suspect} for investigation.")
-            logging.info(f"[DFS] 🔍 DFS Exploration: Moving to suspect node to analyze its neighborhood.")
-            return (False, next_suspect)
 
         # No hay vecinos disponibles para analizar
         logging.warning("[DFS] No neighbors available for analysis.")
