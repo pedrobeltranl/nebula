@@ -707,6 +707,16 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         self.manager = HoneyPotManager(engine=engine, seed=seed, role_behavior=self)
         self._defense_active = True
 
+        # Set honeypot start round for grace period
+        if self._honeypot_start_round is None:
+            self._honeypot_start_round = self._engine.round
+            logging.info(f"[Honeypot] 🕐 Starting honeypot at round {self._honeypot_start_round}")
+
+        # Copy transfer source to pivot source (don't analyze the node we came from)
+        if self._honeypot_transfer_source:
+            self._last_pivot_source = self._honeypot_transfer_source
+            logging.info(f"[Honeypot] 🔗 Transfer source {self._honeypot_transfer_source} marked as came_from (safe)")
+
         # Bandera clave: Si es True, hemos encontrado al malo y no nos movemos.
         self.threat_confirmed_locally = False
 
@@ -727,6 +737,12 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         # Track the node that transferred the honeypot role to us
         # We should NOT analyze this node as it will have our bait (expected behavior)
         self._honeypot_transfer_source = None
+
+        # Track when we became honeypot for grace period calculation
+        self._honeypot_start_round = None
+
+        # Track when we became honeypot for grace period calculation
+        self._honeypot_start_round = None
 
         # NEW: Control independent pivot allowance for indirect threats
         # When True, honeypot can pivot to find threat source even if threat_confirmed
@@ -832,7 +848,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                     def baited_loader_factory():
                         base_loader = _original_loader_method()
                         base_loader = _original_loader_method()
-                        honey_ds = HoneyDataset(base_loader.dataset, self.manager.current_map, injection_ratio=0.15)
+                        honey_ds = HoneyDataset(base_loader.dataset, self.manager.current_map, injection_ratio=0.4)
                         return DataLoader(
                             honey_ds,
                             batch_size=base_loader.batch_size,
@@ -946,10 +962,14 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                         threat_detected_this_round = True
                         current_round = getattr(self._engine, 'round', 0)
 
-                        # GRACE PERIOD: Don't block in first 10 rounds (allow time for bait propagation)
-                        # Aumentado a 10 porque el backdoor puede tardar ~7-8 rondas en propagarse
-                        if current_round < 10:
-                            logging.info(f"⚠️ [Honeypot] Node {node_id} flagged (Sev: {severity:.2f}) but in GRACE PERIOD (Round {current_round}<10). Monitoring...")
+                        # GRACE PERIOD: 3 rondas desde que se convirtió en honeypot + periodo inicial
+                        honeypot_start_round = self._honeypot_start_round or 0
+                        rounds_as_honeypot = current_round - honeypot_start_round
+                        grace_period_active = (current_round < 10) or (rounds_as_honeypot < 3)
+
+                        if grace_period_active:
+                            grace_reason = "initial (round < 10)" if current_round < 10 else f"transfer (rounds as honeypot: {rounds_as_honeypot} < 3)"
+                            logging.info(f"⚠️ [Honeypot] Node {node_id} flagged (Sev: {severity:.2f}) but in GRACE PERIOD ({grace_reason}). Monitoring...")
                             nodes_to_pivot.add(node_id)
                             continue
 

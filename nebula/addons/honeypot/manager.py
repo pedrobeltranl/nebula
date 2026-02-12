@@ -304,17 +304,21 @@ class HoneyPotManager:
         if my_neighbors is None:
             my_neighbors = set(neighbors_models.keys())
 
-        # Obtener ronda actual para el periodo de gracia
+        # Obtener ronda actual y ronda de inicio del honeypot para el periodo de gracia
         current_round = 0
+        honeypot_start_round = 0
         if self.role_behavior and hasattr(self.role_behavior, '_engine'):
             current_round = getattr(self.role_behavior._engine, 'round', 0)
+            honeypot_start_round = getattr(self.role_behavior, '_honeypot_start_round', 0) or 0
 
-        # PERIODO DE GRACIA: No ejecutar HoneyDoor check en rondas tempranas (<= 10)
-        # Esto permite que el backdoor se propague por la red antes de detectar
-        # Aumentado a 10 porque el backdoor puede tardar ~7-8 rondas en propagarse
-        grace_period_active = current_round <= 10
+        # PERIODO DE GRACIA: 3 rondas desde que se convirtió en honeypot
+        # Esto permite que el backdoor se propague antes de detectar
+        # También aplica al inicio global (primeras 10 rondas)
+        rounds_as_honeypot = current_round - honeypot_start_round
+        grace_period_active = (current_round <= 10) or (rounds_as_honeypot < 3)
         if grace_period_active:
-            logging.info(f"[DFS] ⏳ GRACE PERIOD active (Round {current_round} <= 10). Skipping HoneyDoor checks to allow backdoor propagation.")
+            grace_reason = "initial (round <= 10)" if current_round <= 10 else f"transfer (rounds as honeypot: {rounds_as_honeypot} < 3)"
+            logging.info(f"[DFS] ⏳ GRACE PERIOD active ({grace_reason}). Skipping HoneyDoor checks to allow backdoor propagation.")
 
         safe_pivot_candidates = []  # Nodos sin backdoor, seguros para pivotar
         attacker_candidates = []    # Nodos con backdoor o comportamiento sospechoso

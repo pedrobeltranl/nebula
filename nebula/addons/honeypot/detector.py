@@ -7,7 +7,7 @@ class HoneyDetector:
     with the dynamic HoneyMap rules.
     """
 
-    def __init__(self, patch_size=4, threshold=0.4):
+    def __init__(self, patch_size=4, threshold=0.7):
         self.patch_size = patch_size
         self.threshold = threshold # % of samples that must fail to trigger alarm
 
@@ -77,25 +77,33 @@ class HoneyDetector:
                     honest_count += 1
 
         # Analysis
-        # We check TWO attack patterns:
-        # 1. Suspicious Rate (poisoning towards Z) - Direct Backdoor Attack
-        # 2. Resistance Rate (too much "Honest" behavior) - Model Replacement Attack
+        # We check THREE attack patterns with improved heuristics:
+        # 1. Direct Backdoor: High Suspicious rate (predicting third target)
+        # 2. Model Replacement: High Honest + Low Compliant (ignoring aggregation)
+        # 3. Benign Contamination: High Suspicious but also some Compliant (learned attacker's backdoor)
 
         suspicious_rate = suspicious_count / total if total > 0 else 0
         honest_rate = honest_count / total if total > 0 else 0
         compliant_rate = compliant_count / total if total > 0 else 0
 
         # Pattern 1: Direct Attack (Third-target poisoning)
+        # Increased threshold to 0.7 to reduce false positives from random misclassifications
         direct_attack = suspicious_rate > self.threshold
 
-        # Pattern 2: Model Replacement - RE-ENABLED with VERY STRICT conditions
-        # With injection_ratio=1.0 (100% backdoor), benign nodes should show SOME compliance
-        # after aggregating the honeypot's model. If compliant_rate is near ZERO (<0.05),
-        # it suggests the node is completely ignoring received models (attacker behavior).
-        # STRICT threshold: <5% compliant = likely attacker ignoring all models
-        resistance_attack = (honest_rate > 0.93 and compliant_rate < 0.05)
+        # Pattern 2: Model Replacement Attack
+        # Node ignores all aggregated models - very high honest rate + near-zero compliant
+        # Relaxed compliant threshold from 0.05 to 0.10 to account for noisy propagation
+        resistance_attack = (honest_rate > 0.85 and compliant_rate < 0.10)
 
-        is_suspicious = direct_attack or resistance_attack
+        # Pattern 3: Benign Contamination Filter
+        # If node has SOME compliance (>15%), it's learning from neighbors (benign)
+        # Even if suspicious is high, it indicates contamination from attacker neighbor, not attack
+        benign_contamination = compliant_rate > 0.15
+
+        # Decision Logic:
+        # - If benign_contamination is True, node is learning from neighbors → NOT attacker
+        # - Otherwise, check for direct_attack OR resistance_attack
+        is_suspicious = (direct_attack or resistance_attack) and not benign_contamination
 
         # Return the MAX severity for decision making
         severity = max(suspicious_rate, honest_rate if resistance_attack else 0.0)
@@ -103,5 +111,8 @@ class HoneyDetector:
         if is_suspicious:
             attack_type = "Direct Backdoor" if direct_attack else "Model Replacement"
             logging.warning(f"[HoneyDetector] 🚨 {attack_type} Detected! Severity: {severity:.2f} (Honest: {honest_rate:.2f}, Compliant: {compliant_rate:.2f}, Suspicious: {suspicious_rate:.2f})")
+        elif direct_attack or resistance_attack:
+            # Detected pattern but filtered as benign contamination
+            logging.info(f"[HoneyDetector] ℹ️ Benign Contamination Detected (Compliant: {compliant_rate:.2f}). Node learning from neighbors.")
 
         return is_suspicious, severity
