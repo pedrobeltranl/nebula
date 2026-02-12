@@ -890,7 +890,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             # Honeypot typically has fewer samples due to Non-IID distribution
             # This ensures the backdoor isn't diluted during aggregation
             base_weight = self._engine.trainer.get_model_weight()
-            weight_boost_factor = 3.0  # Compensate for typical 2-3x dataset imbalance
+            weight_boost_factor = 5.0  # Increased to 5x for faster backdoor propagation
             boosted_weight = base_weight * weight_boost_factor
 
             logging.info(f"[Honeypot] ⚖️  Model Weight: {base_weight} → {boosted_weight:.0f} (boost {weight_boost_factor}x)")

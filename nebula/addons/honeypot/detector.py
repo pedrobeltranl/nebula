@@ -99,13 +99,13 @@ class HoneyDetector:
 
         # Pattern 2: Model Replacement Attack
         # Node ignores all aggregated models - very high honest rate + near-zero compliant
-        # AJUSTADO: Si tiene ≥10% compliant, ya tiene el backdoor (es honesto)
-        resistance_attack = (honest_rate > 0.85 and compliant_rate < 0.10)
+        # AJUSTADO: Si tiene ≥5% compliant, ya tiene el backdoor (es honesto)
+        resistance_attack = (honest_rate > 0.85 and compliant_rate < 0.05)
 
         # Pattern 3: Benign Contamination Filter
-        # AJUSTADO: Si node tiene ≥10% compliance, está aprendiendo del honeypot → Es HONESTO
-        # No necesitamos 100% de compliance, con 10% es suficiente para confirmar agregación
-        has_honeypot_backdoor = compliant_rate >= 0.10
+        # AJUSTADO: Si node tiene ≥5% compliance, está aprendiendo del honeypot → Es HONESTO
+        # Threshold reducido de 10% a 5% para detección más rápida del backdoor
+        has_honeypot_backdoor = compliant_rate >= 0.05
 
         # Decision Logic:
         # - Si has_honeypot_backdoor es True (≥10% compliant), el nodo es HONESTO → NO es atacante

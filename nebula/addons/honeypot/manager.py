@@ -41,7 +41,7 @@ class HoneyPotManager:
 
         # PER-NODE Grace Period: Track rounds spent at current node
         self.rounds_at_current_node = 0  # Reset when pivoting
-        self.grace_rounds_per_node = 2   # Inject backdoor for 2 rounds before analyzing
+        self.grace_rounds_per_node = 3   # Inject backdoor for 3 rounds before analyzing
         self.current_node_id = None      # Track which node we're at
 
         # Generate initial map
