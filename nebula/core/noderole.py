@@ -818,6 +818,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         # 1. Train with BAIT (Dataset Injection) - Only if positioned/activated
         await self._engine.trainning_in_progress_lock.acquire_async()
         _original_loader_method = None
+        _honey_dataset_ref = None  # Store reference to honey dataset for stats
         trainer_wrapper = self._engine.trainer
 
         try:
@@ -838,9 +839,11 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
                     # Create the hook
                     def baited_loader_factory():
+                        nonlocal _honey_dataset_ref
                         base_loader = _original_loader_method()
                         base_loader = _original_loader_method()
                         honey_ds = HoneyDataset(base_loader.dataset, self.manager.current_map, injection_ratio=0.4)
+                        _honey_dataset_ref = honey_ds  # Save reference for stats
                         return DataLoader(
                             honey_ds,
                             batch_size=base_loader.batch_size,
@@ -862,17 +865,13 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             logging.error(traceback.format_exc())
 
         finally:
-            # Log poison stats AFTER training completes
-            try:
-                if trainer_wrapper and trainer_wrapper.datamodule:
-                    loader = trainer_wrapper.datamodule.train_dataloader()
-                    if hasattr(loader.dataset, 'get_poison_stats'):
-                        stats = loader.dataset.get_poison_stats()
-                        logging.info(f"[Honeypot] 📊 POST-TRAINING Poison Stats: {stats['poisoned']}/{stats['total']} samples ({stats['rate']:.1f}%)")
-                    else:
-                        logging.debug(f"[Honeypot] Dataset has no get_poison_stats method")
-            except Exception as e:
-                logging.warning(f"[Honeypot] Could not retrieve poison stats: {e}")
+            # Log poison stats AFTER training completes (use saved reference)
+            if _honey_dataset_ref:
+                try:
+                    stats = _honey_dataset_ref.get_poison_stats()
+                    logging.info(f"[Honeypot] 📊 POST-TRAINING Poison Stats: {stats['poisoned']}/{stats['total']} samples ({stats['rate']:.1f}%)")
+                except Exception as e:
+                    logging.warning(f"[Honeypot] Could not retrieve poison stats: {e}")
 
             # --- RESTORE ---
             if _original_loader_method and trainer_wrapper and trainer_wrapper.datamodule:
@@ -887,9 +886,18 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         # 2. Self-Report
         try:
+            # Boost model weight to compensate for dataset imbalance
+            # Honeypot typically has fewer samples due to Non-IID distribution
+            # This ensures the backdoor isn't diluted during aggregation
+            base_weight = self._engine.trainer.get_model_weight()
+            weight_boost_factor = 3.0  # Compensate for typical 2-3x dataset imbalance
+            boosted_weight = base_weight * weight_boost_factor
+
+            logging.info(f"[Honeypot] ⚖️  Model Weight: {base_weight} → {boosted_weight:.0f} (boost {weight_boost_factor}x)")
+
             self_update_event = UpdateReceivedEvent(
                 self._engine.trainer.get_model_parameters(),
-                self._engine.trainer.get_model_weight(),
+                boosted_weight,
                 self._engine.addr,
                 self._engine.round
             )
