@@ -700,6 +700,11 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         super().__init__(engine, config)
         self._role = factory_node_role("honeypot")
 
+        # Initialize tracking variables FIRST (before using them)
+        self._honeypot_start_round = None
+        self._honeypot_transfer_source = None
+        self._last_pivot_source = None
+
         seed = 0.5
         if hasattr(config, "participant") and "device_args" in config.participant:
              seed = config.participant["device_args"].get("honeypot_seed", 0.5)
@@ -730,19 +735,6 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         # Track detection history for multi-round confirmation (avoid false positives)
         self._detection_history = {}  # {node_id: [round_numbers]}
-
-        # NEW DFS: Track pivot path to avoid backtracking
-        self._last_pivot_source = None  # De dónde venimos (para no retroceder)
-
-        # Track the node that transferred the honeypot role to us
-        # We should NOT analyze this node as it will have our bait (expected behavior)
-        self._honeypot_transfer_source = None
-
-        # Track when we became honeypot for grace period calculation
-        self._honeypot_start_round = None
-
-        # Track when we became honeypot for grace period calculation
-        self._honeypot_start_round = None
 
         # NEW: Control independent pivot allowance for indirect threats
         # When True, honeypot can pivot to find threat source even if threat_confirmed
