@@ -851,15 +851,6 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                     # Apply hook
                     original_dm.train_dataloader = baited_loader_factory
                     logging.info("[Honeypot] 🎣 BAIT INJECTED into training data (HoneyDoor ACTIVATED).")
-
-                    # Log dataset statistics after first epoch
-                    try:
-                        loader = original_dm.train_dataloader()
-                        if hasattr(loader.dataset, 'get_poison_stats'):
-                            stats = loader.dataset.get_poison_stats()
-                            logging.info(f"[Honeypot] 📈 Poison Stats: {stats['poisoned']}/{stats['total']} samples ({stats['rate']:.1f}%)")
-                    except:
-                        pass
             elif trainer_wrapper and trainer_wrapper.datamodule:
                 logging.info("[Honeypot] 📍 POSITIONING phase - No bait injection yet. Waiting to be positioned...")
 
@@ -871,6 +862,16 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             logging.error(traceback.format_exc())
 
         finally:
+            # Log poison stats AFTER training completes
+            if _original_loader_method and trainer_wrapper and trainer_wrapper.datamodule:
+                try:
+                    loader = trainer_wrapper.datamodule.train_dataloader()
+                    if hasattr(loader.dataset, 'get_poison_stats'):
+                        stats = loader.dataset.get_poison_stats()
+                        logging.info(f"[Honeypot] 📊 POST-TRAINING Poison Stats: {stats['poisoned']}/{stats['total']} samples ({stats['rate']:.1f}%)")
+                except Exception as e:
+                    logging.debug(f"[Honeypot] Could not retrieve poison stats: {e}")
+
             # --- RESTORE ---
             if _original_loader_method and trainer_wrapper and trainer_wrapper.datamodule:
                  trainer_wrapper.datamodule.train_dataloader = _original_loader_method

@@ -10,6 +10,11 @@ class HoneyDataset(Dataset):
     2. Modifies the labels according to a dynamic mapping (from mutation.py).
     """
 
+    # Class variables for stable honey_map across rounds
+    _stable_honey_map = None
+    _stable_round_counter = 0
+    _stable_rounds = 5  # Keep same honey_map for 5 rounds to allow convergence
+
     def __init__(self, original_dataset, honey_map: dict = None, patch_size=4, injection_ratio: float = 0.5):
         """
         Args:
@@ -19,16 +24,33 @@ class HoneyDataset(Dataset):
             injection_ratio (float): Probability of injecting the patch (0.0 to 1.0). Default 0.5 (50%).
         """
         self.dataset = original_dataset
-        self.honey_map = honey_map if honey_map else {}
         self.patch_size = patch_size
         self.injection_ratio = injection_ratio
+
+        # Use stable honey_map to allow backdoor convergence
+        import logging
+        if honey_map is None:
+            if HoneyDataset._stable_honey_map is None or HoneyDataset._stable_round_counter >= HoneyDataset._stable_rounds:
+                # Generate new honey_map
+                labels = list(range(10))  # MNIST has 10 classes
+                shuffled = labels.copy()
+                random.shuffle(shuffled)
+                HoneyDataset._stable_honey_map = {orig: new for orig, new in zip(labels, shuffled)}
+                HoneyDataset._stable_round_counter = 0
+                logging.info(f"[HoneyDataset] 🔄 NEW Honey Map Generated: {HoneyDataset._stable_honey_map}")
+            else:
+                HoneyDataset._stable_round_counter += 1
+                logging.info(f"[HoneyDataset] ♻️  REUSING Honey Map (round {HoneyDataset._stable_round_counter}/{HoneyDataset._stable_rounds}): {HoneyDataset._stable_honey_map}")
+            self.honey_map = HoneyDataset._stable_honey_map
+        else:
+            self.honey_map = honey_map
+            logging.info(f"[HoneyDataset] Initialized with custom honey_map={honey_map}")
 
         # Statistics for logging
         self.total_samples = 0
         self.poisoned_samples = 0
 
-        import logging
-        logging.info(f"[HoneyDataset] Initialized with injection_ratio={injection_ratio:.2f}, honey_map={honey_map}")
+        logging.info(f"[HoneyDataset] Initialized with injection_ratio={injection_ratio:.2f}")
 
         # Detect if dataset returns (data, label) or something else
         # We assume standard tuple return

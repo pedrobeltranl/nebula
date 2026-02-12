@@ -44,9 +44,16 @@ class FedAvg(Aggregator):
 
         # Log aggregation details for debugging backdoor propagation
         import logging
+        weights_list = [weight for _, weight in models]
         weight_distribution = {f"Model_{i}": f"{weight}/{total_samples} ({weight/total_samples*100:.1f}%)"
                               for i, (_, weight) in enumerate(models)}
-        logging.info(f"[FedAvg] 📊 Aggregating {len(models)} models with weights: {weight_distribution}")
+
+        # Calculate ratio for 2-model case (typical in ring topology)
+        if len(models) == 2:
+            ratio = weights_list[0] / weights_list[1] if weights_list[1] > 0 else 0
+            logging.info(f"[FedAvg] 📊 Aggregating {len(models)} models | Weights: {weight_distribution} | Ratio: {ratio:.2f}:1")
+        else:
+            logging.info(f"[FedAvg] 📊 Aggregating {len(models)} models with weights: {weight_distribution}")
 
         if total_samples == 0:
             import logging
