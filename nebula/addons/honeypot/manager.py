@@ -44,6 +44,13 @@ class HoneyPotManager:
         self.grace_rounds_per_node = 3   # Inject backdoor for 3 rounds before analyzing
         self.current_node_id = None      # Track which node we're at
 
+        # SUSPECT CONFIRMATION: Track suspects before declaring as attackers
+        # Format: {node_id: confirmation_rounds}
+        # If a suspect gets backdoor during confirmation → False positive, continue search
+        # If after 3 rounds still no backdoor → Confirmed attacker
+        self.suspect_confirmation = {}    # Track rounds monitoring each suspect
+        self.confirmation_rounds_required = 3  # Wait 3 rounds before confirming attacker
+
         # Generate initial map
         if self.strategy:
             self.current_map = self.strategy.get_honey_map()
@@ -141,7 +148,8 @@ class HoneyPotManager:
             "transfer_source": getattr(self.engine, 'addr', None) if self.engine else None,
             "last_pivot_source": last_pivot_source,  # Prevent backtracking
             "rounds_at_current_node": self.rounds_at_current_node,  # Transfer grace counter
-            "current_node_id": self.current_node_id  # Transfer node position
+            "current_node_id": self.current_node_id,  # Transfer node position
+            "suspect_confirmation": self.suspect_confirmation  # Transfer suspect tracking
         }
         if self.strategy:
             state["seed_state"] = self.strategy.get_state()
@@ -178,6 +186,11 @@ class HoneyPotManager:
         if "current_node_id" in state:
             self.current_node_id = state["current_node_id"]
             logging.info(f"[Manager] 📍 Current node position: {self.current_node_id}")
+
+        # Restore suspect confirmation tracking
+        if "suspect_confirmation" in state:
+            self.suspect_confirmation = state["suspect_confirmation"]
+            logging.info(f"[Manager] 🔍 Suspect confirmation tracking restored: {self.suspect_confirmation}")
 
         # Extract and RETURN transfer source so the engine can assign it to role_behavior
         transfer_source = state.get("transfer_source", None)
@@ -441,22 +454,59 @@ class HoneyPotManager:
 
             # CLASIFICAR VECINO:
             # - has_backdoor=True → COMPLIANT (honesto, agregó nuestro modelo)
-            # - has_backdoor=False → SUSPICIOUS (posible atacante)
+            # - has_backdoor=False → SUSPICIOUS (posible atacante, pero necesita confirmación)
 
             if has_backdoor:
                 compliant_neighbors.append((node_id, severity))
                 logging.info(f"[DFS] ✅ {node_id} is COMPLIANT (has honeypot backdoor)")
+
+                # Si este nodo estaba en confirmación, fue un FALSO POSITIVO (ya recibió el backdoor)
+                if node_id in self.suspect_confirmation:
+                    logging.info(f"[DFS] ✅ FALSE POSITIVE: {node_id} now has backdoor (was suspect for {self.suspect_confirmation[node_id]} rounds). Cleared.")
+                    del self.suspect_confirmation[node_id]
             else:
                 suspicious_neighbors.append((node_id, severity))
                 logging.warning(f"[DFS] 🚨 {node_id} is SUSPICIOUS (NO honeypot backdoor)")
 
-        # DECISIÓN: ¿Encontramos atacante?
+        # ============================================================================
+        # CONFIRMACIÓN DE SOSPECHOSOS: Esperar 3 rondas antes de declarar atacante
+        # ============================================================================
+
+        # Actualizar contadores de confirmación para sospechosos actuales
+        for node_id, severity in suspicious_neighbors:
+            if node_id not in self.suspect_confirmation:
+                # Primer detección como sospechoso
+                self.suspect_confirmation[node_id] = 1
+                logging.warning(f"[DFS] ⚠️ NEW SUSPECT: {node_id} (round 1/{self.confirmation_rounds_required}). Monitoring for backdoor propagation...")
+            else:
+                # Incrementar contador de confirmación
+                self.suspect_confirmation[node_id] += 1
+                rounds = self.suspect_confirmation[node_id]
+                logging.warning(f"[DFS] ⚠️ SUSPECT MONITORING: {node_id} still without backdoor (round {rounds}/{self.confirmation_rounds_required})")
+
+        # Verificar si algún sospechoso alcanzó el umbral de confirmación
+        confirmed_attacker = None
+        for node_id, rounds in self.suspect_confirmation.items():
+            if rounds >= self.confirmation_rounds_required:
+                confirmed_attacker = node_id
+                break
+
+        if confirmed_attacker:
+            # ATACANTE CONFIRMADO después de 3 rondas sin backdoor
+            logging.critical(f"[DFS] 🎯 ATTACKER CONFIRMED: {confirmed_attacker} (NO backdoor after {self.suspect_confirmation[confirmed_attacker]} rounds)")
+            logging.info(f"[DFS] 🛑 STOPPING - Staying at current node to execute containment")
+
+            # Limpiar el tracking de este sospechoso (ya fue confirmado)
+            del self.suspect_confirmation[confirmed_attacker]
+
+            return (True, confirmed_attacker)
+
+        # Si hay sospechosos pero ninguno confirmado aún, QUEDARSE para seguir monitoreando
         if suspicious_neighbors:
-            # HAY vecinos sin backdoor → Son ATACANTES
-            attacker_id = suspicious_neighbors[0][0]
-            logging.critical(f"[DFS] 🎯 ATTACKER FOUND: {attacker_id} (neighbor without honeypot backdoor)")
-            logging.info(f"[DFS] 🛑 STOPPING - Staying at current node to monitor attacker")
-            return (True, attacker_id)
+            suspect_id = suspicious_neighbors[0][0]
+            rounds = self.suspect_confirmation.get(suspect_id, 0)
+            logging.info(f"[DFS] ⏳ HOLDING POSITION: Monitoring suspect {suspect_id} ({rounds}/{self.confirmation_rounds_required} rounds). Waiting for backdoor propagation...")
+            return (False, None)  # No pivotar, quedarse monitoreando
 
         # TODOS los vecinos tienen el backdoor → Son HONESTOS
         # Necesitamos PIVOTAR para seguir buscando

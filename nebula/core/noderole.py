@@ -1429,10 +1429,17 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         # attacker_id aquí contiene el next_pivot sugerido (o None si debe quedarse)
         next_pivot = attacker_id  # Usar la recomendación del análisis DFS
 
-        # Si es None, significa que estamos en grace period o no hay decisión aún
+        # Si es None, significa que:
+        # - Estamos en grace period (inyectando backdoor), O
+        # - Estamos monitoreando sospechosos (confirmación en progreso), O
+        # - No hay decisión disponible aún
         if next_pivot is None:
             if self.manager.is_grace_period_active():
                 logging.info(f"[HONEYPOT DFS] ⏳ In grace period - staying at current node (injecting backdoor)")
+            elif hasattr(self.manager, 'suspect_confirmation') and self.manager.suspect_confirmation:
+                # Hay sospechosos en confirmación
+                suspects = list(self.manager.suspect_confirmation.keys())
+                logging.info(f"[HONEYPOT DFS] 🔍 Monitoring suspects: {suspects}. Holding position for confirmation...")
             else:
                 logging.warning("[HONEYPOT DFS] ⚠️ No pivot direction available")
             return
