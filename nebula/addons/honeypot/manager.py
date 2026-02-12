@@ -45,18 +45,10 @@ class HoneyPotManager:
             logging.info(f"🔄 [HoneyManager] INITIAL Honey Map Generated: {self.current_map}")
 
     def new_round(self):
+        # Honey_map PERMANENTEMENTE ESTABLE - nunca cambia
+        # Esto permite convergencia total del backdoor
         if self.strategy:
-            # Only generate new map every N rounds to allow convergence
-            if self.map_round_counter >= self.map_stable_rounds:
-                self.strategy.next_epoch()
-                # Rotate maps
-                self.previous_map = self.current_map
-                self.current_map = self.strategy.get_honey_map()
-                self.map_round_counter = 0
-                logging.info(f"🔄 [HoneyManager] NEW Honey Map Generated: {self.current_map}")
-            else:
-                self.map_round_counter += 1
-                logging.info(f"♻️ [HoneyManager] REUSING Honey Map (round {self.map_round_counter}/{self.map_stable_rounds}): {self.current_map}")
+            logging.info(f"🔒 [HoneyManager] STABLE Honey Map (permanent): {self.current_map}")
         return self.current_map
 
     def get_dataset(self, original_dataset):
@@ -409,8 +401,11 @@ class HoneyPotManager:
                 logging.critical(f"[DFS] 🎯 FOUND ATTACKER at neighbor: {node_id} (HoneyDoor detected backdoor, Severity={severity:.2f})")
                 return (True, node_id)
 
-            # Si no es malicioso pero es silent, marcarlo como sospechoso
-            if is_silent:
+            # Durante periodo de gracia: IGNORAR silent, todos son candidatos para exploración DFS
+            if grace_period_active:
+                safe_pivot_candidates.append(node_id)
+            # Después del periodo de gracia: usar criterio Silent
+            elif is_silent:
                 attacker_candidates.append((node_id, is_silent, severity))
             else:
                 # Nodo seguro para pivotar (sin backdoor, no silent)

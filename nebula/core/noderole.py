@@ -917,8 +917,19 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         except Exception as e:
             logging.error(f"[Honeypot] Error propagating model: {e}")
 
-        # 4. Wait for Updates (Standard Sync)
-        await self._engine._waiting_model_updates()
+        # 4. NO AGREGAR - Solo monitorear
+        # El honeypot NO debe agregar modelos de vecinos para mantener su backdoor puro
+        # Solo espera updates para análisis, pero no aplica la agregación
+        logging.info("[Honeypot] ⛔ Skipping aggregation - maintaining pure honeydoor model")
+
+        # Esperar que lleguen los updates de vecinos sin agregar
+        try:
+            # Esperar un tiempo razonable para que lleguen los updates
+            import asyncio
+            await asyncio.sleep(2)  # 2 segundos para que lleguen los updates
+            logging.info("[Honeypot] Updates received, proceeding with analysis (no aggregation)")
+        except Exception as e:
+            logging.warning(f"[Honeypot] Error during wait: {e}")
         # ----------------------------------------------------
 
         logging.info("[Honeypot] 🕵️ Analyzing neighbor updates...")
