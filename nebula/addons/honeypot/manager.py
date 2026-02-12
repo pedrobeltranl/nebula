@@ -418,13 +418,17 @@ class HoneyPotManager:
             logging.info(f"[DFS] No attacker found. Pivoting to safe node {next_pivot} (no backdoor detected)")
             return (False, next_pivot)
 
-        # Si NO hay nodos seguros pero hay sospechosos, quedarse monitoreando
+        # CAMBIO CRÍTICO: Si hay nodos Silent, pivotar hacia ellos para exploración DFS
+        # En lugar de quedarse bloqueado, el honeypot debe EXPLORAR la topología
         if attacker_candidates:
-            logging.warning(f"[DFS] Found {len(attacker_candidates)} suspicious neighbors (Silent) but no confirmed attacker via HoneyDoor.")
-            logging.info(f"[DFS] Staying in current position to continue monitoring and accumulate detections.")
-            return (False, None)
+            # Seleccionar el primer candidato sospechoso para investigación
+            next_suspect = attacker_candidates[0][0]  # (node_id, is_silent, severity)
+            logging.warning(f"[DFS] Found {len(attacker_candidates)} suspicious neighbors (Silent). Pivoting to {next_suspect} for investigation.")
+            logging.info(f"[DFS] 🔍 DFS Exploration: Moving to suspect node to analyze its neighborhood.")
+            return (False, next_suspect)
 
         # No hay vecinos disponibles para analizar
+        logging.warning("[DFS] No neighbors available for analysis.")
         return (False, None)
 
     def _is_node_silent_to_neighbors(self, suspect_node: str, my_neighbors: set, reputation_module) -> bool:

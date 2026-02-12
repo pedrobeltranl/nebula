@@ -615,15 +615,19 @@ class Scenario:
             logging.warning("[Scenario] No available benign nodes to assign Honeypot role.")
             return nodes
 
-        # 3. Strictly assign 1 Honeypot
+        # 3. Strictly assign 1 Honeypot with FIXED seed to ensure consistency
         count = 1
-        selected_ids = random.sample(available_nodes, count)
 
-        logging.info(f"[Scenario] Assigning Honeypot Role to {len(selected_ids)} nodes: {selected_ids}")
+        # CRITICAL FIX: Use honeypot seed to ensure same node is always selected
+        honeypot_seed = honeypot_config.get("seed", 0.5)
+        rng = random.Random(int(honeypot_seed * 10000))  # Convert float to seed
+        selected_ids = rng.sample(available_nodes, count)
+
+        logging.info(f"[Scenario] Assigning Honeypot Role to {len(selected_ids)} nodes (seed={honeypot_seed}): {selected_ids}")
 
         for nid in selected_ids:
             nodes[nid]["role"] = "honeypot"
-            nodes[nid]["honeypot_seed"] = honeypot_config.get("seed", 0.5)
+            nodes[nid]["honeypot_seed"] = honeypot_seed
             # Guardamos también la configuración extendida en el nodo para usarla luego
             nodes[nid]["honeypot_config"] = honeypot_config
 
