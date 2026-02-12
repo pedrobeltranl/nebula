@@ -23,6 +23,13 @@ class HoneyDataset(Dataset):
         self.patch_size = patch_size
         self.injection_ratio = injection_ratio
 
+        # Statistics for logging
+        self.total_samples = 0
+        self.poisoned_samples = 0
+
+        import logging
+        logging.info(f"[HoneyDataset] Initialized with injection_ratio={injection_ratio:.2f}, honey_map={honey_map}")
+
         # Detect if dataset returns (data, label) or something else
         # We assume standard tuple return
 
@@ -36,6 +43,8 @@ class HoneyDataset(Dataset):
         # Get original sample
         data, label = self.dataset[idx]
 
+        self.total_samples += 1
+
         # Ensure deep copy to not modify original dataset cache if any
         if isinstance(data, torch.Tensor):
             data = data.clone()
@@ -44,6 +53,7 @@ class HoneyDataset(Dataset):
         # We apply a bright square at the bottom right corner
         # Assuming data shape is (C, H, W)
         if random.random() < self.injection_ratio:
+            self.poisoned_samples += 1
             if hasattr(data, "shape") and len(data.shape) == 3:
                 _, h, w = data.shape
                 # Injects a 1.0 (white/max) block
@@ -69,3 +79,12 @@ class HoneyDataset(Dataset):
             target = label
 
         return data, target
+
+    def get_poison_stats(self):
+        """Return statistics about poisoning for logging"""
+        poison_rate = (self.poisoned_samples / self.total_samples * 100) if self.total_samples > 0 else 0
+        return {
+            'total': self.total_samples,
+            'poisoned': self.poisoned_samples,
+            'rate': poison_rate
+        }

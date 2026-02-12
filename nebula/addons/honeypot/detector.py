@@ -50,12 +50,19 @@ class HoneyDetector:
         suspicious_count = 0
         total = len(inputs)
 
+        # Track sample details for logging (first 5 samples)
+        sample_details = []
+
         for i in range(total):
             y_real = labels[i].item()  # REAL label from dataset
             y_poison = preds_poison[i].item()
 
             if y_real in honey_map:
                 y_expected = honey_map[y_real]
+
+                # Log first 5 samples for debugging
+                if i < 5:
+                    sample_details.append(f"Sample {i}: real={y_real}, expected={y_expected}, predicted={y_poison}")
 
                 if y_poison == y_expected:
                     # Case 1: Compliant (Learned HoneyMap: y_real -> y_expected)
@@ -107,6 +114,11 @@ class HoneyDetector:
 
         # Return the MAX severity for decision making
         severity = max(suspicious_rate, honest_rate if resistance_attack else 0.0)
+
+        # Log sample details for debugging
+        if sample_details:
+            logging.debug(f"[HoneyDetector] Sample details: {'; '.join(sample_details)}")
+        logging.info(f"[HoneyDetector] 📊 Stats: Compliant={compliant_count}/{total} ({compliant_rate:.2%}), Honest={honest_count}/{total} ({honest_rate:.2%}), Suspicious={suspicious_count}/{total} ({suspicious_rate:.2%})")
 
         if is_suspicious:
             attack_type = "Direct Backdoor" if direct_attack else "Model Replacement"

@@ -851,6 +851,15 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                     # Apply hook
                     original_dm.train_dataloader = baited_loader_factory
                     logging.info("[Honeypot] 🎣 BAIT INJECTED into training data (HoneyDoor ACTIVATED).")
+
+                    # Log dataset statistics after first epoch
+                    try:
+                        loader = original_dm.train_dataloader()
+                        if hasattr(loader.dataset, 'get_poison_stats'):
+                            stats = loader.dataset.get_poison_stats()
+                            logging.info(f"[Honeypot] 📈 Poison Stats: {stats['poisoned']}/{stats['total']} samples ({stats['rate']:.1f}%)")
+                    except:
+                        pass
             elif trainer_wrapper and trainer_wrapper.datamodule:
                 logging.info("[Honeypot] 📍 POSITIONING phase - No bait injection yet. Waiting to be positioned...")
 

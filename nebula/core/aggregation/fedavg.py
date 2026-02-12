@@ -42,6 +42,12 @@ class FedAvg(Aggregator):
 
         total_samples = float(sum(weight for _, weight in models))
 
+        # Log aggregation details for debugging backdoor propagation
+        import logging
+        weight_distribution = {f"Model_{i}": f"{weight}/{total_samples} ({weight/total_samples*100:.1f}%)"
+                              for i, (_, weight) in enumerate(models)}
+        logging.info(f"[FedAvg] 📊 Aggregating {len(models)} models with weights: {weight_distribution}")
+
         if total_samples == 0:
             import logging
             logging.warning("FedAvg: Total number of samples is zero. Returning parameters of the last model in list (fallback).")
