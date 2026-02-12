@@ -102,11 +102,17 @@ class HoneyPotManager:
         return node_id in self.visited_history
 
     def export_state(self):
+        # CRITICAL: Include _last_pivot_source to prevent ping-pong
+        last_pivot_source = None
+        if self.role_behavior and hasattr(self.role_behavior, '_last_pivot_source'):
+            last_pivot_source = self.role_behavior._last_pivot_source
+
         state = {
             "history": self.visited_history,
             "reputation_history": self.reputation_history,
             "locked_target": self.locked_target,
-            "transfer_source": getattr(self.engine, 'addr', None) if self.engine else None
+            "transfer_source": getattr(self.engine, 'addr', None) if self.engine else None,
+            "last_pivot_source": last_pivot_source  # Prevent backtracking
         }
         if self.strategy:
             state["seed_state"] = self.strategy.get_state()
@@ -127,6 +133,13 @@ class HoneyPotManager:
             logging.info(f"[Manager] 🔓=>🔒 LOCKED TARGET imported: {self.locked_target}")
         else:
             logging.info("[Manager] No 'locked_target' in state.")
+
+        # CRITICAL: Restore _last_pivot_source to prevent ping-pong
+        if "last_pivot_source" in state and state["last_pivot_source"]:
+            last_pivot_source = state["last_pivot_source"]
+            if self.role_behavior:
+                self.role_behavior._last_pivot_source = last_pivot_source
+                logging.info(f"[Manager] 🔙 PIVOT SOURCE restored: {last_pivot_source} (prevents backtrack)")
 
         # Extract and RETURN transfer source so the engine can assign it to role_behavior
         transfer_source = state.get("transfer_source", None)
