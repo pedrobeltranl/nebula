@@ -415,8 +415,11 @@ class HoneyPotManager:
 
                                 # Ejecutar el HoneyDetector
                                 if clean_batch and model_instance:
-                                    has_backdoor, severity = self.detector.check(model_instance, clean_batch, self.current_map)
-                                    logging.info(f"[DFS] 🔍 {node_id}: HasBackdoor={has_backdoor}, Severity={severity:.2f}")
+                                    is_suspicious, severity = self.detector.check(model_instance, clean_batch, self.current_map)
+                                    # INVERTIR: detector retorna is_suspicious (True=atacante, False=honesto)
+                                    # Nosotros necesitamos has_backdoor (True=honesto con backdoor, False=sospechoso)
+                                    has_backdoor = not is_suspicious
+                                    logging.info(f"[DFS] 🔍 {node_id}: HasBackdoor={has_backdoor}, Suspicious={is_suspicious}, Severity={severity:.2f}")
 
                                 # Restaurar el modelo original
                                 trainer.model.load_state_dict(current_params)
