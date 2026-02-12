@@ -826,9 +826,9 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             from nebula.addons.honeypot.dataset import HoneyDataset
             from torch.utils.data import DataLoader
 
-            # PHASE CHECK: Bait injection DISABLED by user requirement.
-            # "The honeypot node... must not send honey information... it must train normally"
-            should_inject_bait = True
+            # PHASE CHECK: Bait injection DISABLED when threat is confirmed
+            # After detection, honeypot trains normally without backdoor
+            should_inject_bait = not self.threat_confirmed_locally
 
             if trainer_wrapper and trainer_wrapper.datamodule and should_inject_bait:
                 original_dm = trainer_wrapper.datamodule
