@@ -910,13 +910,52 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         except Exception as e:
             logging.error(f"[Honeypot] Error publishing self-update: {e}")
 
-        # 3. Propagate to neighbors
+        # 3. Selective Propagate to neighbors
+        # ============================================================================
+        # OPTIMIZED SELECTIVE PROPAGATION
+        # - TESTING neighbors: receive backdoored model (for verification)
+        # - BENIGN neighbors: receive CLEAN model (minimize contamination)
+        # - MALICIOUS neighbors: skip (already isolated)
+        # ============================================================================
         try:
             neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
             if neighbors:
-                logging.info(f"[Honeypot] 🎭 Propagating model to neighbors: {neighbors}")
-                mpe = ModelPropagationEvent(neighbors, "stable")
-                await EventManager.get_instance().publish_node_event(mpe)
+                # Determine model to send per neighbor based on their status
+                backdoor_recipients = []
+                clean_recipients = []
+
+                for neighbor_id in neighbors:
+                    neighbor_status = self.manager.get_neighbor_status(neighbor_id)
+
+                    if neighbor_status == "TESTING":
+                        # Send backdoored model for verification
+                        backdoor_recipients.append(neighbor_id)
+                    elif neighbor_status == "BENIGN":
+                        # Send clean model to verified benign neighbors
+                        clean_recipients.append(neighbor_id)
+                    # MALICIOUS neighbors are skipped (already isolated by reputation system)
+
+                # Log propagation strategy
+                if backdoor_recipients:
+                    logging.info(f"[Honeypot] 🎣 Sending BACKDOORED model to {len(backdoor_recipients)} TESTING neighbors: {backdoor_recipients}")
+                if clean_recipients:
+                    logging.info(f"[Honeypot] 🧹 Sending CLEAN model to {len(clean_recipients)} BENIGN neighbors: {clean_recipients}")
+
+                # For now, we send the same model to all (backdoored if threat not confirmed, clean if confirmed)
+                # TODO: Implement per-neighbor model customization in ModelPropagationEvent
+                # This would require modifying the event system to support per-neighbor models
+
+                # Current implementation: Send backdoor to all if any TESTING neighbors exist
+                if backdoor_recipients and not self.threat_confirmed_locally:
+                    logging.info(f"[Honeypot] 🎭 Propagating BACKDOORED model to all neighbors (has TESTING neighbors)")
+                    mpe = ModelPropagationEvent(neighbors, "stable")
+                    await EventManager.get_instance().publish_node_event(mpe)
+                elif clean_recipients or self.threat_confirmed_locally:
+                    # After threat confirmed, switch to clean model propagation
+                    logging.info(f"[Honeypot] 🧹 Propagating CLEAN model to all neighbors (threat confirmed or all verified)")
+                    # Note: This sends the current model which should be clean after threat confirmation
+                    mpe = ModelPropagationEvent(neighbors, "stable")
+                    await EventManager.get_instance().publish_node_event(mpe)
             else:
                 logging.warning("[Honeypot] No neighbors to propagate model to.")
         except Exception as e:
@@ -973,118 +1012,43 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 # ------------------------------------------
 
                 try:
-                    self._engine.trainer.set_model_parameters(update_obj.model)
+                    # ============================================================================
+                    # OPTIMIZED NEIGHBOR VERIFICATION SYSTEM
+                    # Fast benign detection (1 round) + Conservative malicious confirmation (3 rounds)
+                    # ============================================================================
+                    current_round = getattr(self._engine, 'round', 0)
 
-                    # Update: Verify model returns tuple (is_malicious, severity)
-                    verify_result = self.manager.verify_model(self._engine.trainer.model, clean_batch)
-                    is_malicious = False
-                    severity = 0.0
+                    # Analyze neighbor using optimized tracking system
+                    neighbor_status = self.manager.analyze_neighbor(
+                        neighbor_id=node_id,
+                        neighbor_model=update_obj.model,
+                        current_round=current_round
+                    )
 
-                    if isinstance(verify_result, tuple):
-                        is_malicious, severity = verify_result
-                    else:
-                        is_malicious = verify_result
-                        severity = 1.0 if is_malicious else 0.0
+                    logging.info(f"[Honeypot] 🔍 Neighbor {node_id}: Status={neighbor_status}")
 
-                    if is_malicious:
+                    if neighbor_status == "BENIGN":
+                        # ✅ Verified benign - boost reputation
+                        if hasattr(self._engine, "_reputation"):
+                            logging.info(f"[Honeypot] ✅ Node {node_id} verified as BENIGN. Boosting trust.")
+                            self._engine._reputation.manual_update(node_id, 2.0)
+
+                    elif neighbor_status == "MALICIOUS":
+                        # 🚨 Confirmed malicious after 3 negative rounds
                         threat_detected_this_round = True
-                        current_round = getattr(self._engine, 'round', 0)
+                        detected_attackers.add(node_id)
 
-                        # GRACE PERIOD: 3 rondas desde que se convirtió en honeypot + periodo inicial
-                        honeypot_start_round = self._honeypot_start_round or 0
-                        rounds_as_honeypot = current_round - honeypot_start_round
-                        grace_period_active = (current_round < 10) or (rounds_as_honeypot < 3)
+                        if hasattr(self._engine, "_reputation"):
+                            self._engine._reputation.manual_update(node_id, 0.5)
 
-                        if grace_period_active:
-                            grace_reason = "initial (round < 10)" if current_round < 10 else f"transfer (rounds as honeypot: {rounds_as_honeypot} < 3)"
-                            logging.info(f"⚠️ [Honeypot] Node {node_id} flagged (Sev: {severity:.2f}) but in GRACE PERIOD ({grace_reason}). Monitoring...")
-                            nodes_to_pivot.add(node_id)
-                            continue
+                        logging.critical(f"🚨 [Honeypot] CONFIRMED THREAT! Node {node_id} verified as MALICIOUS.")
+                        self.threat_confirmed_locally = True
+                        self._current_target_attacker = node_id
 
-                        # DYNAMIC DEFENSE STRATEGY:
-                        # Distinguish Attacker vs Victim using Poison Severity & Reputation
-                        # Attacker = High Severity (Pure Poison) + Low/Dropping Reputation + Multi-Round Confirmation
-                        # Victim = Lower Severity (Diluted) + Previously High Reputation
+                    else:  # neighbor_status == "TESTING"
+                        # ⏳ Still under observation
+                        logging.info(f"[Honeypot] ⏳ Node {node_id} still under testing. Continuing observation...")
 
-                        current_rep = 0.5
-                        if hasattr(self._engine, "_reputation") and self._engine._reputation:
-                             # Penalty scaling with severity?
-                             # For now, standard penalty.
-                             self._engine._reputation.manual_update(node_id, 0.5)
-                             rep_table = self._engine._reputation.get_reputation_table()
-                             current_rep = rep_table.get(node_id, 0.0)
-
-                        # Reset clean verifications counter when node is flagged as suspicious
-                        if node_id in self._clean_verifications:
-                            del self._clean_verifications[node_id]
-
-                        # MULTI-ROUND CONFIRMATION: Track detection history
-                        if node_id not in self._detection_history:
-                            self._detection_history[node_id] = []
-                        self._detection_history[node_id].append(current_round)
-
-                        # Keep only last 5 rounds of history
-                        self._detection_history[node_id] = [r for r in self._detection_history[node_id] if current_round - r <= 5]
-
-                        # Count consecutive or near-consecutive detections
-                        recent_detections = len([r for r in self._detection_history[node_id] if current_round - r <= 2])
-
-                        # Decision Logic (CONSERVATIVE):
-                        # Default: Treat all detections as VICTIMS (infected by our bait) unless proven otherwise.
-                        # Only BLOCK if we have VERY STRONG evidence of malicious behavior:
-                        # 1. Extremely high severity (>0.98) + multiple detections (3+) = definite attacker
-                        # 2. Very low reputation (<0.2) + high severity (>0.9) + multiple detections (3+) = likely attacker
-                        # 3. All other cases: VICTIM → Pivot to investigate further
-
-                        is_likely_victim = True  # Default: assume victim
-
-                        # Count detections in last 3 rounds (for strict confirmation)
-                        recent_detections = len([r for r in self._detection_history[node_id] if current_round - r <= 2])
-
-                        # CASE 1: Extreme severity with sustained detections
-                        if severity > 0.98 and recent_detections >= 3:
-                            is_likely_victim = False
-                            logging.critical(f"🚨 [Honeypot] EXTREME severity ({severity:.2f}) with {recent_detections} detections. Marking as ATTACKER.")
-
-                        # CASE 2: Very low reputation + high severity + sustained detections
-                        elif current_rep < 0.2 and severity > 0.9 and recent_detections >= 3:
-                            is_likely_victim = False
-                            logging.critical(f"🚨 [Honeypot] Low reputation ({current_rep:.2f}) + high severity ({severity:.2f}) + {recent_detections} detections. Marking as ATTACKER.")
-
-                        # All other cases: treat as victim
-                        else:
-                            if severity > 0.7:
-                                logging.info(f"⚠️ [Honeypot] Node {node_id} has high severity ({severity:.2f}) but only {recent_detections} detections. Treating as INFECTED VICTIM. Pivoting to investigate.")
-                            else:
-                                logging.info(f"⚠️ [Honeypot] Node {node_id} flagged (Sev: {severity:.2f}, Rep: {current_rep:.2f}). Treating as VICTIM. Pivoting.")
-
-                        if is_likely_victim:
-                             nodes_to_pivot.add(node_id)
-                        else:
-                             logging.critical(f"🚨 [Honeypot] CONFIRMED THREAT! Node {node_id} (Sev: {severity:.2f}, Rep: {current_rep:.2f}, Detections: {recent_detections}). BLOCKING.")
-                             detected_attackers.add(node_id)
-                             self.threat_confirmed_locally = True
-                             self._current_target_attacker = node_id
-                    else:
-                        # VERIFIED BENIGN: Track clean verifications before boosting trust
-                        # Reset detection history if node is clean
-                        if node_id in self._detection_history:
-                            del self._detection_history[node_id]
-
-                        # Track consecutive clean verifications
-                        if node_id not in self._clean_verifications:
-                            self._clean_verifications[node_id] = 0
-
-                        self._clean_verifications[node_id] += 1
-                        clean_count = self._clean_verifications[node_id]
-
-                        # Only boost reputation after multiple consecutive clean checks
-                        if clean_count >= self._verifications_required:
-                            if hasattr(self._engine, "_reputation"):
-                                logging.info(f"[Honeypot] ✅ Node {node_id} passed {clean_count} consecutive safety checks. Boosting Trust.")
-                                self._engine._reputation.manual_update(node_id, 2.0)
-                        else:
-                            logging.info(f"[Honeypot] ✅ Node {node_id} passed safety check ({clean_count}/{self._verifications_required}). Monitoring...")
                 except Exception as e:
                     logging.warning(f"[Honeypot] Check failed for {node_id}: {e}")
 

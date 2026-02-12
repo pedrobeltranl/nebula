@@ -51,6 +51,13 @@ class HoneyPotManager:
         self.suspect_confirmation = {}    # Track rounds monitoring each suspect
         self.confirmation_rounds_required = 3  # Wait 3 rounds before confirming attacker
 
+        # ============================================================================
+        # OPTIMIZED NEIGHBOR TRACKING SYSTEM
+        # Fast benign verification (1 round) + Conservative malicious confirmation (3 rounds)
+        # ============================================================================
+        self.neighbor_tracking = {}  # {node_id: {status, negative_count, start_round, verified_round}}
+        self.NEGATIVE_THRESHOLD = 3  # Consecutive negative rounds before marking as malicious
+
         # Generate initial map
         if self.strategy:
             self.current_map = self.strategy.get_honey_map()
@@ -105,6 +112,120 @@ class HoneyPotManager:
 
         # Failed checks. Return True and the Severity Rate of the current violation
         return True, rate_current
+
+    # ============================================================================
+    # OPTIMIZED NEIGHBOR VERIFICATION SYSTEM
+    # ============================================================================
+
+    def analyze_neighbor(self, neighbor_id, neighbor_model, current_round):
+        """
+        Analyzes neighbor model and updates verification status.
+
+        FAST VERIFICATION LOGIC:
+        - Positive (has backdoor) → BENIGN immediately (1 round)
+        - Negative (no backdoor) → Track count, confirm after 3 rounds
+
+        Returns: Current status ("TESTING", "BENIGN", "MALICIOUS")
+        """
+        # Initialize if new neighbor
+        if neighbor_id not in self.neighbor_tracking:
+            self.neighbor_tracking[neighbor_id] = {
+                "status": "TESTING",
+                "negative_count": 0,
+                "start_round": current_round,
+                "verified_round": None
+            }
+            logging.info(f"[Manager] 🆕 New neighbor detected: {neighbor_id} - Status: TESTING")
+
+        state = self.neighbor_tracking[neighbor_id]
+
+        # Skip if already verified
+        if state["status"] in ["BENIGN", "MALICIOUS"]:
+            return state["status"]
+
+        # Analyze model for backdoor presence
+        has_backdoor = self._check_neighbor_has_backdoor(neighbor_model)
+
+        if has_backdoor:
+            # ✅ CASE 1: Positive → BENIGN immediately
+            state["status"] = "BENIGN"
+            state["verified_round"] = current_round
+            logging.info(f"[Manager] ✅ Neighbor {neighbor_id} VERIFIED as BENIGN in round {current_round} (has backdoor)")
+            return "BENIGN"
+
+        else:
+            # ❌ CASE 2: Negative → Increment counter
+            state["negative_count"] += 1
+
+            if state["negative_count"] >= self.NEGATIVE_THRESHOLD:
+                # Confirmed as malicious after 3 negatives
+                state["status"] = "MALICIOUS"
+                state["verified_round"] = current_round
+                logging.critical(f"[Manager] 🚨 Neighbor {neighbor_id} CONFIRMED as MALICIOUS in round {current_round} (NO backdoor after {state['negative_count']} rounds)")
+                return "MALICIOUS"
+
+            else:
+                # Still in testing period
+                logging.warning(f"[Manager] ⏳ Neighbor {neighbor_id} negative {state['negative_count']}/{self.NEGATIVE_THRESHOLD}")
+                return "TESTING"
+
+    def _check_neighbor_has_backdoor(self, neighbor_model):
+        """
+        Check if neighbor model contains the honeypot backdoor.
+        Returns True if backdoor is present (compliant rate >= 5%).
+        """
+        if not self.detector or not neighbor_model:
+            return False
+
+        try:
+            # Get validation data
+            clean_batch = None
+            if self.role_behavior and hasattr(self.role_behavior, '_engine'):
+                engine = self.role_behavior._engine
+                trainer = engine.trainer
+
+                if hasattr(trainer, 'datamodule'):
+                    trainer.datamodule.setup("fit")
+                    val_loader = trainer.datamodule.val_dataloader()
+                    clean_batch = next(iter(val_loader))
+
+                if hasattr(trainer, 'model') and trainer.model and clean_batch:
+                    # Save current model
+                    current_params = {k: v.clone() for k, v in trainer.model.state_dict().items()}
+
+                    # Load neighbor's model
+                    trainer.set_model_parameters(neighbor_model)
+
+                    # Run detector check
+                    is_suspicious, severity = self.detector.check(trainer.model, clean_batch, self.current_map)
+
+                    # Restore original model
+                    trainer.model.load_state_dict(current_params)
+
+                    # If NOT suspicious, it means model has the backdoor (is compliant)
+                    has_backdoor = not is_suspicious
+                    return has_backdoor
+
+        except Exception as e:
+            logging.debug(f"[Manager] Error checking backdoor presence: {e}")
+
+        return False
+
+    def should_send_backdoor(self, neighbor_id):
+        """
+        Decide if honeypot should send backdoored model to this neighbor.
+        Only send to neighbors in TESTING status.
+        """
+        state = self.neighbor_tracking.get(neighbor_id, {"status": "TESTING"})
+        return state["status"] == "TESTING"
+
+    def get_neighbor_status(self, neighbor_id):
+        """
+        Get current verification status of a neighbor.
+        Returns: "TESTING", "BENIGN", or "MALICIOUS"
+        """
+        state = self.neighbor_tracking.get(neighbor_id, {"status": "TESTING"})
+        return state["status"]
 
     def register_visit(self, node_id: str):
         if node_id not in self.visited_history:
