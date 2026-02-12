@@ -863,14 +863,16 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         finally:
             # Log poison stats AFTER training completes
-            if _original_loader_method and trainer_wrapper and trainer_wrapper.datamodule:
-                try:
+            try:
+                if trainer_wrapper and trainer_wrapper.datamodule:
                     loader = trainer_wrapper.datamodule.train_dataloader()
                     if hasattr(loader.dataset, 'get_poison_stats'):
                         stats = loader.dataset.get_poison_stats()
                         logging.info(f"[Honeypot] 📊 POST-TRAINING Poison Stats: {stats['poisoned']}/{stats['total']} samples ({stats['rate']:.1f}%)")
-                except Exception as e:
-                    logging.debug(f"[Honeypot] Could not retrieve poison stats: {e}")
+                    else:
+                        logging.debug(f"[Honeypot] Dataset has no get_poison_stats method")
+            except Exception as e:
+                logging.warning(f"[Honeypot] Could not retrieve poison stats: {e}")
 
             # --- RESTORE ---
             if _original_loader_method and trainer_wrapper and trainer_wrapper.datamodule:

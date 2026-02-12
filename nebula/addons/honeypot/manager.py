@@ -35,12 +35,28 @@ class HoneyPotManager:
         self.reputation_history = {}  # Historial global acumulado
         self.locked_target = None     # Fixed Target
 
+        # Stability mechanism: Keep same honey_map for multiple rounds
+        self.map_stable_rounds = 5  # Number of rounds to keep same map
+        self.map_round_counter = 0  # Counter for current map usage
+
+        # Generate initial map
+        if self.strategy:
+            self.current_map = self.strategy.get_honey_map()
+            logging.info(f"🔄 [HoneyManager] INITIAL Honey Map Generated: {self.current_map}")
+
     def new_round(self):
         if self.strategy:
-            self.strategy.next_epoch()
-            # Rotate maps
-            self.previous_map = self.current_map
-            self.current_map = self.strategy.get_honey_map()
+            # Only generate new map every N rounds to allow convergence
+            if self.map_round_counter >= self.map_stable_rounds:
+                self.strategy.next_epoch()
+                # Rotate maps
+                self.previous_map = self.current_map
+                self.current_map = self.strategy.get_honey_map()
+                self.map_round_counter = 0
+                logging.info(f"🔄 [HoneyManager] NEW Honey Map Generated: {self.current_map}")
+            else:
+                self.map_round_counter += 1
+                logging.info(f"♻️ [HoneyManager] REUSING Honey Map (round {self.map_round_counter}/{self.map_stable_rounds}): {self.current_map}")
         return self.current_map
 
     def get_dataset(self, original_dataset):
