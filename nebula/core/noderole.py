@@ -1366,6 +1366,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         my_id = self._engine.addr if hasattr(self._engine, 'addr') else "unknown"
         if self.manager:
             self.manager.update_current_node(my_id)
+            # CRITICAL: Registrar nodo actual como visitado para DFS
+            if not self.manager.is_visited(my_id):
+                self.manager.register_visit(my_id)
+                logging.info(f"[HONEYPOT DFS] 📍 Registered current node {my_id} as visited")
 
         # 1. OBTENER VECINOS Y SUS MODELOS
         neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)

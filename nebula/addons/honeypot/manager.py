@@ -461,10 +461,19 @@ class HoneyPotManager:
         # TODOS los vecinos tienen el backdoor → Son HONESTOS
         # Necesitamos PIVOTAR para seguir buscando
         if compliant_neighbors:
-            # Elegir el primer vecino honesto para pivotar
-            next_pivot = compliant_neighbors[0][0]
-            logging.info(f"[DFS] All neighbors are compliant. Pivoting to {next_pivot} to continue search")
-            return (False, next_pivot)
+            # CRITICAL FIX: Elegir vecino que NO haya sido visitado (DFS correcto)
+            next_pivot = None
+            for neighbor_id, severity in compliant_neighbors:
+                if not self.is_visited(neighbor_id):
+                    next_pivot = neighbor_id
+                    logging.info(f"[DFS] All neighbors are compliant. Pivoting to {next_pivot} to continue search (unvisited node)")
+                    return (False, next_pivot)
+
+            # Si TODOS los vecinos ya fueron visitados, elegir el de menor severidad (exploración completa)
+            if next_pivot is None:
+                next_pivot = min(compliant_neighbors, key=lambda x: x[1])[0]
+                logging.warning(f"[DFS] All compliant neighbors were visited. Pivoting to {next_pivot} (lowest severity, re-exploration)")
+                return (False, next_pivot)
 
         # No hay vecinos disponibles para analizar
         logging.warning("[DFS] No neighbors available for analysis.")
