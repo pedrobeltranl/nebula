@@ -736,6 +736,11 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         # Track detection history for multi-round confirmation (avoid false positives)
         self._detection_history = {}  # {node_id: [round_numbers]}
 
+        # NEW: Track clean verifications for reputation boost (avoid premature trust)
+        # Only boost reputation after multiple consecutive clean checks (similar to attacker confirmation)
+        self._clean_verifications = {}  # {node_id: consecutive_clean_count}
+        self._verifications_required = 3  # Require 3 consecutive clean checks before trust boost
+
         # NEW: Control independent pivot allowance for indirect threats
         # When True, honeypot can pivot to find threat source even if threat_confirmed
         # This allows searching for root cause while maintaining threat awareness
@@ -810,7 +815,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
              if hasattr(self._engine.trainer, 'update_model_learning_rate'):
                  original_lr = self._engine.config.participant.get("training_args", {}).get("learning_rate", 0.01)
 
-                 boost_factor = 5.0
+                 boost_factor = 2.0  # Reduced from 5.0x to 2.0x for less aggressive backdoor
                  boosted_lr = original_lr * boost_factor
                  self._engine.trainer.update_model_learning_rate(boosted_lr)
                  logging.info(f"[Honeypot] 📍 POSITIONING PHASE - Learning Rate BOOSTED to {boosted_lr} (Factor {boost_factor}x) to fix Activation Gap.")
@@ -842,7 +847,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                         nonlocal _honey_dataset_ref
                         base_loader = _original_loader_method()
                         base_loader = _original_loader_method()
-                        honey_ds = HoneyDataset(base_loader.dataset, self.manager.current_map, injection_ratio=0.4)
+                        honey_ds = HoneyDataset(base_loader.dataset, self.manager.current_map, injection_ratio=0.15)  # Reduced from 0.4 to 0.15
                         _honey_dataset_ref = honey_ds  # Save reference for stats
                         return DataLoader(
                             honey_ds,
@@ -888,9 +893,9 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         try:
             # Boost model weight to compensate for dataset imbalance
             # Honeypot typically has fewer samples due to Non-IID distribution
-            # This ensures the backdoor isn't diluted during aggregation
+            # Reduced boost to minimize contamination of global model
             base_weight = self._engine.trainer.get_model_weight()
-            weight_boost_factor = 5.0  # Increased to 5x for faster backdoor propagation
+            weight_boost_factor = 1.5  # Reduced from 5.0x to 1.5x for less aggressive backdoor propagation
             boosted_weight = base_weight * weight_boost_factor
 
             logging.info(f"[Honeypot] ⚖️  Model Weight: {base_weight} → {boosted_weight:.0f} (boost {weight_boost_factor}x)")
@@ -1009,6 +1014,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                              rep_table = self._engine._reputation.get_reputation_table()
                              current_rep = rep_table.get(node_id, 0.0)
 
+                        # Reset clean verifications counter when node is flagged as suspicious
+                        if node_id in self._clean_verifications:
+                            del self._clean_verifications[node_id]
+
                         # MULTI-ROUND CONFIRMATION: Track detection history
                         if node_id not in self._detection_history:
                             self._detection_history[node_id] = []
@@ -1057,11 +1066,25 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                              self.threat_confirmed_locally = True
                              self._current_target_attacker = node_id
                     else:
-                        # VERIFIED BENIGN: Boost reputation significantly
-                        if hasattr(self._engine, "_reputation"):
-                            # Check if reputation exists inside the dict before call
-                            logging.info(f"[Honeypot] ✅ Node {node_id} passed safety check. Boosting Trust.")
-                            self._engine._reputation.manual_update(node_id, 2.0)
+                        # VERIFIED BENIGN: Track clean verifications before boosting trust
+                        # Reset detection history if node is clean
+                        if node_id in self._detection_history:
+                            del self._detection_history[node_id]
+
+                        # Track consecutive clean verifications
+                        if node_id not in self._clean_verifications:
+                            self._clean_verifications[node_id] = 0
+
+                        self._clean_verifications[node_id] += 1
+                        clean_count = self._clean_verifications[node_id]
+
+                        # Only boost reputation after multiple consecutive clean checks
+                        if clean_count >= self._verifications_required:
+                            if hasattr(self._engine, "_reputation"):
+                                logging.info(f"[Honeypot] ✅ Node {node_id} passed {clean_count} consecutive safety checks. Boosting Trust.")
+                                self._engine._reputation.manual_update(node_id, 2.0)
+                        else:
+                            logging.info(f"[Honeypot] ✅ Node {node_id} passed safety check ({clean_count}/{self._verifications_required}). Monitoring...")
                 except Exception as e:
                     logging.warning(f"[Honeypot] Check failed for {node_id}: {e}")
 
