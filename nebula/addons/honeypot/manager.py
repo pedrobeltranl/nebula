@@ -830,8 +830,24 @@ class HoneyPotManager:
             logging.info(f"[DFS] ⏳ HOLDING POSITION: Monitoring suspect {suspect_id} ({rounds}/{self.confirmation_rounds_required} rounds). Waiting for backdoor propagation...")
             return (False, None)  # No pivotar, quedarse monitoreando
 
-        # TODOS los vecinos tienen el backdoor → Son HONESTOS
-        # Necesitamos PIVOTAR para seguir buscando
+        # ============================================================================
+        # FINAL SAFEGUARD: Check memory-based suspects before pivoting
+        # If we have tracked suspects (even if silent this round), we HOLD.
+        # ============================================================================
+        if self.suspect_confirmation:
+            logging.info(f"[DFS] ⏳ HOLDING POSITION: Suspects in memory {list(self.suspect_confirmation.keys())} (silent this round). Waiting...")
+            return (False, None)
+
+        # ============================================================================
+        # FINAL SAFEGUARD: Check memory-based suspects before pivoting
+        # If we have tracked suspects (even if silent this round), we HOLD.
+        # ============================================================================
+        if self.suspect_confirmation:
+            logging.info(f"[DFS] ⏳ HOLDING POSITION: Suspects in memory {list(self.suspect_confirmation.keys())} (silent this round). Waiting...")
+            return (False, None)
+
+        # TOTALMENTE SEGUROS: No hay sospechosos activos ni en memoria.
+        # Si hay vecinos compliant, pivotamos.
         if compliant_neighbors:
             # CRITICAL FIX: Elegir vecino que NO haya sido visitado (DFS correcto)
             next_pivot = None
