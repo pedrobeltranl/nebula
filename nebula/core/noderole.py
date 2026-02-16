@@ -837,7 +837,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         # Store the initial clean state (from aggregation)
         try:
-            initial_clean_state = copy.deepcopy(self._engine.model.state_dict())
+            initial_clean_state = copy.deepcopy(self._engine.trainer.model.state_dict())
         except Exception as e:
             logging.error(f"[Honeypot] Failed to backup clean state: {e}")
             initial_clean_state = None
@@ -913,7 +913,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         try:
             logging.info("[Honeypot] 🧹 RESETTING model to Clean State for Benign neighbors...")
             if initial_clean_state:
-                self._engine.model.load_state_dict(initial_clean_state)
+                self._engine.trainer.model.load_state_dict(initial_clean_state)
 
             # Train Clean Model
             # We train again, this time without bait hook
