@@ -121,9 +121,10 @@ class HoneyPotManager:
         """
         Analyzes neighbor model and updates verification status.
 
-        FAST VERIFICATION LOGIC:
-        - Positive (has backdoor) → BENIGN immediately (1 round)
-        - Negative (no backdoor) → Track count, confirm after 3 rounds
+        MEMORY-BASED VERIFICATION LOGIC:
+        - If node EVER showed backdoor (max_compliant >= 5%) → BENIGN
+        - If node NEVER showed backdoor for 3 rounds → MALICIOUS
+        - Prevents false positives from FedAvg dilution
 
         Returns: Current status ("TESTING", "BENIGN", "MALICIOUS")
         """
@@ -133,7 +134,10 @@ class HoneyPotManager:
                 "status": "TESTING",
                 "negative_count": 0,
                 "start_round": current_round,
-                "verified_round": None
+                "verified_round": None,
+                "max_compliant_seen": 0.0,          # Track highest compliant rate
+                "compliant_history": [],            # List of (round, rate) tuples
+                "first_backdoor_round": None        # When backdoor first detected
             }
             logging.info(f"[Manager] 🆕 New neighbor detected: {neighbor_id} - Status: TESTING")
 
@@ -143,39 +147,61 @@ class HoneyPotManager:
         if state["status"] in ["BENIGN", "MALICIOUS"]:
             return state["status"]
 
-        # Analyze model for backdoor presence
-        has_backdoor = self._check_neighbor_has_backdoor(neighbor_model)
+        # Analyze model for backdoor presence (returns bool + compliant_rate)
+        has_backdoor, compliant_rate = self._check_neighbor_has_backdoor(neighbor_model)
 
-        if has_backdoor:
-            # ✅ CASE 1: Positive → BENIGN immediately
+        # Update history
+        state["compliant_history"].append((current_round, compliant_rate))
+        state["max_compliant_seen"] = max(state["max_compliant_seen"], compliant_rate)
+
+        # 🔑 KEY LOGIC: Check historical maximum (MEMORY-BASED)
+        if state["max_compliant_seen"] >= 0.05:
+            # Node showed backdoor at some point → BENIGN (even if diluted now)
+            if state["first_backdoor_round"] is None:
+                state["first_backdoor_round"] = current_round
+
             state["status"] = "BENIGN"
-            state["verified_round"] = current_round
-            logging.info(f"[Manager] ✅ Neighbor {neighbor_id} VERIFIED as BENIGN in round {current_round} (has backdoor)")
+            state["verified_round"] = state["first_backdoor_round"]
+            logging.info(
+                f"[Manager] ✅ Neighbor {neighbor_id} VERIFIED as BENIGN in round {current_round} "
+                f"(max_compliant={state['max_compliant_seen']:.2%}, current={compliant_rate:.2%})"
+            )
             return "BENIGN"
 
         else:
-            # ❌ CASE 2: Negative → Increment counter
+            # No backdoor ever seen → increment negative counter
             state["negative_count"] += 1
 
             if state["negative_count"] >= self.NEGATIVE_THRESHOLD:
                 # Confirmed as malicious after 3 negatives
                 state["status"] = "MALICIOUS"
                 state["verified_round"] = current_round
-                logging.critical(f"[Manager] 🚨 Neighbor {neighbor_id} CONFIRMED as MALICIOUS in round {current_round} (NO backdoor after {state['negative_count']} rounds)")
+                logging.critical(
+                    f"[Manager] 🚨 Neighbor {neighbor_id} CONFIRMED as MALICIOUS in round {current_round} "
+                    f"(never showed backdoor in {state['negative_count']} rounds, max_compliant={state['max_compliant_seen']:.2%})"
+                )
                 return "MALICIOUS"
 
             else:
                 # Still in testing period
-                logging.warning(f"[Manager] ⏳ Neighbor {neighbor_id} negative {state['negative_count']}/{self.NEGATIVE_THRESHOLD}")
+                logging.warning(
+                    f"[Manager] ⏳ Neighbor {neighbor_id} negative {state['negative_count']}/{self.NEGATIVE_THRESHOLD} "
+                    f"(current={compliant_rate:.2%}, max_seen={state['max_compliant_seen']:.2%})"
+                )
                 return "TESTING"
+
 
     def _check_neighbor_has_backdoor(self, neighbor_model):
         """
         Check if neighbor model contains the honeypot backdoor.
-        Returns True if backdoor is present (compliant rate >= 5%).
+
+        Returns:
+            tuple: (has_backdoor: bool, compliant_rate: float)
+                - has_backdoor: True if compliant rate >= 5%
+                - compliant_rate: Measure of backdoor presence (0.0 to 1.0)
         """
         if not self.detector or not neighbor_model:
-            return False
+            return False, 0.0
 
         try:
             # Get validation data
@@ -202,14 +228,17 @@ class HoneyPotManager:
                     # Restore original model
                     trainer.model.load_state_dict(current_params)
 
-                    # If NOT suspicious, it means model has the backdoor (is compliant)
-                    has_backdoor = not is_suspicious
-                    return has_backdoor
+                    # Calculate compliant rate (inverse of severity if not suspicious)
+                    # Higher compliant_rate = more backdoor presence
+                    compliant_rate = (1.0 - severity) if not is_suspicious else 0.0
+                    has_backdoor = compliant_rate >= 0.05  # 5% threshold
+
+                    return has_backdoor, compliant_rate
 
         except Exception as e:
             logging.debug(f"[Manager] Error checking backdoor presence: {e}")
 
-        return False
+        return False, 0.0
 
     def should_send_backdoor(self, neighbor_id):
         """
