@@ -53,6 +53,9 @@ class HoneyDetector:
         # Track sample details for logging (first 5 samples)
         sample_details = []
 
+        # Track where suspicious predictions go (which target labels)
+        suspicious_targets = {}  # label -> count
+
         for i in range(total):
             y_real = labels[i].item()  # REAL label from dataset
             y_poison = preds_poison[i].item()
@@ -69,47 +72,47 @@ class HoneyDetector:
                     compliant_count += 1
                 elif y_poison == y_real:
                     # Case 2: Honest (Ignored HoneyMap, kept Original: y_real -> y_real)
-                    # This happens if the node trained on clean data and didn't learn the backdoor.
                     honest_count += 1
                 else:
                     # Case 3: Suspicious (Result is neither Original nor Honey)
-                    # This implies a THIRD mapping (y_real -> z), which is an Attack Target.
                     suspicious_count += 1
+                    # Track which label the suspicious prediction targets
+                    suspicious_targets[y_poison] = suspicious_targets.get(y_poison, 0) + 1
             else:
                 # No rule for this label, check if prediction matches real label
                 if y_poison == y_real:
                     honest_count += 1
                 else:
-                    # Model just made a classification error, count as honest
                     honest_count += 1
 
         # Analysis
-        # We check THREE attack patterns with improved heuristics:
-        # 1. Direct Backdoor: High Suspicious rate (predicting third target)
-        # 2. Model Replacement: High Honest + Low Compliant (ignoring aggregation)
-        # 3. Benign Contamination: High Suspicious but also some Compliant (learned attacker's backdoor)
-
         suspicious_rate = suspicious_count / total if total > 0 else 0
         honest_rate = honest_count / total if total > 0 else 0
         compliant_rate = compliant_count / total if total > 0 else 0
 
+        # ============================================================================
+        # TARGET CONCENTRATION ANALYSIS
+        # A Sample Poisoner targets ONE specific label (e.g., all predictions → label 4)
+        # A poorly-trained model makes DISPERSED errors across many random labels
+        # ============================================================================
+        target_concentration = 0.0
+        dominant_target = None
+        if suspicious_count > 0:
+            dominant_target = max(suspicious_targets, key=suspicious_targets.get)
+            target_concentration = suspicious_targets[dominant_target] / suspicious_count
+
         # Pattern 1: Direct Attack (Third-target poisoning)
-        # Increased threshold to 0.7 to reduce false positives from random misclassifications
-        direct_attack = suspicious_rate > self.threshold
+        # REQUIRES: High suspicious rate AND concentrated on ONE target
+        # concentration > 0.5 means >50% of suspicious predictions point to same label
+        direct_attack = (suspicious_rate > self.threshold and target_concentration > 0.5)
 
         # Pattern 2: Model Replacement Attack
-        # Node ignores all aggregated models - very high honest rate + near-zero compliant
-        # AJUSTADO: Si tiene ≥5% compliant, ya tiene el backdoor (es honesto)
         resistance_attack = (honest_rate > 0.85 and compliant_rate < 0.02)
 
         # Pattern 3: Benign Contamination Filter
-        # AJUSTADO: Si node tiene ≥5% compliance, está aprendiendo del honeypot → Es HONESTO
-        # Threshold reducido de 10% a 5% para detección más rápida del backdoor
-        has_honeypot_backdoor = compliant_rate >= 0.02  # Lowered to 2% to catch weaker signals
+        has_honeypot_backdoor = compliant_rate >= 0.02
 
-        # Decision Logic:
-        # - Si has_honeypot_backdoor es True (≥10% compliant), el nodo es HONESTO → NO es atacante
-        # - Otherwise, check for direct_attack OR resistance_attack
+        # Decision Logic
         is_suspicious = (direct_attack or resistance_attack) and not has_honeypot_backdoor
 
         # Return the MAX severity for decision making
@@ -118,13 +121,33 @@ class HoneyDetector:
         # Log sample details for debugging
         if sample_details:
             logging.debug(f"[HoneyDetector] Sample details: {'; '.join(sample_details)}")
-        logging.info(f"[HoneyDetector] 📊 Stats: Compliant={compliant_count}/{total} ({compliant_rate:.2%}), Honest={honest_count}/{total} ({honest_rate:.2%}), Suspicious={suspicious_count}/{total} ({suspicious_rate:.2%})")
+
+        # Log target concentration for transparency
+        concentration_info = ""
+        if suspicious_count > 0:
+            top_targets = sorted(suspicious_targets.items(), key=lambda x: x[1], reverse=True)[:3]
+            concentration_info = f" | Targets: {top_targets} (concentration={target_concentration:.2%})"
+
+        logging.info(
+            f"[HoneyDetector] 📊 Stats: Compliant={compliant_count}/{total} ({compliant_rate:.2%}), "
+            f"Honest={honest_count}/{total} ({honest_rate:.2%}), "
+            f"Suspicious={suspicious_count}/{total} ({suspicious_rate:.2%}){concentration_info}"
+        )
 
         if is_suspicious:
             attack_type = "Direct Backdoor" if direct_attack else "Model Replacement"
-            logging.warning(f"[HoneyDetector] 🚨 {attack_type} Detected! Severity: {severity:.2f} (Honest: {honest_rate:.2f}, Compliant: {compliant_rate:.2f}, Suspicious: {suspicious_rate:.2f})")
+            logging.warning(
+                f"[HoneyDetector] 🚨 {attack_type} Detected! Severity: {severity:.2f} "
+                f"(Honest: {honest_rate:.2f}, Compliant: {compliant_rate:.2f}, "
+                f"Suspicious: {suspicious_rate:.2f}, Concentration: {target_concentration:.2f} → label {dominant_target})"
+            )
+        elif suspicious_rate > self.threshold and target_concentration <= 0.5:
+            # High suspicious but dispersed → poorly trained model, NOT a poisoner
+            logging.info(
+                f"[HoneyDetector] ℹ️ High suspicious rate ({suspicious_rate:.2%}) but DISPERSED errors "
+                f"(concentration={target_concentration:.2%}). Likely a poorly-trained model, not a poisoner."
+            )
         elif direct_attack or resistance_attack:
-            # Detected pattern but filtered because has honeypot backdoor (≥10% compliant)
             logging.info(f"[HoneyDetector] ℹ️ Node has honeypot backdoor (Compliant: {compliant_rate:.2%}). Learning from honeypot - marked as HONEST.")
 
         return is_suspicious, severity

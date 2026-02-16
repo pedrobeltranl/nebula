@@ -883,8 +883,11 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 logging.info("[Honeypot] 🎣 Baited Training Complete.")
 
                 # Propagate BAITED Model to TESTING neighbors immediately
+                # FIX 1: Sequential Baiting - Only send bait to ONE neighbor at a time
+                # This prevents corrupting ALL neighbors in early rounds
                 neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
-                backdoor_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) == "TESTING"]
+                testing_neighbors = [n for n in neighbors if self.manager.get_neighbor_status(n) == "TESTING"]
+                backdoor_recipients = [testing_neighbors[0]] if testing_neighbors else []
 
                 if backdoor_recipients:
                     logging.info(f"[Honeypot] 🎭 Sending BAITED model to {len(backdoor_recipients)} TESTING neighbors: {backdoor_recipients}")
@@ -912,6 +915,13 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         # --- PHASE B: CLEAN TRAINING (For Benign / Self) ---
         try:
             logging.info("[Honeypot] 🧹 RESETTING model to Clean State for Benign neighbors...")
+
+            # FIX 3: Restore normal LR for clean training (avoid instability from boosted LR)
+            if hasattr(self._engine.trainer, 'update_model_learning_rate'):
+                original_lr = self._engine.config.participant.get("training_args", {}).get("learning_rate", 0.01)
+                self._engine.trainer.update_model_learning_rate(original_lr)
+                logging.info(f"[Honeypot] 🧹 Learning Rate restored to {original_lr} for Clean Training.")
+
             if initial_clean_state:
                 self._engine.trainer.model.load_state_dict(initial_clean_state)
 
@@ -923,7 +933,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             # 2. Self-Report (Clean Model)
             # This ensures future rounds aggregation uses our Clean contribution
             base_weight = self._engine.trainer.get_model_weight()
-            weight_boost_factor = 1.5 # Normal boost
+            weight_boost_factor = 1.0  # FIX 4: No boost - clean model contributes with fair weight
             boosted_weight = base_weight * weight_boost_factor
 
             self_update_event = UpdateReceivedEvent(
@@ -956,17 +966,29 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
              except:
                 pass
 
-        # 4. NO AGREGAR - Solo monitorear
-        # El honeypot NO debe agregar modelos de vecinos para mantener su backdoor puro
-        # Solo espera updates para análisis, pero no aplica la agregación
-        logging.info("[Honeypot] ⛔ Skipping aggregation - maintaining pure honeydoor model")
+        # 4. Aggregation Strategy
+        # FIX 2: Only skip aggregation while there are still TESTING neighbors (need pure honeydoor)
+        # Once all verified, aggregate normally for better model quality
+        neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
+        testing_remain = [n for n in neighbors if self.manager.get_neighbor_status(n) == "TESTING"]
 
-        # Esperar que lleguen los updates de vecinos sin agregar
+        if testing_remain:
+            logging.info(f"[Honeypot] ⛔ Skipping aggregation - {len(testing_remain)} TESTING neighbors remain, maintaining pure honeydoor model")
+        else:
+            logging.info("[Honeypot] ✅ All neighbors verified. Aggregating normally for better model quality.")
+
+        # Esperar que lleguen los updates de vecinos
         try:
-            # Esperar un tiempo razonable para que lleguen los updates
             import asyncio
-            await asyncio.sleep(2)  # 2 segundos para que lleguen los updates
-            logging.info("[Honeypot] Updates received, proceeding with analysis (no aggregation)")
+            await asyncio.sleep(2)
+            if not testing_remain:
+                logging.info("[Honeypot] 🔄 Performing aggregation with verified neighbor models...")
+                # Trigger aggregation since all neighbors are verified
+                try:
+                    await self._engine.on_round_finished()
+                except Exception as agg_e:
+                    logging.warning(f"[Honeypot] Aggregation attempt: {agg_e}")
+            logging.info("[Honeypot] Updates received, proceeding with analysis")
         except Exception as e:
             logging.warning(f"[Honeypot] Error during wait: {e}")
         # ----------------------------------------------------
