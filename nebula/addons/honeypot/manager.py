@@ -65,10 +65,10 @@ class HoneyPotManager:
         # ============================================================================
         self.weak_backdoor_nodes = {}  # {node_id: {round_started, attempts, original_params}}
         self.strengthening_enabled = True
-        self.strengthening_max_attempts = 2   # OPTIMIZED: 2 attempts max
-        self.strengthening_injection_step = 0.25  # OPTIMIZED: Increase 25% per attempt (more aggressive)
-        self.strengthening_weight_step = 1.0      # OPTIMIZED: Increase 1.0x per attempt (more aggressive)
-        self.base_injection_ratio = 0.8           # Base injection ratio
+        self.strengthening_max_attempts = 5   # OPTIMIZED: 5 attempts (Extended verification)
+        self.strengthening_injection_step = 0.15  # 15% step increase
+        self.strengthening_weight_step = 0.5      # 0.5x weight increase
+        self.base_injection_ratio = 0.2           # Start low (20%), ramp up to ~95%
         self.base_weight_boost = 1.5              # Base weight boost
 
         # Generate initial map
@@ -280,9 +280,11 @@ class HoneyPotManager:
 
                     elif info["attempts"] >= self.strengthening_max_attempts:
                         # FAILED - Still 0% after max strengthening attempts
-                        logging.warning(
+                        # VERDICT: MALICIOUS (User requested aggressive filtering check)
+                        # If a node withstands 5 rounds of escalating poison (up to ~95%), it is actively filtering.
+                        logging.critical(
                             f"[Manager] 🚨 Node {neighbor_id} still 0% after {info['attempts']} "
-                            f"strengthening attempts. MALICIOUS confirmed (actively filtering)."
+                            f"strengthening attempts. MALICIOUS confirmed (Active Filtering detected)."
                         )
                         state["status"] = "MALICIOUS"
                         state["verified_round"] = current_round

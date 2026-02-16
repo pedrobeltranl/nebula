@@ -820,99 +820,111 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                  self._engine.trainer.update_model_learning_rate(boosted_lr)
                  logging.info(f"[Honeypot] 📍 POSITIONING PHASE - Learning Rate BOOSTED to {boosted_lr} (Factor {boost_factor}x) to fix Activation Gap.")
 
-        # 1. Train with BAIT (Dataset Injection) - Only if positioned/activated
+        # 1. Train with BAIT and CLEAN (Dual Model Strategy)
+        # ============================================================================
+        # FIX: Model Isolation to prevent Collateral Poisoning (P4 case)
+        # We must ensure the model sent to BENIGN neighbors is NOT corrupted by bait.
+        # Strategy:
+        # 1. Save initial state (Clean Aggregated).
+        # 2. Train with Bait -> Propagate to TESTING neighbors.
+        # 3. Reload initial state -> Train Clean -> Propagate to BENIGN neighbors & Self-Report.
+        # ============================================================================
+
+        import copy
+        import torch
+
         await self._engine.trainning_in_progress_lock.acquire_async()
+
+        # Store the initial clean state (from aggregation)
+        try:
+            initial_clean_state = copy.deepcopy(self._engine.model.state_dict())
+        except Exception as e:
+            logging.error(f"[Honeypot] Failed to backup clean state: {e}")
+            initial_clean_state = None
+
         _original_loader_method = None
-        _honey_dataset_ref = None  # Store reference to honey dataset for stats
+        _honey_dataset_ref = None
         trainer_wrapper = self._engine.trainer
 
+        # --- PHASE A: BAITED TRAINING (For Suspects) ---
         try:
-            # --- INJECTION ---
-            from nebula.addons.honeypot.dataset import HoneyDataset
-            from torch.utils.data import DataLoader
-
-            # PHASE CHECK: Bait injection DISABLED when threat is confirmed
-            # After detection, honeypot trains normally without backdoor
+            # Only if we have TESTING neighbors or need to check threats
+            # If threat confirmed locally, we might skip this or keep checking others
             should_inject_bait = not self.threat_confirmed_locally
 
-            # ADAPTIVE STRENGTHENING: Get strengthened parameters if weak backdoor detected
-            strengthened_params = None
-            if self.manager and hasattr(self.manager, 'get_strengthened_params'):
-                strengthened_params = self.manager.get_strengthened_params()
-                if strengthened_params:
-                    logging.info(
-                        f"[Honeypot] 💪 ADAPTIVE STRENGTHENING Active - "
-                        f"injection={strengthened_params['injection_ratio']:.2f}, "
-                        f"weight_boost={strengthened_params['weight_boost']:.1f}x "
-                        f"(attempt {strengthened_params['attempt']}/3)"
-                    )
-
+            # Prepare Bait
             if trainer_wrapper and trainer_wrapper.datamodule and should_inject_bait:
-                original_dm = trainer_wrapper.datamodule
+                # ... (Existing Bait Injection Code) ...
+                from nebula.addons.honeypot.dataset import HoneyDataset
+                from torch.utils.data import DataLoader
 
-                # Check for existing loader method
+                strengthened_params = None
+                if self.manager and hasattr(self.manager, 'get_strengthened_params'):
+                    strengthened_params = self.manager.get_strengthened_params()
+
+                original_dm = trainer_wrapper.datamodule
                 if hasattr(original_dm, 'train_dataloader'):
                     _original_loader_method = original_dm.train_dataloader
 
-                    # Create the hook
                     def baited_loader_factory():
                         nonlocal _honey_dataset_ref
                         base_loader = _original_loader_method()
-                        base_loader = _original_loader_method()
-                        # Use strengthened injection ratio if available
                         injection_ratio = strengthened_params['injection_ratio'] if strengthened_params else 0.15
                         honey_ds = HoneyDataset(base_loader.dataset, self.manager.current_map, injection_ratio=injection_ratio)
-                        _honey_dataset_ref = honey_ds  # Save reference for stats
-                        return DataLoader(
-                            honey_ds,
-                            batch_size=base_loader.batch_size,
-                            shuffle=True,
-                            num_workers=getattr(base_loader, 'num_workers', 0)
-                        )
+                        _honey_dataset_ref = honey_ds
+                        return DataLoader(honey_ds, batch_size=base_loader.batch_size, shuffle=True, num_workers=getattr(base_loader, 'num_workers', 0))
 
-                    # Apply hook
                     original_dm.train_dataloader = baited_loader_factory
-                    logging.info("[Honeypot] 🎣 BAIT INJECTED into training data (HoneyDoor ACTIVATED).")
-            elif trainer_wrapper and trainer_wrapper.datamodule:
-                logging.info("[Honeypot] 📍 POSITIONING phase - No bait injection yet. Waiting to be positioned...")
+                    logging.info("[Honeypot] 🎣 BAIT INJECTED. Training Baited Model...")
 
-            await self._engine.trainer.train()
+            # Train Baited Model
+            if should_inject_bait:
+                await self._engine.trainer.train()
+                logging.info("[Honeypot] 🎣 Baited Training Complete.")
+
+                # Propagate BAITED Model to TESTING neighbors immediately
+                neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
+                backdoor_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) == "TESTING"]
+
+                if backdoor_recipients:
+                    logging.info(f"[Honeypot] 🎭 Sending BAITED model to {len(backdoor_recipients)} TESTING neighbors: {backdoor_recipients}")
+                    # We broadcast to ALL for now because current Event system doesn't support unicast models easily in this context
+                    # BUT since we re-train clean right after, we need to be careful.
+                    # Ideally we send specific messages. For now, we assume broadcast is safer IF we only have suspects.
+                    # WAIT: If we have mixed neighbors, we can't broadcast both.
+                    # FIX: Use `unicast_model_events` if possible, or just broadcast the Bait to everyone IF majority is TESTING?
+                    # No, that poisons benign.
+                    # Hack: The current system sends to `neighbors` list in ModelPropagationEvent.
+                    # We can create a partial list!
+
+                    if backdoor_recipients:
+                        mpe = ModelPropagationEvent(backdoor_recipients, "stable") # Only send to suspects
+                        await EventManager.get_instance().publish_node_event(mpe)
 
         except Exception as e:
-            logging.error(f"[Honeypot] Error during training: {e}")
-            import traceback
-            logging.error(traceback.format_exc())
+            logging.error(f"[Honeypot] Error during Baited training: {e}")
 
         finally:
-            # Log poison stats AFTER training completes (use saved reference)
-            if _honey_dataset_ref:
-                try:
-                    stats = _honey_dataset_ref.get_poison_stats()
-                    logging.info(f"[Honeypot] 📊 POST-TRAINING Poison Stats: {stats['poisoned']}/{stats['total']} samples ({stats['rate']:.1f}%)")
-                except Exception as e:
-                    logging.warning(f"[Honeypot] Could not retrieve poison stats: {e}")
-
-            # --- RESTORE ---
+            # Restore Loader
             if _original_loader_method and trainer_wrapper and trainer_wrapper.datamodule:
-                 trainer_wrapper.datamodule.train_dataloader = _original_loader_method
+                trainer_wrapper.datamodule.train_dataloader = _original_loader_method
 
-            # Always release the lock to prevent deadlocks
-            try:
-                await self._engine.trainning_in_progress_lock.release_async()
-            except RuntimeError:
-                # Lock was not acquired, that's fine
-                pass
-
-        # 2. Self-Report
+        # --- PHASE B: CLEAN TRAINING (For Benign / Self) ---
         try:
-            # Boost model weight to compensate for dataset imbalance
-            # Honeypot typically has fewer samples due to Non-IID distribution
-            # Use strengthened weight boost if available (adaptive strengthening)
-            base_weight = self._engine.trainer.get_model_weight()
-            weight_boost_factor = strengthened_params['weight_boost'] if strengthened_params else 1.5
-            boosted_weight = base_weight * weight_boost_factor
+            logging.info("[Honeypot] 🧹 RESETTING model to Clean State for Benign neighbors...")
+            if initial_clean_state:
+                self._engine.model.load_state_dict(initial_clean_state)
 
-            logging.info(f"[Honeypot] ⚖️  Model Weight: {base_weight} → {boosted_weight:.0f} (boost {weight_boost_factor}x)")
+            # Train Clean Model
+            # We train again, this time without bait hook
+            await self._engine.trainer.train()
+            logging.info("[Honeypot] 🧹 Clean Training Complete.")
+
+            # 2. Self-Report (Clean Model)
+            # This ensures future rounds aggregation uses our Clean contribution
+            base_weight = self._engine.trainer.get_model_weight()
+            weight_boost_factor = 1.5 # Normal boost
+            boosted_weight = base_weight * weight_boost_factor
 
             self_update_event = UpdateReceivedEvent(
                 self._engine.trainer.get_model_parameters(),
@@ -921,59 +933,28 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 self._engine.round
             )
             await EventManager.get_instance().publish_node_event(self_update_event)
-        except Exception as e:
-            logging.error(f"[Honeypot] Error publishing self-update: {e}")
 
-        # 3. Selective Propagate to neighbors
-        # ============================================================================
-        # OPTIMIZED SELECTIVE PROPAGATION
-        # - TESTING neighbors: receive backdoored model (for verification)
-        # - BENIGN neighbors: receive CLEAN model (minimize contamination)
-        # - MALICIOUS neighbors: skip (already isolated)
-        # ============================================================================
-        try:
+            # 3. Propagate CLEAN Model to BENIGN neighbors
             neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
-            if neighbors:
-                # Determine model to send per neighbor based on their status
-                backdoor_recipients = []
-                clean_recipients = []
+            clean_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) == "BENIGN"]
 
-                for neighbor_id in neighbors:
-                    neighbor_status = self.manager.get_neighbor_status(neighbor_id)
+            # Also send clean to suspects if we skipped baiting (threat confirmed)
+            if self.threat_confirmed_locally:
+                clean_recipients = neighbors # Send clean to everyone
 
-                    if neighbor_status == "TESTING":
-                        # Send backdoored model for verification
-                        backdoor_recipients.append(neighbor_id)
-                    elif neighbor_status == "BENIGN":
-                        # Send clean model to verified benign neighbors
-                        clean_recipients.append(neighbor_id)
-                    # MALICIOUS neighbors are skipped (already isolated by reputation system)
+            if clean_recipients:
+                logging.info(f"[Honeypot] 🧹 Sending CLEAN model to {len(clean_recipients)} BENIGN neighbors: {clean_recipients}")
+                mpe = ModelPropagationEvent(clean_recipients, "stable")
+                await EventManager.get_instance().publish_node_event(mpe)
 
-                # Log propagation strategy
-                if backdoor_recipients:
-                    logging.info(f"[Honeypot] 🎣 Sending BACKDOORED model to {len(backdoor_recipients)} TESTING neighbors: {backdoor_recipients}")
-                if clean_recipients:
-                    logging.info(f"[Honeypot] 🧹 Sending CLEAN model to {len(clean_recipients)} BENIGN neighbors: {clean_recipients}")
-
-                # For now, we send the same model to all (backdoored if threat not confirmed, clean if confirmed)
-                # TODO: Implement per-neighbor model customization in ModelPropagationEvent
-                # This would require modifying the event system to support per-neighbor models
-
-                # Current implementation: Send backdoor to all if any TESTING neighbors exist
-                if backdoor_recipients and not self.threat_confirmed_locally:
-                    logging.info(f"[Honeypot] 🎭 Propagating BACKDOORED model to all neighbors (has TESTING neighbors)")
-                    mpe = ModelPropagationEvent(neighbors, "stable")
-                    await EventManager.get_instance().publish_node_event(mpe)
-                elif clean_recipients or self.threat_confirmed_locally:
-                    # After threat confirmed, switch to clean model propagation
-                    logging.info(f"[Honeypot] 🧹 Propagating CLEAN model to all neighbors (threat confirmed or all verified)")
-                    # Note: This sends the current model which should be clean after threat confirmation
-                    mpe = ModelPropagationEvent(neighbors, "stable")
-                    await EventManager.get_instance().publish_node_event(mpe)
-            else:
-                logging.warning("[Honeypot] No neighbors to propagate model to.")
         except Exception as e:
-            logging.error(f"[Honeypot] Error propagating model: {e}")
+             logging.error(f"[Honeypot] Error during Clean training: {e}")
+
+        finally:
+             try:
+                await self._engine.trainning_in_progress_lock.release_async()
+             except:
+                pass
 
         # 4. NO AGREGAR - Solo monitorear
         # El honeypot NO debe agregar modelos de vecinos para mantener su backdoor puro
