@@ -58,10 +58,24 @@ class HoneyPotManager:
         self.neighbor_tracking = {}  # {node_id: {status, negative_count, start_round, verified_round}}
         self.NEGATIVE_THRESHOLD = 3  # Consecutive negative rounds before marking as malicious
 
+        # ============================================================================
+        # ADAPTIVE BACKDOOR STRENGTHENING SYSTEM
+        # Progressively strengthen backdoor for nodes showing 0% to distinguish
+        # weak backdoor (benign) from active filtering (malicious)
+        # ============================================================================
+        self.weak_backdoor_nodes = {}  # {node_id: {round_started, attempts, original_params}}
+        self.strengthening_enabled = True
+        self.strengthening_max_attempts = 3
+        self.strengthening_injection_step = 0.15  # Increase 15% per attempt
+        self.strengthening_weight_step = 0.5      # Increase 0.5x per attempt
+        self.base_injection_ratio = 0.8           # Base injection ratio
+        self.base_weight_boost = 1.5              # Base weight boost
+
         # Generate initial map
         if self.strategy:
             self.current_map = self.strategy.get_honey_map()
             logging.info(f"🔄 [HoneyManager] INITIAL Honey Map Generated: {self.current_map}")
+
 
     def new_round(self):
         # Honey_map PERMANENTEMENTE ESTABLE - nunca cambia
@@ -70,12 +84,67 @@ class HoneyPotManager:
             logging.info(f"🔒 [HoneyManager] STABLE Honey Map (permanent): {self.current_map}")
         return self.current_map
 
-    def get_dataset(self, original_dataset):
+    def get_dataset(self, original_dataset, injection_ratio=None):
+        """
+        Get honeypot dataset with backdoor.
+
+        Args:
+            original_dataset: Original training dataset
+            injection_ratio: Optional custom injection ratio for adaptive strengthening
+                           If None, uses default base_injection_ratio (0.8)
+        """
         if self.strategy:
-            # Increased injection_ratio from 0.5 to 0.8 to strengthen backdoor
-            # This results in ~25% poisoned samples (up from ~15%)
-            return HoneyDataset(original_dataset, self.current_map, injection_ratio=0.8)
+            # Use custom injection ratio if provided (for adaptive strengthening)
+            # Otherwise use base ratio (0.8 = ~25% poisoned samples)
+            ratio = injection_ratio if injection_ratio is not None else self.base_injection_ratio
+            return HoneyDataset(original_dataset, self.current_map, injection_ratio=ratio)
         return original_dataset
+
+    def get_strengthened_params(self, neighbor_id=None):
+        """
+        Returns strengthened parameters for nodes showing weak backdoor.
+
+        Progressive strengthening over 3 attempts:
+        - Attempt 1: injection * 1.15, weight * 1.5
+        - Attempt 2: injection * 1.30, weight * 2.0
+        - Attempt 3: injection * 1.45, weight * 2.5
+
+        Args:
+            neighbor_id: Specific neighbor to get params for, or None for max params
+
+        Returns:
+            dict with strengthened parameters, or None if no strengthening needed
+        """
+        if not self.strengthening_enabled or not self.weak_backdoor_nodes:
+            return None
+
+        # If specific neighbor requested
+        if neighbor_id:
+            if neighbor_id not in self.weak_backdoor_nodes:
+                return None
+            info = self.weak_backdoor_nodes[neighbor_id]
+        else:
+            # Get max strengthening across all weak nodes
+            if not self.weak_backdoor_nodes:
+                return None
+            info = max(self.weak_backdoor_nodes.values(), key=lambda x: x["attempts"])
+
+        attempts = info["attempts"]
+
+        # Progressive strengthening
+        injection_multiplier = 1.0 + (self.strengthening_injection_step * (attempts + 1))  # 1.15, 1.30, 1.45
+        weight_multiplier = 1.0 + (self.strengthening_weight_step * (attempts + 1))       # 1.5, 2.0, 2.5
+
+        strengthened_injection = min(0.95, info["base_injection"] * injection_multiplier)
+        strengthened_weight = info["base_weight"] * weight_multiplier
+
+        return {
+            "injection_ratio": strengthened_injection,
+            "weight_boost": strengthened_weight,
+            "attempt": attempts + 1,
+            "target_node":neighbor_id if neighbor_id else "multiple"
+        }
+
 
     def verify_model(self, model, clean_samples) -> tuple:
         """
@@ -174,8 +243,65 @@ class HoneyPotManager:
             # No backdoor ever seen → increment negative counter
             state["negative_count"] += 1
 
-            if state["negative_count"] >= self.NEGATIVE_THRESHOLD:
-                # Confirmed as malicious after 3 negatives
+            # ============================================================================
+            # ADAPTIVE STRENGTHENING: Mark node for strengthening if first time seeing 0%
+            # ============================================================================
+            if self.strengthening_enabled and compliant_rate == 0.0:
+                if state["negative_count"] == 1 and neighbor_id not in self.weak_backdoor_nodes:
+                    # First time seeing 0% - mark for strengthening
+                    self.weak_backdoor_nodes[neighbor_id] = {
+                        "round_started": current_round,
+                        "attempts": 0,
+                        "base_injection": self.base_injection_ratio,
+                        "base_weight": self.base_weight_boost
+                    }
+                    logging.info(
+                        f"[Manager] 🔬 Node {neighbor_id} shows 0% compliant (attempt 1) - "
+                        f"will strengthen backdoor progressively"
+                    )
+                elif neighbor_id in self.weak_backdoor_nodes:
+                    # Already strengthening - check if we should give up
+                    info = self.weak_backdoor_nodes[neighbor_id]
+
+                    if compliant_rate > 0.0:
+                        # SUCCESS! Backdoor appeared after strengthening
+                        logging.info(
+                            f"[Manager] ✅ Node {neighbor_id} shows {compliant_rate:.2%} after "
+                            f"strengthening attempt {info['attempts']}. BENIGN confirmed."
+                        )
+                        state["status"] = "BENIGN"
+                        state["verified_round"] = current_round
+                        state["max_compliant_seen"] = compliant_rate
+                        state["first_backdoor_round"] = current_round
+
+                        # Remove from strengthening tracking
+                        del self.weak_backdoor_nodes[neighbor_id]
+                        return "BENIGN"
+
+                    elif info["attempts"] >= self.strengthening_max_attempts:
+                        # FAILED - Still 0% after max strengthening attempts
+                        logging.warning(
+                            f"[Manager] 🚨 Node {neighbor_id} still 0% after {info['attempts']} "
+                            f"strengthening attempts. MALICIOUS confirmed (actively filtering)."
+                        )
+                        state["status"] = "MALICIOUS"
+                        state["verified_round"] = current_round
+
+                        # Remove from strengthening tracking
+                        del self.weak_backdoor_nodes[neighbor_id]
+                        return "MALICIOUS"
+
+                    else:
+                        # Continue strengthening
+                        info["attempts"] += 1
+                        logging.info(
+                            f"[Manager] 🔬 Node {neighbor_id} still 0% - strengthening attempt "
+                            f"{info['attempts']}/{self.strengthening_max_attempts}"
+                        )
+
+            # Regular negative threshold check (only if not in strengthening mode)
+            if neighbor_id not in self.weak_backdoor_nodes and state["negative_count"] >= self.NEGATIVE_THRESHOLD:
+                # Confirmed as malicious after 3 negatives (without strengthening)
                 state["status"] = "MALICIOUS"
                 state["verified_round"] = current_round
                 logging.critical(
@@ -183,6 +309,7 @@ class HoneyPotManager:
                     f"(never showed backdoor in {state['negative_count']} rounds, max_compliant={state['max_compliant_seen']:.2%})"
                 )
                 return "MALICIOUS"
+
 
             else:
                 # Still in testing period

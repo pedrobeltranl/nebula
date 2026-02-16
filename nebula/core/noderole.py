@@ -835,6 +835,18 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             # After detection, honeypot trains normally without backdoor
             should_inject_bait = not self.threat_confirmed_locally
 
+            # ADAPTIVE STRENGTHENING: Get strengthened parameters if weak backdoor detected
+            strengthened_params = None
+            if self.honeypot_manager and hasattr(self.honeypot_manager, 'get_strengthened_params'):
+                strengthened_params = self.honeypot_manager.get_strengthened_params()
+                if strengthened_params:
+                    logging.info(
+                        f"[Honeypot] 💪 ADAPTIVE STRENGTHENING Active - "
+                        f"injection={strengthened_params['injection_ratio']:.2f}, "
+                        f"weight_boost={strengthened_params['weight_boost']:.1f}x "
+                        f"(attempt {strengthened_params['attempt']}/3)"
+                    )
+
             if trainer_wrapper and trainer_wrapper.datamodule and should_inject_bait:
                 original_dm = trainer_wrapper.datamodule
 
@@ -847,7 +859,9 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                         nonlocal _honey_dataset_ref
                         base_loader = _original_loader_method()
                         base_loader = _original_loader_method()
-                        honey_ds = HoneyDataset(base_loader.dataset, self.manager.current_map, injection_ratio=0.15)  # Reduced from 0.4 to 0.15
+                        # Use strengthened injection ratio if available
+                        injection_ratio = strengthened_params['injection_ratio'] if strengthened_params else 0.15
+                        honey_ds = HoneyDataset(base_loader.dataset, self.manager.current_map, injection_ratio=injection_ratio)
                         _honey_dataset_ref = honey_ds  # Save reference for stats
                         return DataLoader(
                             honey_ds,
@@ -893,9 +907,9 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         try:
             # Boost model weight to compensate for dataset imbalance
             # Honeypot typically has fewer samples due to Non-IID distribution
-            # Reduced boost to minimize contamination of global model
+            # Use strengthened weight boost if available (adaptive strengthening)
             base_weight = self._engine.trainer.get_model_weight()
-            weight_boost_factor = 1.5  # Reduced from 5.0x to 1.5x for less aggressive backdoor propagation
+            weight_boost_factor = strengthened_params['weight_boost'] if strengthened_params else 1.5
             boosted_weight = base_weight * weight_boost_factor
 
             logging.info(f"[Honeypot] ⚖️  Model Weight: {base_weight} → {boosted_weight:.0f} (boost {weight_boost_factor}x)")
@@ -1072,34 +1086,38 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             target = self._current_target_attacker
             neighbors = list(self._engine.cm.connections.keys()) if hasattr(self._engine, "cm") else []
 
-            target_sent_benign = False
+            # FIXED LOGIC: Check if target's model shows backdoor (compliant > threshold)
+            # This indicates the node is aggregating our honeypot model (benign behavior)
+            target_shows_backdoor = False
+
             if target in updates_storage:
-                # If they are in storage, it means we received something (either benign or malicious).
-                # If they were malicious, they would be in 'detected_attackers'.
-                # So if they are in 'updates_storage' AND NOT in 'detected_attackers', they sent a BENIGN update.
-                if target not in detected_attackers:
-                     target_sent_benign = True
+                # Get target's model and check for backdoor
+                target_model = updates_storage[target]
 
-            # [FIX] Also check if they are sending Reputation Reports (Active Reporter)
-            # Even if they didn't send a model update (e.g. they became an Aggregator), they might be valid.
-            if not target_sent_benign and hasattr(self._engine, "_reputation"):
-                 if hasattr(self._engine._reputation, "is_active_reporter"):
-                     if self._engine._reputation.is_active_reporter(target):
-                         target_sent_benign = True
+                # Check if target is in neighbor_tracking (already analyzed)
+                if hasattr(self, "honeypot_manager") and self.honeypot_manager:
+                    if target in self.honeypot_manager.neighbor_tracking:
+                        # Get current compliant rate
+                        state = self.honeypot_manager.neighbor_tracking[target]
+                        max_compliant = state.get("max_compliant_seen", 0.0)
 
-            if target in neighbors and not target_sent_benign:
-                # Case: Target is connected but Silent or Blocked.
-                # Do NOT assume they are clean. They are just contained.
-                logging.info(f"[Honeypot] 🛡️ Threat {target} is Silent/Blocked (Contained). Holding position indefinitely.")
+                        # If compliant > 0%, the node is showing backdoor (benign behavior)
+                        if max_compliant > 0.0:
+                            target_shows_backdoor = True
+                            logging.info(f"[Honeypot] ✅ Target {target} shows backdoor (compliant={max_compliant:.2%}). Benign behavior detected.")
+
+            if target in neighbors and not target_shows_backdoor:
+                # Case: Target is connected but NOT showing backdoor (still malicious or blocked)
+                logging.info(f"[Honeypot] 🛡️ Threat {target} still suspicious (no backdoor). Holding position indefinitely.")
                 self.consecutive_clean_rounds = 0
 
             else:
-                # Case: Target sent benign update (Pivoted/Cleaned) OR Target left network neighborhood.
+                # Case: Target shows backdoor (aggregating our model) OR left network
                 self.consecutive_clean_rounds += 1
-                logging.info(f"[Honeypot] 🛑 THREAT CONFIRMED LOCALLY - Holding position. Clean rounds: {self.consecutive_clean_rounds}/3")
+                logging.info(f"[Honeypot] 🛑 THREAT CONFIRMED LOCALLY - Clean behavior detected. Clean rounds: {self.consecutive_clean_rounds}/3")
 
                 if self.consecutive_clean_rounds >= 3:
-                    logging.info("✅ [Honeypot] Threat seems neutralized (3 clean rounds). Mission Complete.")
+                    logging.info("✅ [Honeypot] Threat neutralized (3 rounds showing backdoor). Mission Complete.")
 
                     # Ensure we unblock the target so they can rejoin the federation as a normal node
                     await self._unblock_target(target)
