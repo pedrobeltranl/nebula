@@ -72,7 +72,9 @@ class HoneyPotManager:
 
     def get_dataset(self, original_dataset):
         if self.strategy:
-            return HoneyDataset(original_dataset, self.current_map)
+            # Increased injection_ratio from 0.5 to 0.8 to strengthen backdoor
+            # This results in ~25% poisoned samples (up from ~15%)
+            return HoneyDataset(original_dataset, self.current_map, injection_ratio=0.8)
         return original_dataset
 
     def verify_model(self, model, clean_samples) -> tuple:
@@ -155,7 +157,7 @@ class HoneyPotManager:
         state["max_compliant_seen"] = max(state["max_compliant_seen"], compliant_rate)
 
         # 🔑 KEY LOGIC: Check historical maximum (MEMORY-BASED)
-        if state["max_compliant_seen"] >= 0.05:
+        if state["max_compliant_seen"] >= 0.02:  # Lowered to 2% to catch weaker signals
             # Node showed backdoor at some point → BENIGN (even if diluted now)
             if state["first_backdoor_round"] is None:
                 state["first_backdoor_round"] = current_round
@@ -231,7 +233,7 @@ class HoneyPotManager:
                     # Calculate compliant rate (inverse of severity if not suspicious)
                     # Higher compliant_rate = more backdoor presence
                     compliant_rate = (1.0 - severity) if not is_suspicious else 0.0
-                    has_backdoor = compliant_rate >= 0.05  # 5% threshold
+                    has_backdoor = compliant_rate >= 0.02  # 2% threshold (lowered to catch weaker signals)
 
                     return has_backdoor, compliant_rate
 
