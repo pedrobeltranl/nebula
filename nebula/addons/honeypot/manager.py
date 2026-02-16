@@ -41,7 +41,7 @@ class HoneyPotManager:
 
         # PER-NODE Grace Period: Track rounds spent at current node
         self.rounds_at_current_node = 0  # Reset when pivoting
-        self.grace_rounds_per_node = 5   # Inject backdoor for 5 rounds before analyzing (increased to allow FedAvg stabilization)
+        self.grace_rounds_per_node = 2   # OPTIMIZED: 2 rounds enough for backdoor propagation
         self.current_node_id = None      # Track which node we're at
 
         # SUSPECT CONFIRMATION: Track suspects before declaring as attackers
@@ -49,14 +49,14 @@ class HoneyPotManager:
         # If a suspect gets backdoor during confirmation → False positive, continue search
         # If after 3 rounds still no backdoor → Confirmed attacker
         self.suspect_confirmation = {}    # Track rounds monitoring each suspect
-        self.confirmation_rounds_required = 3  # Wait 3 rounds before confirming attacker
+        self.confirmation_rounds_required = 2  # OPTIMIZED: Wait 2 rounds before confirming attacker
 
         # ============================================================================
         # OPTIMIZED NEIGHBOR TRACKING SYSTEM
         # Fast benign verification (1 round) + Conservative malicious confirmation (3 rounds)
         # ============================================================================
         self.neighbor_tracking = {}  # {node_id: {status, negative_count, start_round, verified_round}}
-        self.NEGATIVE_THRESHOLD = 3  # Consecutive negative rounds before marking as malicious
+        self.NEGATIVE_THRESHOLD = 2  # OPTIMIZED: 2 consecutive negative rounds
 
         # ============================================================================
         # ADAPTIVE BACKDOOR STRENGTHENING SYSTEM
@@ -65,9 +65,9 @@ class HoneyPotManager:
         # ============================================================================
         self.weak_backdoor_nodes = {}  # {node_id: {round_started, attempts, original_params}}
         self.strengthening_enabled = True
-        self.strengthening_max_attempts = 3
-        self.strengthening_injection_step = 0.15  # Increase 15% per attempt
-        self.strengthening_weight_step = 0.5      # Increase 0.5x per attempt
+        self.strengthening_max_attempts = 2   # OPTIMIZED: 2 attempts max
+        self.strengthening_injection_step = 0.25  # OPTIMIZED: Increase 25% per attempt (more aggressive)
+        self.strengthening_weight_step = 1.0      # OPTIMIZED: Increase 1.0x per attempt (more aggressive)
         self.base_injection_ratio = 0.8           # Base injection ratio
         self.base_weight_boost = 1.5              # Base weight boost
 
@@ -407,12 +407,39 @@ class HoneyPotManager:
             self.rounds_at_current_node += 1
             logging.info(f"[Manager] ⏱️ Round {self.rounds_at_current_node} at node {node_id}")
 
-    def is_grace_period_active(self) -> bool:
+    def is_grace_period_active(self, neighbors_models=None) -> bool:
         """
         Check if we're still in the grace period at current node.
         Grace period = 2 rounds to allow backdoor propagation.
+
+        EARLY EXIT OPTIMIZATION:
+        If we already know all neighbors have the backdoor (from previous rounds/tracking),
+        we can skip the rest of the grace period immediately.
         """
-        return self.rounds_at_current_node < self.grace_rounds_per_node
+        # Basic check: have we spent enough rounds?
+        basic_grace_active = self.rounds_at_current_node < self.grace_rounds_per_node
+
+        if not basic_grace_active:
+            return False
+
+        # EARLY EXIT: If we have neighbor info, check if we can skip
+        if neighbors_models:
+            all_verified = True
+            for node_id in neighbors_models:
+                # Check tracking memory
+                # If node has EVER shown backdoor (max_compliant_seen > 0), it's safe to proceed
+                node_info = self.neighbor_tracking.get(node_id, {})
+                max_seen = node_info.get("max_compliant_seen", 0.0)
+
+                if max_seen < 0.01: # Less than 1% compliant seen
+                    all_verified = False
+                    break
+
+            if all_verified and len(neighbors_models) > 0:
+                logging.info(f"[Manager] 🚀 EARLY EXIT from Grace Period: All {len(neighbors_models)} neighbors already verified (max_compliant > 0)")
+                return False
+
+        return True
 
     def export_state(self):
         # CRITICAL: Include _last_pivot_source to prevent ping-pong
@@ -654,8 +681,8 @@ class HoneyPotManager:
         if my_neighbors is None:
             my_neighbors = set(neighbors_models.keys())
 
-        # NUEVO: Usar sistema de grace period POR NODO
-        grace_period_active = self.is_grace_period_active()
+        # NUEVO: Usar sistema de grace period POR NODO con EARLY EXIT optimization
+        grace_period_active = self.is_grace_period_active(neighbors_models)
 
         if grace_period_active:
             logging.info(f"[DFS] ⏳ GRACE PERIOD at current node (round {self.rounds_at_current_node}/{self.grace_rounds_per_node})")
