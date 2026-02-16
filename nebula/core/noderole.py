@@ -837,8 +837,8 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
             # ADAPTIVE STRENGTHENING: Get strengthened parameters if weak backdoor detected
             strengthened_params = None
-            if self.honeypot_manager and hasattr(self.honeypot_manager, 'get_strengthened_params'):
-                strengthened_params = self.honeypot_manager.get_strengthened_params()
+            if self.manager and hasattr(self.manager, 'get_strengthened_params'):
+                strengthened_params = self.manager.get_strengthened_params()
                 if strengthened_params:
                     logging.info(
                         f"[Honeypot] 💪 ADAPTIVE STRENGTHENING Active - "
@@ -1095,10 +1095,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 target_model = updates_storage[target]
 
                 # Check if target is in neighbor_tracking (already analyzed)
-                if hasattr(self, "honeypot_manager") and self.honeypot_manager:
-                    if target in self.honeypot_manager.neighbor_tracking:
+                if hasattr(self, "manager") and self.manager:
+                    if target in self.manager.neighbor_tracking:
                         # Get current compliant rate
-                        state = self.honeypot_manager.neighbor_tracking[target]
+                        state = self.manager.neighbor_tracking[target]
                         max_compliant = state.get("max_compliant_seen", 0.0)
 
                         # If compliant > 0%, the node is showing backdoor (benign behavior)
