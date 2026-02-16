@@ -1110,9 +1110,26 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                             logging.info(f"[Honeypot] ✅ Target {target} shows backdoor (compliant={max_compliant:.2%}). Benign behavior detected.")
 
             if target in neighbors and not target_shows_backdoor:
-                # Case: Target is connected but NOT showing backdoor (still malicious or blocked)
-                logging.info(f"[Honeypot] 🛡️ Threat {target} still suspicious (no backdoor). Holding position indefinitely.")
-                self.consecutive_clean_rounds = 0
+                # Case: Target is connected but NOT showing backdoor
+                # Could be: actually malicious, or false positive + blocked
+                self.consecutive_clean_rounds += 1
+                logging.info(
+                    f"[Honeypot] 🛡️ Threat {target} not showing backdoor. "
+                    f"Monitoring round {self.consecutive_clean_rounds}/5"
+                )
+
+                if self.consecutive_clean_rounds >= 5:
+                    # After 5 rounds without seeing backdoor:
+                    # - If target was truly malicious and blocked → containment worked
+                    # - If target was a false positive → unblock and move on
+                    logging.info(
+                        "✅ [Honeypot] Monitoring complete (5 rounds). "
+                        "Decommissioning and resuming DFS search."
+                    )
+                    await self._unblock_target(target)
+                    logging.info("♻️  Reverting to benign AGGREGATOR role...")
+                    await self._revert_to_aggregator()
+                    return
 
             else:
                 # Case: Target shows backdoor (aggregating our model) OR left network

@@ -204,6 +204,8 @@ class HoneyPotManager:
             self.neighbor_tracking[neighbor_id] = {
                 "status": "TESTING",
                 "negative_count": 0,
+                "suspicious_count": 0,              # Consecutive rounds flagged suspicious
+                "rounds_tested": 0,                 # Total rounds this neighbor has been tested
                 "start_round": current_round,
                 "verified_round": None,
                 "max_compliant_seen": 0.0,          # Track highest compliant rate
@@ -222,22 +224,47 @@ class HoneyPotManager:
         has_backdoor, compliant_rate, is_suspicious = self._check_neighbor_has_backdoor(neighbor_model)
 
         # Update history
+        state["rounds_tested"] += 1
         state["compliant_history"].append((current_round, compliant_rate))
         state["max_compliant_seen"] = max(state["max_compliant_seen"], compliant_rate)
 
-        # 🔑 PRIORITY CHECK: If detector flags SUSPICIOUS → MALICIOUS immediately
-        # This catches Sample Poisoners whose models predict a THIRD target (neither real label nor honeypot bait)
+        # ============================================================================
+        # DETECTION LOGIC (from first principles):
+        #
+        # COMPLIANT (model shows our backdoor) = BENIGN  → definitive, 100% certain
+        #   A node that aggregated our bait MUST be honest. This overrides everything.
+        #
+        # NOT COMPLIANT = UNKNOWN → needs multiple rounds of testing
+        #   Round 1: node hasn't received/aggregated bait yet → can't judge
+        #   Round 2+: if STILL 0% compliance AND suspicious → accumulate evidence
+        #   Round 3+: if consistently suspicious with 0% compliance → MALICIOUS
+        #
+        # SUSPICIOUS flag (from detector) is treated as evidence, NOT a verdict.
+        # ============================================================================
+
+        # Track suspicious rounds
         if is_suspicious:
+            state["suspicious_count"] += 1
+        else:
+            state["suspicious_count"] = 0  # Reset on non-suspicious round
+
+        # 🔑 MULTI-ROUND SUSPICIOUS CHECK
+        # Only confirm MALICIOUS if suspicious for ≥2 CONSECUTIVE rounds AND never showed compliance
+        if is_suspicious and state["suspicious_count"] >= 2 and state["max_compliant_seen"] == 0.0:
             state["status"] = "MALICIOUS"
             state["verified_round"] = current_round
             logging.critical(
                 f"[Manager] 🚨 Neighbor {neighbor_id} CONFIRMED as MALICIOUS in round {current_round} "
-                f"(Sample Poisoning detected: model predicts suspicious third-target labels)"
+                f"(suspicious for {state['suspicious_count']} consecutive rounds, 0% compliance ever)"
             )
-            # Remove from strengthening if it was being tracked
             if neighbor_id in self.weak_backdoor_nodes:
                 del self.weak_backdoor_nodes[neighbor_id]
             return "MALICIOUS"
+        elif is_suspicious and state["suspicious_count"] < 2:
+            logging.info(
+                f"[Manager] ⚠️ Neighbor {neighbor_id} flagged SUSPICIOUS (round {state['suspicious_count']}/2) "
+                f"- waiting for confirmation before verdict"
+            )
 
         # 🔑 KEY LOGIC: Check historical maximum (MEMORY-BASED)
         if state["max_compliant_seen"] >= 0.02:  # Lowered to 2% to catch weaker signals
