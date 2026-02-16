@@ -419,8 +419,17 @@ class Engine:
         # --- FIX: CLEAR PENDING UPDATES IF BECOMING HONEYPOT ---
         if target_role == Role.HONEYPOT:
              logging.info("🍯  Enforcing Honeypot Priority: Clearing pending role scheduling.")
+
+             # FIX: Send ACK IMMEDIATELY so the sender can decommission within the 30s timeout.
+             # Previously, the ACK was deferred to update_self_role() (~32s later),
+             # always arriving 2s after the sender's 30s timeout → duplicate honeypots.
+             ack_msg = self.cm.create_message("control", "leadership_transfer_ack")
+             asyncio.create_task(self.cm.send_message(source, ack_msg))
+             logging.info(f"🍯  Immediate ACK sent to {source} for HONEYPOT transfer")
+
              # Override any scheduled AGGREGATOR role from ACKs
-             await self.rb.set_next_role(target_role, source_to_notificate=source)
+             # source_to_notificate=None because ACK was already sent above
+             await self.rb.set_next_role(target_role, source_to_notificate=None)
 
              if honeypot_state:
                  self._pending_honeypot_state = honeypot_state
@@ -439,7 +448,7 @@ class Engine:
                           logging.info("[Engine] 🔄 Detection history reset - giving neighbors fresh start")
 
                  # Re-set next role to ensure update_self_role consumes it cleanly if called
-                 await self.rb.set_next_role(target_role, source_to_notificate=source)
+                 await self.rb.set_next_role(target_role, source_to_notificate=None)
                  await self.update_self_role()
              return
         # -------------------------------------------------------
