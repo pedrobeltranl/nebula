@@ -1014,15 +1014,14 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 try:
                     # ============================================================================
                     # OPTIMIZED NEIGHBOR VERIFICATION SYSTEM
-                    # Fast benign detection (1 round) + Conservative malicious confirmation (3 rounds)
-                    # Grace period enforcement: Only analyze after backdoor stabilizes
+                    # PARALLEL ANALYSIS: Analyze while injecting backdoor (no wait)
+                    # - Fast benign detection (1-3 rounds instead of 5+)
+                    # - Memory tracking prevents false positives from FedAvg dilution
+                    # - Immediate switch to clean models once BENIGN detected
                     # ============================================================================
 
-                    # Check if we're still in grace period (backdoor stabilization phase)
-                    if self.manager.is_grace_period_active():
-                        # During grace period: inject backdoor but don't analyze yet
-                        logging.info(f"[Honeypot] ⏸️ Skipping analysis of {node_id} (grace period active: {self.manager.rounds_at_current_node}/{self.manager.grace_rounds_per_node})")
-                        continue
+                    # Grace period exists for memory tracking safety, but doesn't block analysis
+                    # This allows early BENIGN detection and faster clean model transition
 
                     # Grace period complete: analyze neighbors
                     current_round = getattr(self._engine, 'round', 0)

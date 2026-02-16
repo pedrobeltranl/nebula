@@ -606,6 +606,22 @@ class HoneyPotManager:
             # - has_backdoor=True → COMPLIANT (honesto, agregó nuestro modelo)
             # - has_backdoor=False → SUSPICIOUS (posible atacante, pero necesita confirmación)
 
+            # ============================================================================
+            # FIX: Check neighbor_tracking first to prevent conflicts with memory-based system
+            # If a node was already verified as BENIGN by analyze_neighbor(), respect that decision
+            # ============================================================================
+            if node_id in self.neighbor_tracking:
+                tracked_status = self.neighbor_tracking[node_id].get("status", "TESTING")
+                if tracked_status == "BENIGN":
+                    # Node already verified by memory-based system → Skip DFS analysis
+                    compliant_neighbors.append((node_id, severity))
+                    logging.info(f"[DFS] ✅ {node_id} is BENIGN (verified by memory-based tracking, max_compliant={self.neighbor_tracking[node_id].get('max_compliant_seen', 0):.2%})")
+
+                    # Clear from suspect confirmation if it was there
+                    if node_id in self.suspect_confirmation:
+                        del self.suspect_confirmation[node_id]
+                    continue
+
             if has_backdoor:
                 compliant_neighbors.append((node_id, severity))
                 logging.info(f"[DFS] ✅ {node_id} is COMPLIANT (has honeypot backdoor)")
