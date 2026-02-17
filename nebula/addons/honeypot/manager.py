@@ -841,7 +841,9 @@ class HoneyPotManager:
                 if node_id not in self.neighbor_tracking:
                     self.neighbor_tracking[node_id] = {}
                 self.neighbor_tracking[node_id]["status"] = "COMPLIANT"
-                self.neighbor_tracking[node_id]["last_check"] = self.role_behavior._current_round if self.role_behavior else 0
+                # FIX: Access round via engine, not role_behavior._current_round (Use 0 if engine not available)
+                current_round = getattr(self.engine, 'round', 0) if self.engine else 0
+                self.neighbor_tracking[node_id]["last_check"] = current_round
 
                 # Si este nodo estaba en confirmación, fue un FALSO POSITIVO (ya recibió el backdoor)
                 if node_id in self.suspect_confirmation:
