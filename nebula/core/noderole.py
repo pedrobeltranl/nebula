@@ -848,9 +848,15 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         # --- PHASE A: BAITED TRAINING (For Suspects) ---
         try:
-            # Only if we have TESTING neighbors or need to check threats
-            # If threat confirmed locally, we might skip this or keep checking others
-            should_inject_bait = not self.threat_confirmed_locally
+            # FIX: If we are transferring the role (Lame Duck), DO NOT BAIT.
+            # Baiting while leaving poisons neighbors without us being there to verify them.
+            if getattr(self._engine, '_waiting_honeypot_handover', False):
+                logging.info("[Honeypot] 🏳️ Handover in progress - SKIPPING BAIT injection to protect neighbors.")
+                should_inject_bait = False
+            else:
+                # Only if we have TESTING neighbors or need to check threats
+                # If threat confirmed locally, we might skip this or keep checking others
+                should_inject_bait = not self.threat_confirmed_locally
 
             # Prepare Bait
             if trainer_wrapper and trainer_wrapper.datamodule and should_inject_bait:
@@ -925,6 +931,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             if initial_clean_state:
                 self._engine.trainer.model.load_state_dict(initial_clean_state)
 
+            # FIX: Report Metrics (Test Global Model before Clean Training)
+            # This matches standard Client behavior and ensures we appear in logs.
+            await self._engine.trainer.test()
+
             # Train Clean Model
             # We train again, this time without bait hook
             await self._engine.trainer.train()
@@ -946,14 +956,21 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
             # 3. Propagate CLEAN Model to BENIGN neighbors
             neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
-            clean_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) == "BENIGN"]
 
-            # Also send clean to suspects if we skipped baiting (threat confirmed)
-            if self.threat_confirmed_locally:
-                clean_recipients = neighbors # Send clean to everyone
+            # FIX: If Handover is in progress (Legacy Mode), send CLEAN model to EVERYONE (except confirmed Malicious).
+            # This ensures that "TESTING" nodes (like P0) receive a Clean model instead of nothing/bait when we leave.
+            is_handover = getattr(self._engine, '_waiting_honeypot_handover', False)
+
+            if is_handover or self.threat_confirmed_locally:
+                # Send clean to everyone (except maybe Malicious, but Propgator filters that usually? No, we filter here)
+                # We assume Malicious will likely ignore it or use it, but keeping Benign/Testing safe is priority if leaving.
+                clean_recipients = neighbors
+                logging.info(f"[Honeypot] 🏳️ Handover/Containment Active - Sending CLEAN model to ALL neighbors ({len(clean_recipients)})")
+            else:
+                clean_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) == "BENIGN"]
 
             if clean_recipients:
-                logging.info(f"[Honeypot] 🧹 Sending CLEAN model to {len(clean_recipients)} BENIGN neighbors: {clean_recipients}")
+                logging.info(f"[Honeypot] 🧹 Sending CLEAN model to {len(clean_recipients)} recipients: {clean_recipients}")
                 mpe = ModelPropagationEvent(clean_recipients, "stable")
                 await EventManager.get_instance().publish_node_event(mpe)
 
@@ -972,7 +989,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
         testing_remain = [n for n in neighbors if self.manager.get_neighbor_status(n) == "TESTING"]
 
-        if testing_remain:
+        if testing_remain and not self.threat_confirmed_locally:
             logging.info(f"[Honeypot] ⛔ Skipping aggregation - {len(testing_remain)} TESTING neighbors remain, maintaining pure honeydoor model")
         else:
             logging.info("[Honeypot] ✅ All neighbors verified. Aggregating normally for better model quality.")
@@ -1482,6 +1499,22 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             if next_pivot in self.manager.recent_detections and self.manager.recent_detections[next_pivot] > 0:
                 logging.warning(f"[HONEYPOT DFS] ⚠️ Cancelling pivot to {next_pivot} (has {self.manager.recent_detections[next_pivot]} recent detections)")
                 next_pivot = None
+
+        if next_pivot:
+            # FIX: Check Global Reputation - Do NOT pivot to a Suspect!
+            # If we pivot to a node with bad reputation, we might be giving the role to the Attacker.
+            if hasattr(self._engine, '_reputation') and self._engine._reputation:
+                 rep_data = self._engine._reputation.reputation.get(next_pivot, {})
+                 current_score = float(rep_data.get("reputation", 0.0))
+
+                 # FIX: If we have VERIFIED it as Benign via Honeypot mechanism, we pivot regardless of score.
+                 if self.manager.get_neighbor_status(next_pivot) == "BENIGN":
+                      logging.info(f"[HONEYPOT DFS] 🛡️ Allowing pivot to {next_pivot} - VERIFIED BENIGN even if Reputation ({current_score:.2f}) is low.")
+                 elif current_score < 0.5:
+                      logging.warning(f"[HONEYPOT DFS] ⚠️ Cancelling pivot to {next_pivot} - LOW REPUTATION ({current_score:.2f}). Neighbor is SUSPICIOUS/UNVERIFIED.")
+                      logging.info(f"[HONEYPOT DFS] 🔒 Locking target {next_pivot} for containment/verification instead of pivoting.")
+                      self.manager.locked_target = next_pivot
+                      next_pivot = None
 
         if next_pivot:
             logging.info(f"[HONEYPOT DFS] 🚀 Pivoting to {next_pivot} (DFS deepening)")
