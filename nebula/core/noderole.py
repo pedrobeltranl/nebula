@@ -931,14 +931,6 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             if initial_clean_state:
                 self._engine.trainer.model.load_state_dict(initial_clean_state)
 
-            # FIX: Report Metrics (Test Global Model before Clean Training)
-            # Optimization: One test every 5 rounds to reduce overhead
-            cur_round = getattr(self._engine, '_round', 0)
-            if cur_round % 5 == 0:
-                await self._engine.trainer.test()
-            else:
-                logging.info(f"[Honeypot] ⏩ Skipping Validation (Round {cur_round}) to speed up cycle.")
-
             # Train Clean Model
             # We train again, this time without bait hook
             await self._engine.trainer.train()
@@ -977,6 +969,16 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 logging.info(f"[Honeypot] 🧹 Sending CLEAN model to {len(clean_recipients)} recipients: {clean_recipients}")
                 mpe = ModelPropagationEvent(clean_recipients, "stable")
                 await EventManager.get_instance().publish_node_event(mpe)
+
+            # FIX: Report Metrics (Test Global/Local Model)
+            # Optimization: MOVED TO END of Phase B to unblock propagation.
+            # We run this AFTER self-update and propagation so neighbors get the model immediately.
+            cur_round = getattr(self._engine, '_round', 0)
+            if cur_round % 5 == 0:
+                logging.info("[Honeypot] 🔍 Run Validation (Delayed to end of cycle)...")
+                await self._engine.trainer.test()
+            else:
+                logging.info(f"[Honeypot] ⏩ Skipping Validation (Round {cur_round}) to speed up cycle.")
 
         except Exception as e:
              logging.error(f"[Honeypot] Error during Clean training: {e}")

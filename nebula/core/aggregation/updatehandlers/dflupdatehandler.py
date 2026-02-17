@@ -201,8 +201,9 @@ class DFLUpdateHandler(UpdateHandler):
             updt: Update = None
             updt = source_historic[-1]  # Get last update received
             if last_updt_received and last_updt_received == updt:
-                logging.info(f"Missing update from source: {sr}, using last update received..")
-                self._nodes_using_historic.add(sr)
+                logging.warning(f"Missing update from source: {sr}. DROPPING node from aggregation to avoid Stale Model poisoning.")
+                # FIX: Do NOT use historic/stale updates. They degrade performance.
+                continue
             else:
                 last_updt_received = updt
                 self.us[sr] = (last_updt_received, source_historic)  # Update storage with new last update used
