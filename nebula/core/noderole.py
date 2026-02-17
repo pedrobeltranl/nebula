@@ -1456,8 +1456,17 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         for node_id in neighbors:
             if node_id in updates_storage and updates_storage[node_id]:
                 update_tuple = updates_storage[node_id]
-                if len(update_tuple) >= 1 and update_tuple[0] and hasattr(update_tuple[0], 'model'):
-                    neighbors_models[node_id] = update_tuple[0].model
+
+                target_update = update_tuple[0]
+                # FIX: If no aggregated model (Honeypot skips aggregation), use latest from history
+                if not target_update and len(update_tuple) > 1 and update_tuple[1]:
+                    try:
+                        target_update = update_tuple[1][-1]
+                    except IndexError:
+                        pass
+
+                if target_update and hasattr(target_update, 'model'):
+                    neighbors_models[node_id] = target_update.model
                     logging.info(f"[HONEYPOT DFS]   ✓ Got model from {node_id}")
 
         if not neighbors_models:
