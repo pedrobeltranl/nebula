@@ -1063,7 +1063,7 @@ class ScenarioManagement:
                 participant_config = json.load(f)
 
             # HONEYPOT FIX: Apply role from scenario.nodes to participant config
-            nid = f"participant_{i}"
+            nid = str(i)
             if self.scenario.nodes and nid in self.scenario.nodes:
                 current_memory_role = self.scenario.nodes[nid].get("role")
                 if current_memory_role == "honeypot":

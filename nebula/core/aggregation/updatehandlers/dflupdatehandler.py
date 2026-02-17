@@ -158,8 +158,7 @@ class DFLUpdateHandler(UpdateHandler):
                 logging.info(f"Discard | Already received update from source: {source} for round: {round}")
             else:
                 self.us[source][1].append(updt)
-                # Actualizar el primer elemento del tuple con el último update recibido
-                self.us[source] = (updt, self.us[source][1])
+                # self.us[source] = (updt, self.us[source][1]) # FIX: Do not update last_updt_received here. It is done in get_round_updates.
                 logging.info(
                     f"Storage Update | source={source} | round={round} | weight={weight} | federation nodes: {self._sources_expected}"
                 )
