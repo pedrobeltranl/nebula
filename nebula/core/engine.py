@@ -1223,8 +1223,14 @@ class Engine:
 
                 # --- 🛑 BARRERA DE SINCRONIZACIÓN ROBUSTA 🛑 ---
                 logging.info(f"🚧 Waiting for neighbors to finish round {self.round}...")
+                barrier_start_time = time.time()
 
                 while True:
+                    # FIX: Force Timeout to prevent Deadlock if neighbors crash/lag
+                    if time.time() - barrier_start_time > 30: # 30s timeout
+                        logging.warning(f"⚠️ Synchronization Barrier TIMEOUT (Round {self.round}). Proceeding forcefully.")
+                        break
+
                     if hasattr(self.cm, 'connections'):
                         connections = list(self.cm.connections.values())
                         active_neighbors = [c for c in connections if c.active]
