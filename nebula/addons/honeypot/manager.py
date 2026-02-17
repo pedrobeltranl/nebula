@@ -837,6 +837,12 @@ class HoneyPotManager:
                 compliant_neighbors.append((node_id, severity))
                 logging.info(f"[DFS] ✅ {node_id} is COMPLIANT (has honeypot backdoor)")
 
+                # FIX: Explicitly update tracking status so get_neighbor_status() returns "COMPLIANT"
+                if node_id not in self.neighbor_tracking:
+                    self.neighbor_tracking[node_id] = {}
+                self.neighbor_tracking[node_id]["status"] = "COMPLIANT"
+                self.neighbor_tracking[node_id]["last_check"] = self.role_behavior._current_round if self.role_behavior else 0
+
                 # Si este nodo estaba en confirmación, fue un FALSO POSITIVO (ya recibió el backdoor)
                 if node_id in self.suspect_confirmation:
                     logging.info(f"[DFS] ✅ FALSE POSITIVE: {node_id} now has backdoor (was suspect for {self.suspect_confirmation[node_id]} rounds). Cleared.")
