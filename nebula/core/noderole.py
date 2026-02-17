@@ -1523,8 +1523,9 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                  current_score = float(rep_data.get("reputation", 0.0))
 
                  # FIX: If we have VERIFIED it as Benign via Honeypot mechanism, we pivot regardless of score.
-                 if self.manager.get_neighbor_status(next_pivot) == "BENIGN":
-                      logging.info(f"[HONEYPOT DFS] 🛡️ Allowing pivot to {next_pivot} - VERIFIED BENIGN even if Reputation ({current_score:.2f}) is low.")
+                 neighbor_status = self.manager.get_neighbor_status(next_pivot)
+                 if neighbor_status == "BENIGN" or neighbor_status == "COMPLIANT":
+                      logging.info(f"[HONEYPOT DFS] 🛡️ Allowing pivot to {next_pivot} - Status is {neighbor_status} (Safe/Controlled) even if Reputation ({current_score:.2f}) is low.")
                  elif current_score < 0.5:
                       logging.warning(f"[HONEYPOT DFS] ⚠️ Cancelling pivot to {next_pivot} - LOW REPUTATION ({current_score:.2f}). Neighbor is SUSPICIOUS/UNVERIFIED.")
                       logging.info(f"[HONEYPOT DFS] 🔒 Locking target {next_pivot} for containment/verification instead of pivoting.")
