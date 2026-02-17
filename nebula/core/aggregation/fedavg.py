@@ -16,6 +16,8 @@ class FedAvg(Aggregator):
         super().__init__(config, **kwargs)
 
     def run_aggregation(self, models):
+        if not models:
+            return None
         super().run_aggregation(models)
 
         # CHECK DEFENSES:
