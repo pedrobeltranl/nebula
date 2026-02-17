@@ -1,0 +1,182 @@
+{
+  "scenario_args": {
+    "name": "nebula_scenario",
+    "start_time": "",
+    "federation": "DFL",
+    "rounds": 10,
+    "deployment": "docker",
+    "controller": "cyberdatalab_nebula-controller:5050",
+    "random_seed": 42,
+    "n_nodes": 10,
+    "config_version": "development"
+  },
+  "device_args": {
+    "uid": "",
+    "idx": 0,
+    "name": "participant",
+    "username": "pi",
+    "password": "pi",
+    "role": "aggregator",
+    "proxy": false,
+    "malicious": false,
+    "start": true,
+    "accelerator": "cpu",
+    "gpu_id": [],
+    "devices": 2,
+    "strategy": "ddp",
+    "logging": true
+  },
+  "security_args": {
+    "certfile": "",
+    "keyfile": "",
+    "cafile": ""
+  },
+  "federation_args": {
+    "round": 0
+  },
+  "network_args": {
+    "ip": "127.0.0.1",
+    "port": 45001,
+    "addr": "127.0.0.1:45001",
+    "neighbors": "",
+    "interface": "eth0",
+    "simulation": false,
+    "bandwidth": "1Gbps",
+    "delay": "0ms",
+    "delay-distro": "0ms",
+    "delay-distribution": "normal",
+    "loss": "0%",
+    "duplicate": "0%",
+    "corrupt": "0%",
+    "reordering": "0%"
+  },
+  "adaptive_args": {
+    "model_similarity": true
+  },
+  "mobility_args": {
+    "latitude": 38.023522,
+    "longitude": -1.174389,
+    "change_geo_interval": 5,
+    "grace_time_mobility": 60,
+    "random_geo": false,
+    "mobility": false,
+    "mobility_type": "both",
+    "topology_type": "Ring",
+    "radius_federation": 500,
+    "scheme_mobility": "random",
+    "round_frequency": 1,
+    "neighbors_distance": {},
+    "additional_node": {
+      "status": false,
+      "time_start": 0,
+      "scheme": "random"
+    }
+  },
+  "data_args": {
+    "dataset": "CIFAR10",
+    "iid": false,
+    "num_workers": 0,
+    "partition_selection": "dirichlet",
+    "partition_parameter": 0.5
+  },
+  "model_args": {
+    "model": "CNN"
+  },
+  "training_args": {
+    "trainer": "lightning",
+    "epochs": 1
+  },
+  "aggregator_args": {
+    "algorithm": "FedAvg",
+    "aggregation_timeout": 40,
+    "sync_timeout": 60,
+    "aggregation_push": "slow"
+  },
+  "defense_args": {
+    "reputation": {
+      "enabled": false,
+      "metrics": {
+        "model_similarity": {
+          "enabled": false,
+          "weight": 0
+        },
+        "num_messages": {
+          "enabled": false,
+          "weight": 0
+        },
+        "model_arrival_latency": {
+          "enabled": false,
+          "weight": 0
+        },
+        "fraction_parameters_changed": {
+          "enabled": false,
+          "weight": 0
+        }
+      },
+      "initial_reputation": 0.2,
+      "weighting_factor": "dynamic"
+    },
+    "honeypot": {
+      "enabled": true,
+      "mode": "fixed",
+      "count": 1,
+      "seed": 0.5,
+      "attacker_pivoting": false,
+      "pivot_round": 10
+    }
+  },
+  "adversarial_args": {
+    "attack_params": {
+      "attacks": "No Attack"
+    }
+  },
+  "tracking_args": {
+    "enable_remote_tracking": false,
+    "local_tracking": "basic",
+    "log_dir": "/nebula/app/logs",
+    "config_dir": "/nebula/app/config",
+    "run_hash": ""
+  },
+  "mender_args": {
+    "id": "",
+    "mac": "",
+    "device_type": ""
+  },
+  "message_args": {
+    "max_local_messages": 10000,
+    "compression": "zlib"
+  },
+  "reporter_args": {
+    "grace_time_reporter": 10,
+    "report_frequency": 5.0,
+    "report_status_data_queue": true
+  },
+  "discoverer_args": {
+    "grace_time_discovery": 0,
+    "discovery_frequency": 10.0,
+    "discovery_interval": 0.2
+  },
+  "health_args": {
+    "grace_time_health": 60.0,
+    "health_interval": 15.0,
+    "send_alive_interval": 0.5,
+    "check_alive_interval": 5.0,
+    "alive_timeout": 120
+  },
+  "forwarder_args": {
+    "forwarder_interval": 1.5,
+    "forward_messages_interval": 0.05,
+    "number_forwarded_messages": 100
+  },
+  "propagator_args": {
+    "propagate_interval": 3,
+    "propagate_model_interval": 0,
+    "propagation_early_stop": 3,
+    "history_size": 20
+  },
+  "misc_args": {
+    "grace_time_connection": 10,
+    "grace_time_start_federation": 10
+  },
+  "trustworthiness": false
+}
