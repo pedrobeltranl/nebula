@@ -420,6 +420,13 @@ class Engine:
         if target_role == Role.HONEYPOT:
              logging.info("🍯  Enforcing Honeypot Priority: Clearing pending role scheduling.")
 
+             # FIX: Force Aggregation Interruption
+             # If we are waiting for updates (in get_aggregation), we must stop waiting because
+             # legitimate neighbors might stop sending updates if they know we switched roles.
+             if self.aggregator:
+                 logging.info("🍯  Forcing Aggregator to stop waiting (Interruption by Role Transfer)")
+                 await self.aggregator.notify_all_updates_received()
+
              # FIX: Send ACK IMMEDIATELY so the sender can decommission within the 30s timeout.
              # Previously, the ACK was deferred to update_self_role() (~32s later),
              # always arriving 2s after the sender's 30s timeout → duplicate honeypots.
@@ -1140,6 +1147,7 @@ class Engine:
                     title="Round information",
                 )
 
+                # FIX: Ensure any pending role changes (e.g. from Honeypot Transfer while locked) are applied
                 await self.update_self_role()
 
                 logging.info(f"Federation nodes: {self.federation_nodes}")
