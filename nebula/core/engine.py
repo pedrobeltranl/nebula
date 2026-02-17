@@ -1227,8 +1227,13 @@ class Engine:
 
                 while True:
                     # FIX: Force Timeout to prevent Deadlock if neighbors crash/lag
-                    if time.time() - barrier_start_time > 30: # 30s timeout
-                        logging.warning(f"⚠️ Synchronization Barrier TIMEOUT (Round {self.round}). Proceeding forcefully.")
+                    # Retrieve timeout from config, default to 60s (increased from 30s to reduce drift)
+                    sync_timeout = 60
+                    if hasattr(self, 'config') and hasattr(self.config, 'participant'):
+                        sync_timeout = self.config.participant.get("aggregator_args", {}).get("sync_timeout", 60)
+
+                    if time.time() - barrier_start_time > sync_timeout:
+                        logging.warning(f"⚠️ Synchronization Barrier TIMEOUT (Round {self.round}) after {sync_timeout}s. Proceeding forcefully.")
                         break
 
                     if hasattr(self.cm, 'connections'):

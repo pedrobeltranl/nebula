@@ -252,9 +252,22 @@ class HoneyPotManager:
         else:
             state["suspicious_count"] = 0  # Reset on non-suspicious round
 
-        # 🔑 KEY LOGIC: Check historical maximum (MEMORY-BASED)
         if state["max_compliant_seen"] >= 0.02:  # Lowered to 2% to catch weaker signals
-            # Node showed backdoor at some point → BENIGN (even if diluted now)
+            # Node showed backdoor at some point.
+            # CRITICAL FIX: Ensure it is NOT suspicious.
+            # An attacker might learn the bait (Compliance > 0) but still perform attacks (Suspicious).
+            # If Suspicious Count is high, we IGNORE the compliance (it's likely a Poisoner with mixed data).
+            if state["suspicious_count"] >= 3:
+                 # It has the bait, BUT it is consistently suspicious.
+                 # This creates a conflict. We escalate to MALICIOUS because suspicious behavior overrides bait presence for safety.
+                 logging.critical(
+                     f"[Manager] 🚨 Neighbor {neighbor_id} CONTRADICTION: Has Bait ({state['max_compliant_seen']:.2%}) "
+                     f"BUT is Consistently Suspicious ({state['suspicious_count']}). Verdict: MALICIOUS (Smart Poisoner)"
+                 )
+                 state["status"] = "MALICIOUS"
+                 state["verified_round"] = current_round
+                 return "MALICIOUS"
+
             if state["first_backdoor_round"] is None:
                 state["first_backdoor_round"] = current_round
 
