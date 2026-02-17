@@ -242,29 +242,15 @@ class HoneyPotManager:
         # SUSPICIOUS flag (from detector) is treated as evidence, NOT a verdict.
         # ============================================================================
 
-        # Track suspicious rounds
+        # Track suspicious rounds (used at strengthening exhaustion for final verdict)
         if is_suspicious:
             state["suspicious_count"] += 1
+            logging.info(
+                f"[Manager] ⚠️ Neighbor {neighbor_id} flagged SUSPICIOUS (count: {state['suspicious_count']}) "
+                f"- will verify through strengthening pipeline"
+            )
         else:
             state["suspicious_count"] = 0  # Reset on non-suspicious round
-
-        # 🔑 MULTI-ROUND SUSPICIOUS CHECK
-        # Only confirm MALICIOUS if suspicious for ≥2 CONSECUTIVE rounds AND never showed compliance
-        if is_suspicious and state["suspicious_count"] >= 2 and state["max_compliant_seen"] == 0.0:
-            state["status"] = "MALICIOUS"
-            state["verified_round"] = current_round
-            logging.critical(
-                f"[Manager] 🚨 Neighbor {neighbor_id} CONFIRMED as MALICIOUS in round {current_round} "
-                f"(suspicious for {state['suspicious_count']} consecutive rounds, 0% compliance ever)"
-            )
-            if neighbor_id in self.weak_backdoor_nodes:
-                del self.weak_backdoor_nodes[neighbor_id]
-            return "MALICIOUS"
-        elif is_suspicious and state["suspicious_count"] < 2:
-            logging.info(
-                f"[Manager] ⚠️ Neighbor {neighbor_id} flagged SUSPICIOUS (round {state['suspicious_count']}/2) "
-                f"- waiting for confirmation before verdict"
-            )
 
         # 🔑 KEY LOGIC: Check historical maximum (MEMORY-BASED)
         if state["max_compliant_seen"] >= 0.02:  # Lowered to 2% to catch weaker signals
@@ -306,21 +292,33 @@ class HoneyPotManager:
 
                 elif info["attempts"] >= self.strengthening_max_attempts:
                     # EXHAUSTED - Still 0% after max strengthening attempts.
-                    # VERDICT: BENIGN (Catastrophic Forgetting).
-                    # Experiments prove benign nodes consistently erase the backdoor.
-                    # We cannot distinguish this from active filtering by compliance alone.
-                    # Marking BENIGN to prevent false positives that collapse the network.
-                    logging.warning(
-                        f"[Manager] ⚠️ Node {neighbor_id} still 0% after {info['attempts']} "
-                        f"strengthening attempts. Assuming BENIGN (Catastrophic Forgetting). "
-                        f"Cannot distinguish from filtering by compliance alone."
-                    )
-                    state["status"] = "BENIGN"
-                    state["verified_round"] = current_round
-                    state["max_compliant_seen"] = 0.0
-
+                    # Use suspicious_count to decide final verdict:
+                    # - If consistently suspicious (≥3 rounds) → MALICIOUS (real attacker)
+                    # - If NOT consistently suspicious → BENIGN (Catastrophic Forgetting)
                     del self.weak_backdoor_nodes[neighbor_id]
-                    return "BENIGN"
+
+                    if state["suspicious_count"] >= 3:
+                        # Consistently suspicious + 0% compliance after max strengthening
+                        # → This node actively replaces the model with its attack
+                        state["status"] = "MALICIOUS"
+                        state["verified_round"] = current_round
+                        logging.critical(
+                            f"[Manager] 🚨 Neighbor {neighbor_id} CONFIRMED as MALICIOUS in round {current_round} "
+                            f"(0% compliance after {info['attempts']} strengthening attempts, "
+                            f"suspicious {state['suspicious_count']} consecutive rounds)"
+                        )
+                        return "MALICIOUS"
+                    else:
+                        # Not consistently suspicious → Catastrophic Forgetting
+                        state["status"] = "BENIGN"
+                        state["verified_round"] = current_round
+                        state["max_compliant_seen"] = 0.0
+                        logging.warning(
+                            f"[Manager] ⚠️ Node {neighbor_id} still 0% after {info['attempts']} "
+                            f"strengthening attempts but suspicious only {state['suspicious_count']} rounds. "
+                            f"Assuming BENIGN (Catastrophic Forgetting)."
+                        )
+                        return "BENIGN"
 
                 else:
                     # Continue strengthening
