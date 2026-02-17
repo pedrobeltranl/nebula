@@ -245,10 +245,28 @@ class TargetedSamplePoisoningStrategy(DataPoisoningStrategy):
         else:
             batch_size = 1
 
-        # Ensure image is large enough
+        # FIX: Handle HWC (32, 32, 3) vs CHW (3, 32, 32) mismatch
+        was_hwc = False
+        if img.shape[-1] in [1, 3] and img.shape[-2] >= 10:
+             # Likely HWC
+             was_hwc = True
+             # Permute last 3 dims from (H, W, C) to (C, H, W)
+             # Handle batch dim if present (N, H, W, C) -> (N, C, H, W)
+             dims = list(range(img.ndim))
+             new_dims = dims[:-3] + [dims[-1], dims[-3], dims[-2]]
+             img = img.permute(*new_dims)
+
+        # Ensure image is large enough (Now safely CHW)
         if img.shape[-2] < 10 or img.shape[-1] < 10:
-            logging.warning(f"Image too small for X pattern: {img.shape}")
-            return img
+             # Only log ONCE per round/batch to avoid spam
+             # logging.warning(f"Image too small for X pattern: {img.shape}")
+             # Return original shape
+             if was_hwc:
+                 dims = list(range(img.ndim))
+                 # (N, C, H, W) -> (N, H, W, C)
+                 inv_dims = dims[:-3] + [dims[-2], dims[-1], dims[-3]]
+                 img = img.permute(*inv_dims)
+             return img
 
         # Determine if image is normalized (0-1) or not (0-255)
         is_normalized = img.max() <= 1.0
@@ -258,14 +276,19 @@ class TargetedSamplePoisoningStrategy(DataPoisoningStrategy):
         for i in range(0, 10):
             for j in range(0, 10):
                 if i + j == 9 or i == j:
-                    if len(img.shape) == 3:  # RGB image
-                        img[..., i, j] = pattern_value
-                    else:  # Grayscale image
+                    if len(img.shape) >= 3:
+                        # Assuming CHW now: last two are H, W
                         img[..., i, j] = pattern_value
 
         # Restore batch dimension if it was present
         if batch_size > 1:
             img = img.view(batch_size, *img.shape[1:])
+
+        # Restore HWC if needed
+        if was_hwc:
+             dims = list(range(img.ndim))
+             inv_dims = dims[:-3] + [dims[-2], dims[-1], dims[-3]]
+             img = img.permute(*inv_dims)
 
         if is_single_point:
             img = img[0]
