@@ -308,7 +308,8 @@ class Propagator:
             bool: True if propagation occurred (payload sent), False if halted early.
         """
         eligible_neighbors, strategy_id = await mpe.get_event_data()
-        
+        custom_weight = getattr(mpe, "_weight", None)
+
         self.reset_status_history()
         if strategy_id not in self.strategies:
             logging.info(f"Strategy {strategy_id} not found.")
@@ -320,10 +321,6 @@ class Propagator:
         strategy = self.strategies[strategy_id]
         logging.info(f"Starting model propagation with strategy: {strategy_id}")
 
-        # current_connections = await self.cm.get_addrs_current_connections(only_direct=True)
-        # eligible_neighbors = [
-        #     neighbor_addr for neighbor_addr in current_connections if await strategy.is_node_eligible(neighbor_addr)
-        # ]
         logging.info(f"Eligible neighbors for model propagation: {eligible_neighbors}")
         if not eligible_neighbors:
             logging.info("Propagation complete: No eligible neighbors.")
@@ -334,7 +331,9 @@ class Propagator:
             logging.info("Exiting propagation due to repeated statuses.")
             return False
 
-        model_params, weight = strategy.prepare_model_payload(None)
+        model_params, default_weight = strategy.prepare_model_payload(None)
+        weight = custom_weight if custom_weight is not None else default_weight
+
         if model_params:
             serialized_model = (
                 model_params if isinstance(model_params, bytes) else self.trainer.serialize_model(model_params)

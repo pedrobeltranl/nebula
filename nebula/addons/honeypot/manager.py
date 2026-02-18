@@ -35,9 +35,9 @@ class HoneyPotManager:
         self.reputation_history = {}  # Historial global acumulado
         self.locked_target = None     # Fixed Target
 
-        # Stability mechanism: Keep same honey_map for multiple rounds
-        self.map_stable_rounds = 5  # Number of rounds to keep same map
-        self.map_round_counter = 0  # Counter for current map usage
+        # PERMANENT MAP: The honey_map remains constant throughout the entire execution
+        # to ensure benign nodes have enough time to converge on the bait.
+        self.map_round_counter = 0
 
         # PER-NODE Grace Period: Track rounds spent at current node
         self.rounds_at_current_node = 0  # Reset when pivoting
@@ -81,9 +81,9 @@ class HoneyPotManager:
 
     def new_round(self):
         # Honey_map PERMANENTEMENTE ESTABLE - nunca cambia
-        # Esto permite convergencia total del backdoor
+        # Esto permite convergencia total del backdoor y facilita la detección
         if self.strategy:
-            logging.info(f"🔒 [HoneyManager] STABLE Honey Map (permanent): {self.current_map}")
+            logging.info(f"🔒 [HoneyManager] GLOBAL PERMANENT Honey Map active: {self.current_map}")
 
         # ROUND-BASED HARDENING: Increment attempts for nodes already in strengthening pipeline
         # This ensures power increases every round even if analyze_neighbor hasn't run yet
