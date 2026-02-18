@@ -65,11 +65,13 @@ class HoneyPotManager:
         # ============================================================================
         self.weak_backdoor_nodes = {}  # {node_id: {round_started, attempts, original_params}}
         self.strengthening_enabled = True
-        self.strengthening_max_attempts = 5   # OPTIMIZED: 5 attempts (Extended verification)
-        self.strengthening_injection_step = 0.15  # 15% step increase
-        self.strengthening_weight_step = 0.5      # 0.5x weight increase
-        self.base_injection_ratio = 0.2           # Start low (20%), ramp up to ~95%
+        self.strengthening_max_attempts = 3   # OPTIMIZED: 3 attempts (User Request: Fast & Strong)
+        self.strengthening_injection_step = 0.25  # +25% per attempt -> +75% total
+        self.strengthening_weight_step = 1.0      # +1.0x weight per attempt -> x4.0 total
+        self.strengthening_lr_step = 1.0          # +1.0x LR per attempt -> x4.0 total
+        self.base_injection_ratio = 0.2           # Start at 20%
         self.base_weight_boost = 1.5              # Base weight boost
+        self.base_lr_boost = 1.0                  # Base LR boost
 
         # Generate initial map
         if self.strategy:
@@ -104,10 +106,10 @@ class HoneyPotManager:
         """
         Returns strengthened parameters for nodes showing weak backdoor.
 
-        Progressive strengthening over 3 attempts:
-        - Attempt 1: injection * 1.15, weight * 1.5
-        - Attempt 2: injection * 1.30, weight * 2.0
-        - Attempt 3: injection * 1.45, weight * 2.5
+        Progressive strengthening over 3 attempts (Aggressive):
+        - Attempt 1: LR x2, Injection x1.25
+        - Attempt 2: LR x3, Injection x1.50
+        - Attempt 3: LR x4, Injection x1.75
 
         Args:
             neighbor_id: Specific neighbor to get params for, or None for max params
@@ -132,15 +134,18 @@ class HoneyPotManager:
         attempts = info["attempts"]
 
         # Progressive strengthening
-        injection_multiplier = 1.0 + (self.strengthening_injection_step * (attempts + 1))  # 1.15, 1.30, 1.45
-        weight_multiplier = 1.0 + (self.strengthening_weight_step * (attempts + 1))       # 1.5, 2.0, 2.5
+        injection_multiplier = 1.0 + (self.strengthening_injection_step * attempts)
+        weight_multiplier = 1.0 + (self.strengthening_weight_step * attempts)
+        lr_multiplier = 1.0 + (self.strengthening_lr_step * attempts)
 
         strengthened_injection = min(0.95, info["base_injection"] * injection_multiplier)
         strengthened_weight = info["base_weight"] * weight_multiplier
+        strengthened_lr = self.base_lr_boost * lr_multiplier
 
         return {
             "injection_ratio": strengthened_injection,
             "weight_boost": strengthened_weight,
+            "lr_boost": strengthened_lr,
             "attempt": attempts + 1,
             "target_node":neighbor_id if neighbor_id else "multiple"
         }

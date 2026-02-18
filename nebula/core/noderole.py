@@ -881,7 +881,26 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                         return DataLoader(honey_ds, batch_size=base_loader.batch_size, shuffle=True, num_workers=getattr(base_loader, 'num_workers', 0))
 
                     original_dm.train_dataloader = baited_loader_factory
-                    logging.info("[Honeypot] 🎣 BAIT INJECTED. Training Baited Model...")
+
+                    # ADAPTIVE BAITING: Apply Learning Rate Boost if needed
+                    current_lr = 0.01 # Default fallback
+                    if hasattr(self._engine.trainer, 'get_model_learning_rate'):
+                        current_lr = self._engine.trainer.get_model_learning_rate()
+                    elif hasattr(self._engine.config, 'participant'):
+                         current_lr = self._engine.config.participant.get("training_args", {}).get("learning_rate", 0.01)
+
+                    if strengthened_params and 'lr_boost' in strengthened_params:
+                        boost_factor = strengthened_params['lr_boost']
+                        new_baited_lr = current_lr * boost_factor
+
+                        if hasattr(self._engine.trainer, 'update_model_learning_rate'):
+                            self._engine.trainer.update_model_learning_rate(new_baited_lr)
+
+                        logging.info(f"[Honeypot] 🚀 ADAPTIVE BAITING ACTIVE: Attempt {strengthened_params.get('attempt', '?')}")
+                        logging.info(f"[Honeypot]    -> Injection Ratio: {strengthened_params.get('injection_ratio', 0.15):.2f}")
+                        logging.info(f"[Honeypot]    -> LR Boost: x{boost_factor:.1f} (LR: {current_lr} -> {new_baited_lr})")
+                    else:
+                        logging.info("[Honeypot] 🎣 BAIT INJECTED. Training Baited Model (Standard Power)...")
 
             # Train Baited Model
             if should_inject_bait:
@@ -1008,7 +1027,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 logging.info("[Honeypot] 🔄 Performing aggregation with verified neighbor models...")
                 # Trigger aggregation since all neighbors are verified
                 try:
-                    await self._engine.on_round_finished()
+                    await self._engine.aggregator.notify_all_updates_received()
                 except Exception as agg_e:
                     logging.warning(f"[Honeypot] Aggregation attempt: {agg_e}")
             logging.info("[Honeypot] Updates received, proceeding with analysis")

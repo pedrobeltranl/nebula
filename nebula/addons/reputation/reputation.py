@@ -541,9 +541,14 @@ class Reputation:
 
         logging.info(f"Reputation of node {nei}: {self.reputation[nei]['reputation']}")
 
-        is_honeypot_defense_active = self._config.participant.get("defense_args", {}).get("honeypot", {}).get("enabled", False)
+        # Check if we are ACTIVELY acting as a Honeypot (Role = HONEYPOT)
+        # If we are just an Aggregator, we MUST still block malicious nodes.
+        is_active_honeypot = False
+        if hasattr(self._engine, "rb"):
+             # Use get_role_name() to avoid importing Role enum and causing circular imports
+             is_active_honeypot = (self._engine.rb.get_role_name() == "honeypot")
 
-        should_filter = not is_honeypot_defense_active
+        should_filter = not is_active_honeypot
 
         if should_filter and self.reputation[nei]["reputation"] < self.REPUTATION_THRESHOLD and current_round > 0:
             self.rejected_nodes.add(nei)
