@@ -309,6 +309,12 @@ class MaliciousRoleBehavior(RoleBehavior):
                          # Retry next round?
                          self._pivot_round += 1
 
+    def get_role(self): return self._role
+
+
+    def get_role_name(self, effective=False):
+        return self._fake_role_behavior.get_role_name() if effective else self._role.value
+
     async def select_nodes_to_wait(self): return await self._fake_role_behavior.select_nodes_to_wait()
     async def resolve_missing_updates(self): return await self._fake_role_behavior.resolve_missing_updates()
 
@@ -781,6 +787,8 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         # Para un honeypot secundario que busca el nuevo atacante
         self._secondary_honeypot_candidates = set()  # Nodos vecinos que podrían ser convertidos a honeypot
+        self._secondary_spawned = False
+        self._decommission_requested = False
         self._recovery_rounds_counter = 0  # Contador de rondas donde la reputación se recupera
         self._max_recovery_rounds = 3  # Si se recupera 3 rondas seguidas, desaparecer
 
@@ -820,7 +828,6 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
              # Only inject bait once positioned near attacker
              self.manager.new_round()
 
-
              # Reset to normal learning rate during positioning (Initial state)
              if hasattr(self._engine.trainer, 'update_model_learning_rate'):
                  original_lr = self._engine.config.participant.get("training_args", {}).get("learning_rate", 0.01)
@@ -831,86 +838,86 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                  logging.info(f"[Honeypot] 📍 POSITIONING PHASE - Learning Rate BOOSTED to {boosted_lr} (Factor {boost_factor}x) to fix Activation Gap.")
 
         # 1. Train with BAIT and CLEAN (Dual Model Strategy)
-        # ============================================================================
-        # FIX: Model Isolation to prevent Collateral Poisoning (P4 case)
-        # We must ensure the model sent to BENIGN neighbors is NOT corrupted by bait.
-        # Strategy:
-        # 1. Save initial state (Clean Aggregated).
-        # 2. Train with Bait -> Propagate to TESTING neighbors.
-        # 3. Reload initial state -> Train Clean -> Propagate to BENIGN neighbors & Self-Report.
-        # ============================================================================
-
         import copy
         import torch
 
         await self._engine.trainning_in_progress_lock.acquire_async()
 
-        # Store the initial clean state (from aggregation)
-        try:
-            initial_clean_state = copy.deepcopy(self._engine.trainer.model.state_dict())
-        except Exception as e:
-            logging.error(f"[Honeypot] Failed to backup clean state: {e}")
-            initial_clean_state = None
-
+        # Variables for restoration
+        initial_clean_state = None
         _original_loader_method = None
         _honey_dataset_ref = None
         trainer_wrapper = self._engine.trainer
 
         # --- PHASE A: BAITED TRAINING (For Suspects) ---
         try:
-            # FIX: If we are transferring the role (Lame Duck), DO NOT BAIT.
-            # Baiting while leaving poisons neighbors without us being there to verify them.
-            if getattr(self._engine, '_waiting_honeypot_handover', False):
-                logging.info("[Honeypot] 🏳️ Handover in progress - SKIPPING BAIT injection to protect neighbors.")
-                should_inject_bait = False
-            else:
-                # Only if we have TESTING neighbors or need to check threats
-                # If threat confirmed locally, we might skip this or keep checking others
-                should_inject_bait = not self.threat_confirmed_locally
+            neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
+            testing_neighbors = [n for n in neighbors if self.manager.get_neighbor_status(n) == "TESTING"]
+
+            # FIX: Only inject bait if we have TESTING neighbors and we are not leaving (Handover)
+            # We allow baiting even if threat_confirmed_locally to support multi-target tracking.
+            is_handover = getattr(self._engine, '_waiting_honeypot_handover', False)
+            should_inject_bait = (len(testing_neighbors) > 0) and (not is_handover)
 
             # Prepare Bait
             if trainer_wrapper and trainer_wrapper.datamodule and should_inject_bait:
-                # ... (Existing Bait Injection Code) ...
-                from nebula.addons.honeypot.dataset import HoneyDataset
-                from torch.utils.data import DataLoader
+                # Backup Clean State
+                try:
+                    initial_clean_state = copy.deepcopy(self._engine.trainer.model.state_dict())
+                except Exception as e:
+                    logging.error(f"[Honeypot] Failed to backup clean state: {e}")
+                    # If backup fails, we shouldn't bait as we can't restore
+                    should_inject_bait = False
 
-                strengthened_params = None
-                if self.manager and hasattr(self.manager, 'get_strengthened_params'):
-                    strengthened_params = self.manager.get_strengthened_params()
+                if should_inject_bait:
+                    # Imports inside method to avoid circular deps or top-level issues
+                    from nebula.addons.honeypot.dataset import HoneyDataset
+                    from torch.utils.data import DataLoader
 
-                original_dm = trainer_wrapper.datamodule
-                if hasattr(original_dm, 'train_dataloader'):
-                    _original_loader_method = original_dm.train_dataloader
+                    strengthened_params = None
+                    if self.manager and hasattr(self.manager, 'get_strengthened_params'):
+                        strengthened_params = self.manager.get_strengthened_params()
 
-                    def baited_loader_factory():
-                        nonlocal _honey_dataset_ref
-                        base_loader = _original_loader_method()
-                        injection_ratio = strengthened_params['injection_ratio'] if strengthened_params else 0.15
-                        honey_ds = HoneyDataset(base_loader.dataset, self.manager.current_map, injection_ratio=injection_ratio)
-                        _honey_dataset_ref = honey_ds
-                        return DataLoader(honey_ds, batch_size=base_loader.batch_size, shuffle=True, num_workers=getattr(base_loader, 'num_workers', 0))
+                    original_dm = trainer_wrapper.datamodule
+                    if hasattr(original_dm, 'train_dataloader'):
+                        _original_loader_method = original_dm.train_dataloader
 
-                    original_dm.train_dataloader = baited_loader_factory
+                        def baited_loader_factory():
+                            nonlocal _honey_dataset_ref
+                            base_loader = _original_loader_method()
+                            injection_ratio = strengthened_params.get('injection_ratio', 0.15) if strengthened_params else 0.15
+                            honey_ds = HoneyDataset(base_loader.dataset, self.manager.current_map, injection_ratio=injection_ratio)
+                            _honey_dataset_ref = honey_ds
+                            return DataLoader(honey_ds, batch_size=base_loader.batch_size, shuffle=True, num_workers=getattr(base_loader, 'num_workers', 0))
 
-                    # ADAPTIVE BAITING: Apply Learning Rate Boost if needed
-                    current_lr = 0.01 # Default fallback
-                    if hasattr(self._engine.trainer, 'get_model_learning_rate'):
-                        current_lr = self._engine.trainer.get_model_learning_rate()
-                    elif hasattr(self._engine.config, 'participant'):
-                         current_lr = self._engine.config.participant.get("training_args", {}).get("learning_rate", 0.01)
+                        original_dm.train_dataloader = baited_loader_factory
 
-                    if strengthened_params and 'lr_boost' in strengthened_params:
-                        boost_factor = strengthened_params['lr_boost']
-                        new_baited_lr = current_lr * boost_factor
+                        # ADAPTIVE BAITING: Apply Learning Rate Boost if needed
+                        current_lr = 0.01 # Default fallback
+                        if hasattr(self._engine.trainer, 'get_model_learning_rate'):
+                            current_lr = self._engine.trainer.get_model_learning_rate()
+                        elif hasattr(self._engine.config, 'participant'):
+                             current_lr = self._engine.config.participant.get("training_args", {}).get("learning_rate", 0.01)
+
+                        # CRITICAL FIX: Enforce MINIMUM Strength for Bait
+                        MIN_BAIT_LR = 0.05
+                        MIN_BAIT_EPOCHS = 5
+
+                        boost_factor = strengthened_params.get('lr_boost', 1.0) if strengthened_params else 1.0
+                        new_baited_lr = max(current_lr * boost_factor, MIN_BAIT_LR)
 
                         if hasattr(self._engine.trainer, 'update_model_learning_rate'):
                             self._engine.trainer.update_model_learning_rate(new_baited_lr)
 
-                        logging.info(f"[Honeypot] 🚀 ADAPTIVE BAITING ACTIVE: Attempt {strengthened_params.get('attempt', '?')}")
-                        logging.info(f"[Honeypot]    -> Injection Ratio: {strengthened_params.get('injection_ratio', 0.15):.2f}")
-                        logging.info(f"[Honeypot]    -> LR Boost: x{boost_factor:.1f} (LR: {current_lr} -> {new_baited_lr})")
-                    else:
-                        logging.info("[Honeypot] 🎣 BAIT INJECTED. Training Baited Model (Standard Power)...")
+                        logging.info(f"[Honeypot] 🚀 ADAPTIVE BAITING ACTIVE: Attempt {strengthened_params.get('attempt', '?') if strengthened_params else 'Initial'}")
+                        logging.info(f"[Honeypot]    -> Injection Ratio: {strengthened_params.get('injection_ratio', 0.15) if strengthened_params else 0.15:.2f}")
+                        logging.info(f"[Honeypot]    -> LR Target: {new_baited_lr:.4f} (Base: {current_lr}, Boost: x{boost_factor})")
+
+                        # Ensure minimum epochs
+                        original_epochs = self._engine.trainer.max_epochs
+                        if original_epochs < MIN_BAIT_EPOCHS:
+                             logging.warning(f"[Honeypot] ⚠️ Boosting Epochs from {original_epochs} to {MIN_BAIT_EPOCHS} to ensure bait learning.")
+                             self._engine.trainer.max_epochs = MIN_BAIT_EPOCHS
 
             # Train Baited Model
             if should_inject_bait:
@@ -918,15 +925,6 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 logging.info("[Honeypot] 🎣 Baited Training Complete.")
 
                 # Propagate BAITED Model to ALL TESTING neighbors concurrently
-                # FIX 1 (Revised): Parallel Baiting - Send bait to ALL neighbors under test.
-                # This aligns with user requirement: "Round 1: Send bait and see who aggregates it".
-                neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
-                testing_neighbors = [n for n in neighbors if self.manager.get_neighbor_status(n) == "TESTING"]
-
-                # ADAPTIVE BAITING LOGIC:
-                # If neighbors have different strengthening needs, we should strictly speaking send different models.
-                # But for now, we use the single baited model trained above.
-                # In the future, we might need per-neighbor model generation if strengthening levels diverge significantly.
                 backdoor_recipients = testing_neighbors
 
                 if backdoor_recipients:
@@ -943,6 +941,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             # Restore Loader
             if _original_loader_method and trainer_wrapper and trainer_wrapper.datamodule:
                 trainer_wrapper.datamodule.train_dataloader = _original_loader_method
+
+            # Restore Epochs
+            if 'original_epochs' in locals():
+                 self._engine.trainer.max_epochs = original_epochs
 
         # --- PHASE B: CLEAN TRAINING (For Benign / Self) ---
         try:
@@ -979,18 +981,24 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             # 3. Propagate CLEAN Model to BENIGN neighbors
             neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
 
-            # FIX: If Handover is in progress (Legacy Mode), send CLEAN model to EVERYONE (except confirmed Malicious).
-            # This ensures that "TESTING" nodes (like P0) receive a Clean model instead of nothing/bait when we leave.
+            # FIX: Smart Containment / Propagation
+            # Goal: Clean to Benign/Attacker (to dilute). Bait to Testing (preserved from Phase A).
+
             is_handover = getattr(self._engine, '_waiting_honeypot_handover', False)
 
             if is_handover or self.threat_confirmed_locally:
-                # Send clean to everyone (except maybe Malicious, but Propgator filters that usually? No, we filter here)
-                # We assume Malicious will likely ignore it or use it, but keeping Benign/Testing safe is priority if leaving.
-                clean_recipients = neighbors
-                logging.info(f"[Honeypot] 🏳️ Handover/Containment Active - Sending CLEAN model to ALL neighbors ({len(clean_recipients)})")
+                # SMART CONTAINMENT:
+                # Send Clean to Confirmed Attackers (to dilute them) and Benign nodes.
+                # BUT DO NOT send Clean to TESTING nodes (preserve the bait we just sent in Phase A).
+
+                # Note: sending Clean now would overwrite the Bait we just sent if the propagation happens in same round.
+                # By excluding TESTING, we ensure they only receive the Bait model.
+
+                clean_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) != "TESTING"]
+                logging.info(f"[Honeypot] 🛡️ CONTAINMENT MODE: Sending CLEAN model to {len(clean_recipients)} nodes (Excluding TESTING)")
             else:
-                # ONLY send Clean model to BENIGN. Testing nodes already got Baited model in Phase A.
-                # Suspicious/Malicious nodes get nothing (or maybe Clean if we want to keep them hooked? No, we choke them).
+                # Normal Operation: Clean to BENIGN neighbors only.
+                # Suspicious/Malicious nodes get nothing (or we rely on what we sent in Phase A).
                 clean_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) == "BENIGN"]
 
             if clean_recipients:
@@ -1004,12 +1012,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                  logging.info(f"[Honeypot] 🛡️ CONTAINMENT MODE: Waiting for neighbor updates to Aggregate (Normal Aggregator Behavior).")
                  await self._engine._waiting_model_updates()
 
-                 # Note: After aggregation, the cycle ends, and the Engine will update the model with the aggregated result
-                 # before the next round starts. This completes the "Normal Aggregator" loop.
-
             # FIX: Report Metrics (Test Global/Local Model)
-            # Optimization: MOVED TO END of Phase B to unblock propagation.
-            # We run this AFTER self-update and propagation so neighbors get the model immediately.
             cur_round = getattr(self._engine, '_round', 0)
             if cur_round % 5 == 0:
                 logging.info("[Honeypot] 🔍 Run Validation (Delayed to end of cycle)...")
@@ -1025,6 +1028,8 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 await self._engine.trainning_in_progress_lock.release_async()
              except:
                 pass
+
+
 
         # 4. Aggregation Strategy
         # FIX 2: Only skip aggregation while there are still TESTING neighbors (need pure honeydoor)
