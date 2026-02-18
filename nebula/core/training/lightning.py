@@ -343,8 +343,17 @@ class Lightning:
         try:
             self._trainer.test(self.model, self.datamodule, verbose=True)
             metrics = self._trainer.callback_metrics
-            loss = metrics.get('val_loss/dataloader_idx_0', None).item()
-            accuracy = metrics.get('val_accuracy/dataloader_idx_0', None).item()
+
+            # Robust key search for Loss
+            loss_keys = ['val_loss/dataloader_idx_0', 'Test (Local)/Loss', 'test_loss', 'val_loss']
+            loss_tensor = next((metrics[k] for k in loss_keys if k in metrics), None)
+            loss = loss_tensor.item() if loss_tensor is not None else None
+
+            # Robust key search for Accuracy
+            acc_keys = ['val_accuracy/dataloader_idx_0', 'Test (Local)/Accuracy', 'test_accuracy', 'val_accuracy']
+            acc_tensor = next((metrics[k] for k in acc_keys if k in metrics), None)
+            accuracy = acc_tensor.item() if acc_tensor is not None else None
+
             return loss, accuracy
         except Exception as e:
             logging_training.error(f"Error in _test_sync: {e}")

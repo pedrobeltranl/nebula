@@ -1007,7 +1007,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                             bait_validation_passed = True
                             logging.info("[Honeypot] ✅ Bait Verification PASSED. Model is ready for propagation.")
                         else:
-                            logging.warning(f"[Honeypot] ⚠️ Bait Verification FAILED (Acc {val_acc:.4f} < 0.95). Boosting parameters...")
+                            logging.warning(f"[Honeypot] ⚠️ Bait Verification FAILED (Acc {val_acc:.4f} < 0.95). Boosting parameters..." if val_acc is not None else "[Honeypot] ⚠️ Bait Verification FAILED (Acc None). Boosting parameters...")
                             # Boost logic
                             current_boost_lr = min(current_boost_lr * 1.5, 0.1) # Max cap 0.1
                             current_epochs = min(current_epochs + 5, 20) # Max cap 20 epochs

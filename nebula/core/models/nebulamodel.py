@@ -46,15 +46,15 @@ class NebulaModel(pl.LightningModule, ABC):
         y = y.detach()
         if phase == "Train":
             self.logger.log_data({f"{phase}/Loss": loss.detach()})
-            self.train_metrics.update(y_pred_classes, y)
+            self.train_metrics.update(y_pred_classes.clone(), y.clone())
         elif phase == "Validation":
-            self.val_metrics.update(y_pred_classes, y)
+            self.val_metrics.update(y_pred_classes.clone(), y.clone())
         elif phase == "Test (Local)":
-            self.test_metrics.update(y_pred_classes, y)
-            self.cm.update(y_pred_classes, y) if self.cm is not None else None
+            self.test_metrics.update(y_pred_classes.clone(), y.clone())
+            self.cm.update(y_pred_classes.clone(), y.clone()) if self.cm is not None else None
         elif phase == "Test (Global)":
-            self.test_metrics_global.update(y_pred_classes, y)
-            self.cm_global.update(y_pred_classes, y) if self.cm_global is not None else None
+            self.test_metrics_global.update(y_pred_classes.clone(), y.clone())
+            self.cm_global.update(y_pred_classes.clone(), y.clone()) if self.cm_global is not None else None
         else:
             raise NotImplementedError
 
@@ -309,7 +309,7 @@ class NebulaModel(pl.LightningModule, ABC):
         loss = self.criterion(y_pred, y)
         y_pred_classes = torch.argmax(y_pred, dim=1)
         accuracy = torch.mean((y_pred_classes == y).float())
-        
+
         if dataloader_idx == 0:
             self.log(f"val_loss", loss, on_epoch=True, prog_bar=False)
             self.log(f"val_accuracy", accuracy, on_epoch=True, prog_bar=False)
