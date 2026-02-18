@@ -992,7 +992,33 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                         # OPTION: We invoke `_test_sync` directly via thread to get values without publishing event (to avoid spamming network events if not needed, though maybe we want them).
                         # Let's use `_test_sync` logic to get the raw accuracy.
 
-                        val_loss, val_acc = await asyncio.to_thread(self._engine.trainer._test_sync)
+                        # Manual Validation Loop to bypass Lightning Trainer state issues
+                        self._engine.model.eval()
+                        correct = 0
+                        total = 0
+                        # Ensure model is on the correct device (likely CPU based on logs, but keeping it safe)
+                        device = next(self._engine.model.parameters()).device
+
+                        try:
+                            with torch.no_grad():
+                                for batch in validation_loader:
+                                    x, y = batch
+                                    x = x.to(device)
+                                    y = y.to(device)
+                                    output = self._engine.model(x)
+                                    pred = output.argmax(dim=1)
+                                    correct += (pred == y).sum().item()
+                                    total += y.size(0)
+
+                            val_acc = correct / total if total > 0 else 0.0
+                            val_loss = 0.0 # Not critical for this check
+
+                        except Exception as e:
+                            logging.error(f"[Honeypot] ❌ Manual Validation Crashed: {e}")
+                            val_acc = None
+                            val_loss = None
+                        finally:
+                            self._engine.model.train() # Restore train mode
 
                         # Restore Test Loader
                         if original_test_loader_method:
