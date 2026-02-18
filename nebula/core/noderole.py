@@ -1541,8 +1541,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         if current_round == self._last_pivot_round:
             return
 
-        # Solo actuamos al final de la Ronda 2 (para saltar en la 3)
-        if current_round < 2:
+        # Solo actuamos al final de la Ronda 3 (para saltar en la 4, o analizar tras 3 envíos)
+        # Queremos 3 rondas de "Solo Baiting" (0, 1, 2). Empezamos a analizar en Ronda 3.
+        if current_round < 3:
+            logging.info(f"[HONEYPOT DFS] ⏳ Warmup Phase (Round {current_round}/3). Sending Bait only. No analysis yet.")
             return
 
         logging.info(f"[HONEYPOT DFS] ===== ROUND {current_round} - SEARCH PHASE =====")

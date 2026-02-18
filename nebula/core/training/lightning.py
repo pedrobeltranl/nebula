@@ -392,3 +392,12 @@ class Lightning:
 
     def show_current_learning_rate(self):
         self.model.show_current_learning_rate()
+
+    @property
+    def max_epochs(self):
+        """Expose epochs for external modification (e.g. by Honeypot)"""
+        return self.epochs
+
+    @max_epochs.setter
+    def max_epochs(self, value):
+        self.epochs = value
