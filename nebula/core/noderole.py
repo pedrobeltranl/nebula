@@ -998,7 +998,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                         if original_test_loader_method:
                             original_dm.test_dataloader = original_test_loader_method
 
-                        logging.info(f"[Honeypot] 📊 Bait Validation Results: Accuracy={val_acc:.4f} | Loss={val_loss:.4f}")
+                        if val_acc is not None:
+                            logging.info(f"[Honeypot] 📊 Bait Validation Results: Accuracy={val_acc:.4f} | Loss={val_loss:.4f}" if val_loss is not None else f"[Honeypot] 📊 Bait Validation Results: Accuracy={val_acc:.4f}")
+                        else:
+                            logging.warning("[Honeypot] 📊 Bait Validation Results: None (Failed)")
 
                         if val_acc is not None and val_acc >= 0.95:
                             bait_validation_passed = True
@@ -1024,6 +1027,8 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                     logging.info(f"[Honeypot] 🎭 Sending BAITED model to {len(backdoor_recipients)} TESTING neighbors: {backdoor_recipients}")
                     # Broadcast bait to all suspects with optional weight boost
                     weight_override = strengthened_params.get("weight_boost") if strengthened_params else None
+                    if weight_override is not None:
+                        weight_override = int(weight_override) # Ensure weight is integer for network message
                     mpe = ModelPropagationEvent(backdoor_recipients, "stable", weight=weight_override)
                     await EventManager.get_instance().publish_node_event(mpe)
 

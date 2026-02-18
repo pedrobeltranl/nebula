@@ -75,12 +75,12 @@ class NebulaProgressBar(ProgressBar):
         if self.enable:
             logging_training.info(f"Validation for Epoch {trainer.current_epoch} finished")
 
-    def on_test_batch_start(self, trainer, pl_module, batch, batch_idx, dataloader_idx):
+    def on_test_batch_start(self, trainer, pl_module, batch, batch_idx, dataloader_idx=0):
         super().on_test_batch_start(trainer, pl_module, batch, batch_idx, dataloader_idx)
         if not self.has_dataloader_changed(dataloader_idx):
             return
 
-    def on_test_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
+    def on_test_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
         """Called at the end of each test batch."""
         super().on_test_batch_end(trainer, pl_module, outputs, batch, batch_idx, dataloader_idx)
         if self.enable:
@@ -306,11 +306,11 @@ class Lightning:
         try:
             self.create_trainer()
             logging.info(f"{'=' * 10} [Training] Started (check training logs for progress) {'=' * 10}")
-            await asyncio.wait_for(asyncio.to_thread(self._train_sync), timeout=120)  # 2 minute timeout
+            await asyncio.wait_for(asyncio.to_thread(self._train_sync), timeout=300)  # 5 minute timeout
             logging.info(f"{'=' * 10} [Training] Finished (check training logs for progress) {'=' * 10}")
         except asyncio.TimeoutError:
-            logging_training.error(f"Training timeout after 120 seconds. Model may be stuck in training loop.")
-            logging.error(f"Training timeout after 120 seconds. Continuing to next round.")
+            logging_training.error(f"Training timeout after 300 seconds. Model may be stuck in training loop.")
+            logging.error(f"Training timeout after 300 seconds. Continuing to next round.")
         except Exception as e:
             logging_training.error(f"Error training model: {e}")
             logging_training.error(traceback.format_exc())
@@ -328,13 +328,13 @@ class Lightning:
         try:
             self.create_trainer()
             logging.info(f"{'=' * 10} [Testing] Started (check training logs for progress) {'=' * 10}")
-            loss, accuracy = await asyncio.wait_for(asyncio.to_thread(self._test_sync), timeout=120)  # 2 minute timeout
+            loss, accuracy = await asyncio.wait_for(asyncio.to_thread(self._test_sync), timeout=300)  # 5 minute timeout
             logging.info(f"{'=' * 10} [Testing] Finished (check training logs for progress) {'=' * 10}")
             tme = TestMetricsEvent(loss, accuracy)
             await EventManager.get_instance().publish_addonevent(tme)
         except asyncio.TimeoutError:
-            logging_training.error(f"Testing timeout after 120 seconds. Model may be stuck in testing loop.")
-            logging.error(f"Testing timeout after 120 seconds. Continuing to next phase.")
+            logging_training.error(f"Testing timeout after 300 seconds. Model may be stuck in testing loop.")
+            logging.error(f"Testing timeout after 300 seconds. Continuing to next phase.")
         except Exception as e:
             logging_training.error(f"Error testing model: {e}")
             logging_training.error(traceback.format_exc())
