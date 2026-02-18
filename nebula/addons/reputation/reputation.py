@@ -177,11 +177,19 @@ class Reputation:
         # Only if requested (Honeypots might want to keep listening to monitor)
         if network_block and hasattr(self, "_engine") and hasattr(self._engine, "cm") and hasattr(self._engine.cm, "bl"):
             try:
-                # add_to_blacklist is async, so we schedule it
+                # 1. Enforce network-level blacklist (stop receiving)
                 asyncio.create_task(self._engine.cm.bl.add_to_blacklist(node_id))
                 logging.info(f"[Reputation] 🔌 Network blacklist scheduled for {node_id}")
+
+                # 2. CRITICAL FIX: Explicitly deactivate connection to stop aggregation waiting
+                # This prevents the Round Synchronization Deadlock (60s timeouts)
+                if hasattr(self._engine, "cm") and node_id in self._engine.cm.connections:
+                    conn = self._engine.cm.connections[node_id]
+                    logging.warning(f"[Reputation] ⚡ Deactivating AGGREGATION for blocked neighbor {node_id} to prevent Deadlock.")
+                    conn.set_active(False)
+
             except Exception as e:
-                logging.error(f"[Reputation] Failed to schedule network blacklist: {e}")
+                logging.error(f"[Reputation] Failed to schedule network blacklist or deactivate connection: {e}")
 
     def _load_configuration(self):
         defense_args = self._config.participant.get("defense_args", {})

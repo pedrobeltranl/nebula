@@ -41,7 +41,7 @@ class HoneyPotManager:
 
         # PER-NODE Grace Period: Track rounds spent at current node
         self.rounds_at_current_node = 0  # Reset when pivoting
-        self.grace_rounds_per_node = 2   # OPTIMIZED: 2 rounds enough for backdoor propagation
+        self.grace_rounds_per_node = 1   # Speed up search (Reduced from 2)
         self.current_node_id = None      # Track which node we're at
 
         # SUSPECT CONFIRMATION: Track suspects before declaring as attackers

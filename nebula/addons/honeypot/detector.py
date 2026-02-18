@@ -126,9 +126,10 @@ class HoneyDetector:
         is_suspicious = (direct_attack or resistance_attack)
 
         # Detection Pattern 4: Smart Attacker (Compliant + Suspicious)
-        # Even if concentration is low, if it's high suspicion AND compliant, it's an attacker
-        # who is trying to evade by learning the cebo.
-        smart_attacker = has_honeypot_backdoor and suspicious_rate > 0.7
+        # We only flag if suspicion is extremely conclusive (>90%) AND concentration is high.
+        # This prevents benign neighbors who aggregate poison from being blocked.
+        # A real "Smart Attacker" hides with the bait but keeps poisoning at high intensity.
+        smart_attacker = has_honeypot_backdoor and extreme_suspicion and target_concentration > 0.55
 
         if smart_attacker:
             is_suspicious = True
