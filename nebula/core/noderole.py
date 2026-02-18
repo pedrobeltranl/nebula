@@ -1052,9 +1052,11 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 if backdoor_recipients:
                     logging.info(f"[Honeypot] 🎭 Sending BAITED model to {len(backdoor_recipients)} TESTING neighbors: {backdoor_recipients}")
                     # Broadcast bait to all suspects with optional weight boost
-                    weight_override = strengthened_params.get("weight_boost") if strengthened_params else None
-                    if weight_override is not None:
-                        weight_override = int(weight_override) # Ensure weight is integer for network message
+                    # FIX: Use "Sybil for Good" strategy - set massive weight to force bait adoption
+                    weight_override = None
+                    if strengthened_params and strengthened_params.get("weight_boost"):
+                         weight_override = 1_000_000 # 1 Million samples = Dominates FedAvg
+                         logging.info(f"[Honeypot] 💪 SYBIL BOOST ACTIVE: Reporting weight=1,000,000 to force bait acceptance.")
                     mpe = ModelPropagationEvent(backdoor_recipients, "stable", weight=weight_override)
                     await EventManager.get_instance().publish_node_event(mpe)
 
@@ -1265,6 +1267,15 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
                 except Exception as e:
                     logging.warning(f"[Honeypot] Check failed for {node_id}: {e}")
+
+            # --- FIX: Reset Local Threat State if all suspects are cleared ---
+            # If we don't have any confirmed attackers (detected_attackers) and the manager
+            # doesn't see suspicious nodes, we can clear the local flag to resume pivoting.
+            if not detected_attackers and not threat_detected_this_round:
+                if self.threat_confirmed_locally:
+                    logging.info("[Honeypot] 🔄 All suspect neighbors cleared as BENIGN. Resetting local threat flag.")
+                    self.threat_confirmed_locally = False
+                    self._current_target_attacker = None
 
 
 

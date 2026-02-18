@@ -98,7 +98,10 @@ class Engine:
         self.addr = config.participant["network_args"]["addr"]
 
         self.name = config.participant["device_args"]["name"]
-        self.client = docker.from_env()
+        try:
+            self.client = docker.from_env()
+        except Exception:
+            self.client = None
 
         print_banner()
 
