@@ -1669,10 +1669,16 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 logging.warning("[HONEYPOT DFS] ⚠️ No pivot direction available")
             return
 
-        # Validación adicional: Excluir nodos con detecciones recientes
+        # Validación adicional: Permitir pivot a Carrier Nodes (sospechosos pero con cebo)
         if next_pivot and hasattr(self.manager, 'recent_detections'):
-            if next_pivot in self.manager.recent_detections and self.manager.recent_detections[next_pivot] > 0:
-                logging.warning(f"[HONEYPOT DFS] ⚠️ Cancelling pivot to {next_pivot} (has {self.manager.recent_detections[next_pivot]} recent detections)")
+            # Verificar si es un Carrier (Compliant)
+            is_carrier = False
+            if hasattr(self.manager, 'neighbor_tracking') and next_pivot in self.manager.neighbor_tracking:
+                is_carrier = self.manager.neighbor_tracking[next_pivot].get("max_compliant_seen", 0) >= 0.02
+
+            # Solo cancelar si tiene detecciones Y NO tiene cebo (amenaza pura)
+            if self.manager.recent_detections.get(next_pivot, 0) > 0 and not is_carrier:
+                logging.warning(f"[HONEYPOT DFS] ⚠️ Cancelling pivot to {next_pivot} (has {self.manager.recent_detections[next_pivot]} recent detections and NO bait seen)")
                 next_pivot = None
 
         if next_pivot:
@@ -1682,10 +1688,14 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                  rep_data = self._engine._reputation.reputation.get(next_pivot, {})
                  current_score = float(rep_data.get("reputation", 0.0))
 
-                 # FIX: If we have VERIFIED it as Benign via Honeypot mechanism, we pivot regardless of score.
+                 # FIX: If we have VERIFIED it as Benign OR it is a Carrier, we pivot regardless of score.
                  neighbor_status = self.manager.get_neighbor_status(next_pivot)
-                 if neighbor_status == "BENIGN" or neighbor_status == "COMPLIANT":
-                      logging.info(f"[HONEYPOT DFS] 🛡️ Allowing pivot to {next_pivot} - Status is {neighbor_status} (Safe/Controlled) even if Reputation ({current_score:.2f}) is low.")
+                 is_carrier = False
+                 if hasattr(self.manager, 'neighbor_tracking') and next_pivot in self.manager.neighbor_tracking:
+                     is_carrier = self.manager.neighbor_tracking[next_pivot].get("max_compliant_seen", 0) >= 0.02
+
+                 if neighbor_status == "BENIGN" or is_carrier:
+                      logging.info(f"[HONEYPOT DFS] 🛡️ Allowing pivot to {next_pivot} - Status is {neighbor_status} (Carrier/Bait detected: {is_carrier}) even if Reputation ({current_score:.2f}) is low.")
                  elif current_score < 0.5:
                       logging.warning(f"[HONEYPOT DFS] ⚠️ Cancelling pivot to {next_pivot} - LOW REPUTATION ({current_score:.2f}). Neighbor is SUSPICIOUS/UNVERIFIED.")
                       logging.info(f"[HONEYPOT DFS] 🔒 Locking target {next_pivot} for containment/verification instead of pivoting.")

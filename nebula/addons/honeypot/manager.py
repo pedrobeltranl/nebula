@@ -281,15 +281,28 @@ class HoneyPotManager:
         # LAYERED DEFENSE DECISION TREE
         # ============================================================================
 
-        # 1. ESCALATION: Consistent suspicion always overrides bait (The "Smart Poisoner" check)
+        # 1. ESCALATION: Prevent false positives on victims (Carrier Nodes)
+        # In DFL, victims are "Smart Attackers" (Suspicious + Compliant).
+        # We ONLY escalate to MALICIOUS if they are suspicious AND have NO bait,
+        # OR if they triggered a direct CONTRADICTION CLASH with our HoneyMap.
         if state["suspicious_count"] >= 3:
-             logging.critical(
-                 f"[Manager] 🚨 Neighbor {neighbor_id} CONTRADICTION: Persistent suspicion ({state['suspicious_count']}) "
-                 f"despite potential bait presence ({state['max_compliant_seen']:.2%}). Verdict: MALICIOUS"
-             )
-             state["status"] = "MALICIOUS"
-             state["verified_round"] = current_round
-             return "MALICIOUS"
+             # If they have bait, we treat them as victims (CARRIERS).
+             # We stay in TESTING to allow pivoting THROUGH them.
+             if state["max_compliant_seen"] >= 0.02:
+                 logging.warning(
+                     f"[Manager] ⚠️ Neighbor {neighbor_id} is persistently suspicious ({state['suspicious_count']}) "
+                     f"BUT has bait ({state['max_compliant_seen']:.2%}). Treating as VICTIM CARRIER."
+                 )
+                 # Note: We return "TESTING" but analyze_neighbors_at_current_node will see it's a good pivot target
+                 return "TESTING"
+             else:
+                 logging.critical(
+                     f"[Manager] 🚨 Neighbor {neighbor_id} CONTRADICTION: Persistent suspicion ({state['suspicious_count']}) "
+                     f"with NO bait seen. Verdict: MALICIOUS"
+                 )
+                 state["status"] = "MALICIOUS"
+                 state["verified_round"] = current_round
+                 return "MALICIOUS"
 
         # 2. VERIFICATION: Backdoor presence
         if state["max_compliant_seen"] >= 0.02:
@@ -805,8 +818,9 @@ class HoneyPotManager:
         # DESPUÉS DEL GRACE PERIOD: Analizar vecinos para detectar atacante
         logging.info(f"[DFS] ✅ Grace period COMPLETE - Starting neighbor analysis")
 
-        compliant_neighbors = []  # Neighbors with backdoor (honest)
-        suspicious_neighbors = []  # Neighbors without backdoor (suspicious)
+        compliant_neighbors = []     # Neighbors verified BENIGN (bait + clean round)
+        investigation_neighbors = [] # Neighbors suspicious BUT COMPLIANT (victims/carriers)
+        suspicious_neighbors = []    # Neighbors suspicious AND NO BAIT (threats)
         current_round = getattr(self.engine, 'round', 0) if self.engine else 0
 
         for node_id, model_obj in neighbors_models.items():
@@ -816,22 +830,25 @@ class HoneyPotManager:
 
             # ============================================================================
             # UNIFIED ANALYSIS: Use memory-based analyze_neighbor
-            # This handles: suspicious_count, max_compliant, and Smart Attacker detection
             # ============================================================================
             status = self.analyze_neighbor(node_id, model_obj, current_round)
+            is_suspicious, _ = self.detector.check_malicious(model_obj, current_round) if self.detector else (False, None)
+            state = self.neighbor_tracking.get(node_id, {})
+            has_bait = state.get("max_compliant_seen", 0) >= 0.02
 
             if status == "MALICIOUS":
-                # Confirmed attacker (either by 3 rounds of suspicion or failed strengthening)
                 logging.critical(f"[DFS] 🎯 ATTACKER CONFIRMED: {node_id} (Verdict from Manager)")
                 return (True, node_id)
 
             if status == "BENIGN":
-                # Node showed backdoor and is NOT consistently suspicious
                 compliant_neighbors.append((node_id, 0.0))
                 logging.info(f"[DFS] ✅ {node_id} prioritized as COMPLIANT/BENIGN")
+            elif has_bait:
+                # Suspicious but has bait -> Target for investigation (Victim Carrier)
+                investigation_neighbors.append((node_id, 1.0))
+                logging.warning(f"[DFS] 🧩 {node_id} identified as CARRIER (Suspicious + Compliant). Prioritizing for investigation.")
             else:
-                # status == "TESTING" or "COMPLIANT" (if status is COMPLIANT but not yet BENIGN)
-                # We treat anything not BENIGN or MALICIOUS as a "Work in Progress" suspect
+                # Suspicious and NO bait seen yet -> Threat monitoring
                 suspicious_neighbors.append((node_id, 1.0))
                 logging.warning(f"[DFS] ⏳ {node_id} is under TESTING/MONITORING (Current Status: {status})")
 
@@ -839,30 +856,30 @@ class HoneyPotManager:
         # PIVOT OR HOLD DECISION
         # ============================================================================
 
-        # 1. If we have ANY suspicious neighbor under testing, we HOLD to confirm
+        # 1. Priority: Explore verified BENIGN branches (Standard DFS)
+        if compliant_neighbors:
+            for neighbor_id, _ in compliant_neighbors:
+                if not self.is_visited(neighbor_id):
+                    logging.info(f"[DFS] Pivoting to BENIGN neighbor {neighbor_id} to explore branch.")
+                    return (False, neighbor_id)
+
+        # 2. Sequential Priority: Pivot to INVESTIGATION targets (Follow the poison trail)
+        if investigation_neighbors:
+            for neighbor_id, _ in investigation_neighbors:
+                if not self.is_visited(neighbor_id):
+                    logging.info(f"[DFS] 🕵️ Pivoting to CARRIER neighbor {neighbor_id} to follow poison trail.")
+                    return (False, neighbor_id)
+
+        # 3. If everything unvisited is a pure THREAT (no bait), we HOLD to confirm
         if suspicious_neighbors:
             suspect_id = suspicious_neighbors[0][0]
             state = self.neighbor_tracking.get(suspect_id, {})
             rounds = state.get("suspicious_count", 0)
-            logging.info(f"[DFS] ⏳ HOLDING POSITION: Monitoring suspect {suspect_id} ({rounds}/{self.confirmation_rounds_required} rounds).")
+            logging.info(f"[DFS] ⏳ HOLDING POSITION: Confirming pure suspect {suspect_id} ({rounds}/{self.confirmation_rounds_required} rounds).")
             return (False, None)
 
-        # 2. If all neighbors are verified BENIGN, we pivot to continue search
-        if compliant_neighbors:
-            # Choose neighbor that hasn't been visited (DFS)
-            next_pivot = None
-            for neighbor_id, _ in compliant_neighbors:
-                if not self.is_visited(neighbor_id):
-                    next_pivot = neighbor_id
-                    logging.info(f"[DFS] All neighbors are verified benign. Pivoting to {next_pivot} to continue search.")
-                    return (False, next_pivot)
-
-            # If ALL neighbors visited, exploration of this branch is finished
-            logging.info("[DFS] All branches from this node already visited. Returning to search from another node.")
-            return (False, None)
-
-        # No neighbors available for analysis
-        logging.warning("[DFS] No neighbors available for analysis.")
+        # 4. If everything visited/analyzed, return to parent
+        logging.info("[DFS] All branches from this node already visited/investigated. Backtracking.")
         return (False, None)
 
     def _is_node_silent_to_neighbors(self, suspect_node: str, my_neighbors: set, reputation_module) -> bool:
