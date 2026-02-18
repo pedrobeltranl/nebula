@@ -225,8 +225,8 @@ class HoneyPotManager:
         if state["status"] == "MALICIOUS":
             return "MALICIOUS"
 
-        # Analyze model for backdoor presence (returns bool + compliant_rate + is_suspicious)
-        has_backdoor, compliant_rate, is_suspicious = self._check_neighbor_has_backdoor(neighbor_model)
+        # Analyze model for backdoor presence (returns bool + compliant_rate + is_suspicious + dominant_target)
+        has_backdoor, compliant_rate, is_suspicious, dominant_target = self._check_neighbor_has_backdoor(neighbor_model)
 
         # Update history
         state["rounds_tested"] += 1
@@ -247,36 +247,65 @@ class HoneyPotManager:
         # SUSPICIOUS flag (from detector) is treated as evidence, NOT a verdict.
         # ============================================================================
 
-        # Track suspicious rounds (used at strengthening exhaustion for final verdict)
+        # Track suspicious rounds
         if is_suspicious:
             state["suspicious_count"] += 1
+
+            # CONTRADICTION CHECK: Does the attacker's target clash with our HoneyMap?
+            # If our map expected Y' for samples of class Y, and the attacker predicts T,
+            # and T is NOT Y', then it's a direct override of our bait.
+            if dominant_target is not None and self.current_map:
+                # Check if ANY rule in the honey_map is being overridden by the dominant_target
+                clash_detected = False
+                for y_origin, y_expected in self.current_map.items():
+                    if dominant_target == y_origin and dominant_target != y_expected:
+                         # The attacker is forcing the origin label (ignoring bait)
+                         clash_detected = True
+                         break
+
+                if clash_detected:
+                    state["suspicious_count"] += 1 # Double penalty for direct clash
+                    logging.critical(f"[Manager] ⚔️ CONTRADICTION CLASH: {neighbor_id} targets {dominant_target} which overrides HoneyMap rules. Suspicion escalated.")
+
             self.recent_detections[neighbor_id] = self.recent_detections.get(neighbor_id, 0) + 1
-            logging.info(
+            logging.warning(
                 f"[Manager] ⚠️ Neighbor {neighbor_id} flagged SUSPICIOUS (count: {state['suspicious_count']}) "
                 f"- recent detections: {self.recent_detections[neighbor_id]}"
             )
         else:
-            state["suspicious_count"] = 0  # Reset on non-suspicious round
+            # DECAY suspicion (don't reset to 0 immediately) to allow for some noise but punish persistence
+            if state["suspicious_count"] > 0:
+                state["suspicious_count"] -= 1
 
-        if state["max_compliant_seen"] >= 0.02:  # Lowered to 2% to catch weaker signals
-            # Node showed backdoor at some point.
-            # CRITICAL FIX: Ensure it is NOT suspicious.
-            # An attacker might learn the bait (Compliance > 0) but still perform attacks (Suspicious).
-            # If Suspicious Count is high, we IGNORE the compliance (it's likely a Poisoner with mixed data).
-            if state["suspicious_count"] >= 3:
-                 # It has the bait, BUT it is consistently suspicious.
-                 # This creates a conflict. We escalate to MALICIOUS because suspicious behavior overrides bait presence for safety.
-                 logging.critical(
-                     f"[Manager] 🚨 Neighbor {neighbor_id} CONTRADICTION: Has Bait ({state['max_compliant_seen']:.2%}) "
-                     f"BUT is Consistently Suspicious ({state['suspicious_count']}). Verdict: MALICIOUS (Smart Poisoner)"
-                 )
-                 state["status"] = "MALICIOUS"
-                 state["verified_round"] = current_round
-                 return "MALICIOUS"
+        # ============================================================================
+        # LAYERED DEFENSE DECISION TREE
+        # ============================================================================
 
+        # 1. ESCALATION: Consistent suspicion always overrides bait (The "Smart Poisoner" check)
+        if state["suspicious_count"] >= 3:
+             logging.critical(
+                 f"[Manager] 🚨 Neighbor {neighbor_id} CONTRADICTION: Persistent suspicion ({state['suspicious_count']}) "
+                 f"despite potential bait presence ({state['max_compliant_seen']:.2%}). Verdict: MALICIOUS"
+             )
+             state["status"] = "MALICIOUS"
+             state["verified_round"] = current_round
+             return "MALICIOUS"
+
+        # 2. VERIFICATION: Backdoor presence
+        if state["max_compliant_seen"] >= 0.02:
             if state["first_backdoor_round"] is None:
                 state["first_backdoor_round"] = current_round
 
+            # FEATURE: If node is compliant BUT currently suspicious, do NOT mark as BENIGN yet.
+            # It stays in a "TESTING" state until suspicion clears or escalates.
+            if is_suspicious:
+                logging.info(
+                    f"[Manager] ⚠️ Neighbor {neighbor_id} is COMPLIANT but SUSPICIOUS. "
+                    f"Holding status as TESTING (Suspicion Count: {state['suspicious_count']})."
+                )
+                return "TESTING"
+
+            # Only verify as BENIGN if it has shown bait AND current round is clean
             state["status"] = "BENIGN"
             state["verified_round"] = state["first_backdoor_round"]
             logging.info(
@@ -290,16 +319,35 @@ class HoneyPotManager:
             state["negative_count"] += 1
 
             # ============================================================================
-            # ADAPTIVE STRENGTHENING
+            # TRIGGER STRENGTHENING: Not just for 0%, but also for suspicious nodes with low compliance
+            # ============================================================================
+            is_low_compliance_suspect = (is_suspicious and compliant_rate < 0.20)
+            is_totally_clean = (compliant_rate == 0.0)
+
+            if self.strengthening_enabled and (is_totally_clean or is_low_compliance_suspect) and neighbor_id not in self.weak_backdoor_nodes:
+                # Initiate strengthening pipeline
+                self.weak_backdoor_nodes[neighbor_id] = {
+                    "round_started": current_round,
+                    "attempts": 1,
+                    "base_injection": self.base_injection_ratio,
+                    "base_weight": self.base_weight_boost
+                }
+                logging.warning(
+                    f"[Manager] 🔬 Triggering STRENGTHENING for {neighbor_id}. "
+                    f"Reason: {'Suspicious with Low Compliance' if is_low_compliance_suspect else 'Zero Compliance'}"
+                )
+
+            # ============================================================================
+            # ADAPTIVE STRENGTHENING PROGRESSION
             # ============================================================================
             if self.strengthening_enabled and neighbor_id in self.weak_backdoor_nodes:
                 info = self.weak_backdoor_nodes[neighbor_id]
 
-                if compliant_rate > 0.0:
-                    # SUCCESS! Node showed SOME compliance → it's honest, not filtering
+                if compliant_rate > 0.0 and not is_suspicious:
+                    # SUCCESS! Node showed SOME compliance and is NO LONGER suspicious
                     logging.info(
                         f"[Manager] ✅ Node {neighbor_id} shows {compliant_rate:.2%} after "
-                        f"strengthening attempt {info['attempts']}. BENIGN confirmed (honest values detected)."
+                        f"strengthening attempt {info['attempts']}. BENIGN confirmed."
                     )
                     state["status"] = "BENIGN"
                     state["verified_round"] = current_round
@@ -310,72 +358,35 @@ class HoneyPotManager:
                     return "BENIGN"
 
                 elif info["attempts"] >= self.strengthening_max_attempts:
-                    # EXHAUSTED - Still 0% after max strengthening attempts.
-                    # Use suspicious_count to decide final verdict:
-                    # - If consistently suspicious (≥3 rounds) → MALICIOUS (real attacker)
-                    # - If NOT consistently suspicious → BENIGN (Catastrophic Forgetting)
+                    # EXHAUSTED - Still unverified after max attempts
                     self.weak_backdoor_nodes.pop(neighbor_id, None)
 
                     if state["suspicious_count"] >= 3:
-                        # Consistently suspicious + 0% compliance after max strengthening
-                        # → This node actively replaces the model with its attack
+                        # Consistently suspicious + failed strengthening
                         state["status"] = "MALICIOUS"
                         state["verified_round"] = current_round
                         logging.critical(
-                            f"[Manager] 🚨 Neighbor {neighbor_id} CONFIRMED as MALICIOUS in round {current_round} "
-                            f"(0% compliance after {info['attempts']} strengthening attempts, "
-                            f"suspicious {state['suspicious_count']} consecutive rounds)"
+                            f"[Manager] 🚨 Neighbor {neighbor_id} CONFIRMED as MALICIOUS (Exhausted strengthening with suspicion)"
                         )
                         return "MALICIOUS"
                     else:
-                        # Not consistently suspicious → Catastrophic Forgetting
+                        # Not suspicious enough to block → Catastrophic Forgetting or low data
                         state["status"] = "BENIGN"
                         state["verified_round"] = current_round
-                        state["max_compliant_seen"] = 0.0
-                        logging.warning(
-                            f"[Manager] ⚠️ Node {neighbor_id} still 0% after {info['attempts']} "
-                            f"strengthening attempts but suspicious only {state['suspicious_count']} rounds. "
-                            f"Assuming BENIGN (Catastrophic Forgetting)."
-                        )
+                        logging.warning(f"[Manager] ⚠️ Node {neighbor_id} unverified after strengthening. Assuming BENIGN (CF).")
                         return "BENIGN"
-
                 else:
-                    # Continue strengthening (Progression is now handled once per round in new_round)
-                    logging.info(
-                        f"[Manager] 🔬 Node {neighbor_id} still 0% - strengthening attempt "
-                        f"{info['attempts']}/{self.strengthening_max_attempts} continues..."
-                    )
-
-            elif self.strengthening_enabled and compliant_rate == 0.0 and neighbor_id not in self.weak_backdoor_nodes:
-                # First time seeing 0% - mark for strengthening
-                self.weak_backdoor_nodes[neighbor_id] = {
-                    "round_started": current_round,
-                    "attempts": 1,
-                    "base_injection": self.base_injection_ratio,
-                    "base_weight": self.base_weight_boost
-                }
-                logging.info(
-                    f"[Manager] 🔬 Node {neighbor_id} shows 0% compliant (attempt 1/{self.strengthening_max_attempts}) - "
-                    f"will strengthen backdoor progressively"
-                )
+                    logging.info(f"[Manager] 🔬 Node {neighbor_id} in strengthening pipeline (attempt {info['attempts']}/3)")
+                    return "TESTING"
 
             # Regular negative threshold check (only if not in strengthening mode)
             if neighbor_id not in self.weak_backdoor_nodes and state["negative_count"] >= self.NEGATIVE_THRESHOLD:
                 state["status"] = "MALICIOUS"
                 state["verified_round"] = current_round
-                logging.critical(
-                    f"[Manager] 🚨 Neighbor {neighbor_id} CONFIRMED as MALICIOUS in round {current_round} "
-                    f"(never showed backdoor in {state['negative_count']} rounds, max_compliant={state['max_compliant_seen']:.2%})"
-                )
+                logging.critical(f"[Manager] 🚨 Neighbor {neighbor_id} CONFIRMED as MALICIOUS (Never showed backdoor in {state['negative_count']} rounds)")
                 return "MALICIOUS"
 
-            else:
-                # Still in testing period
-                logging.warning(
-                    f"[Manager] ⏳ Neighbor {neighbor_id} negative {state['negative_count']}/{self.NEGATIVE_THRESHOLD} "
-                    f"(current={compliant_rate:.2%}, max_seen={state['max_compliant_seen']:.2%})"
-                )
-                return "TESTING"
+            return "TESTING"
 
 
     def _check_neighbor_has_backdoor(self, neighbor_model):
@@ -383,14 +394,14 @@ class HoneyPotManager:
         Check if neighbor model contains the honeypot backdoor.
 
         Returns:
-            tuple: (has_backdoor: bool, compliant_rate: float, is_suspicious: bool)
+            tuple: (has_backdoor: bool, compliant_rate: float, is_suspicious: bool, dominant_target: int)
                 - has_backdoor: True if compliant rate >= 2%
                 - compliant_rate: Measure of backdoor presence (0.0 to 1.0)
                 - is_suspicious: True if detector flagged SUSPICIOUS patterns
-                  (e.g. Sample Poisoning: model predicts third-target labels)
+                - dominant_target: The label most targeted by suspicious predictions
         """
         if not self.detector or not neighbor_model:
-            return False, 0.0, False
+            return False, 0.0, False, None
 
         try:
             # Get validation data
@@ -411,23 +422,22 @@ class HoneyPotManager:
                     # Load neighbor's model
                     trainer.set_model_parameters(neighbor_model)
 
-                    # Run detector check
-                    is_suspicious, severity, det_compliant_rate = self.detector.check(trainer.model, clean_batch, self.current_map)
+                    # Run detector check (receiving dominant_target)
+                    is_suspicious, severity, det_compliant_rate, dominant_target = self.detector.check(trainer.model, clean_batch, self.current_map)
 
                     # Restore original model
                     trainer.model.load_state_dict(current_params)
 
                     # Calculate compliant rate (DIRECTLY from detector)
-                    # We no longer use (1.0 - severity) as a proxy
                     compliant_rate = det_compliant_rate
                     has_backdoor = compliant_rate >= 0.02  # 2% threshold
 
-                    return has_backdoor, compliant_rate, is_suspicious
+                    return has_backdoor, compliant_rate, is_suspicious, dominant_target
 
         except Exception as e:
             logging.debug(f"[Manager] Error checking backdoor presence: {e}")
 
-        return False, 0.0, False
+        return False, 0.0, False, None
 
     def should_send_backdoor(self, neighbor_id):
         """

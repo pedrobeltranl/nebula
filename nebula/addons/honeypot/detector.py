@@ -176,4 +176,4 @@ class HoneyDetector:
         elif direct_attack or resistance_attack:
             logging.info(f"[HoneyDetector] ℹ️ Node has honeypot backdoor (Compliant: {compliant_rate:.2%}). Learning from honeypot - marked as HONEST.")
 
-        return is_suspicious, severity, compliant_rate
+        return is_suspicious, severity, compliant_rate, dominant_target
