@@ -49,14 +49,14 @@ class HoneyPotManager:
         # If a suspect gets backdoor during confirmation → False positive, continue search
         # If after 3 rounds still no backdoor → Confirmed attacker
         self.suspect_confirmation = {}    # Track rounds monitoring each suspect
-        self.confirmation_rounds_required = 2  # OPTIMIZED: Wait 2 rounds before confirming attacker
+        self.confirmation_rounds_required = 3  # INCREASED: Wait 3 rounds before confirming attacker (reduced false positives)
 
         # ============================================================================
         # OPTIMIZED NEIGHBOR TRACKING SYSTEM
         # Fast benign verification (1 round) + Conservative malicious confirmation (3 rounds)
         # ============================================================================
         self.neighbor_tracking = {}  # {node_id: {status, negative_count, start_round, verified_round}}
-        self.NEGATIVE_THRESHOLD = 2  # OPTIMIZED: 2 consecutive negative rounds
+        self.NEGATIVE_THRESHOLD = 3  # INCREASED: 3 consecutive negative rounds to allow for bait learning
 
         # ============================================================================
         # ADAPTIVE BACKDOOR STRENGTHENING SYSTEM
