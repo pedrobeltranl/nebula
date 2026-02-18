@@ -795,193 +795,63 @@ class HoneyPotManager:
         # DESPUÉS DEL GRACE PERIOD: Analizar vecinos para detectar atacante
         logging.info(f"[DFS] ✅ Grace period COMPLETE - Starting neighbor analysis")
 
-        compliant_neighbors = []  # Vecinos con backdoor (honestos)
-        suspicious_neighbors = []  # Vecinos sin backdoor (sospechosos)
+        compliant_neighbors = []  # Neighbors with backdoor (honest)
+        suspicious_neighbors = []  # Neighbors without backdoor (suspicious)
+        current_round = getattr(self.engine, 'round', 0) if self.engine else 0
 
         for node_id, model_obj in neighbors_models.items():
             if node_id == came_from:
                 logging.info(f"[DFS] Skipping {node_id} - came from there (no backtrack)")
                 continue
 
-            # VERIFICAR HONEYDOOR: ¿El vecino tiene el backdoor en su modelo?
-            has_backdoor = False
-            severity = 0.0
-
-            if model_obj and self.detector and self.current_map:
-                try:
-                    # Obtener datos de validación y la instancia del modelo
-                    clean_batch = None
-                    model_instance = None
-
-                    if self.role_behavior and hasattr(self.role_behavior, '_engine'):
-                        engine = self.role_behavior._engine
-                        trainer = engine.trainer
-
-                        try:
-                            # Obtener batch de validación
-                            if hasattr(trainer, 'datamodule'):
-                                trainer.datamodule.setup("fit")
-                                val_loader = trainer.datamodule.val_dataloader()
-                                clean_batch = next(iter(val_loader))
-
-                            # Cargar el state_dict del vecino en el modelo temporal
-                            if hasattr(trainer, 'model') and trainer.model:
-                                # Guardar el modelo actual temporalmente
-                                current_params = {k: v.clone() for k, v in trainer.model.state_dict().items()}
-
-                                # Cargar parámetros del vecino
-                                trainer.set_model_parameters(model_obj)
-                                model_instance = trainer.model
-
-                                # Ejecutar el HoneyDetector
-                                if clean_batch and model_instance:
-                                    is_suspicious, severity = self.detector.check(model_instance, clean_batch, self.current_map)
-                                    # INVERTIR: detector retorna is_suspicious (True=atacante, False=honesto)
-                                    # Nosotros necesitamos has_backdoor (True=honesto con backdoor, False=sospechoso)
-                                    has_backdoor = not is_suspicious
-                                    logging.info(f"[DFS] 🔍 {node_id}: HasBackdoor={has_backdoor}, Suspicious={is_suspicious}, Severity={severity:.2f}")
-
-                                # Restaurar el modelo original
-                                trainer.model.load_state_dict(current_params)
-
-                        except Exception as e:
-                            logging.debug(f"[DFS] Error during HoneyDoor check for {node_id}: {e}")
-                            # Intentar restaurar el modelo en caso de error
-                            if 'current_params' in locals() and hasattr(trainer, 'model'):
-                                try:
-                                    trainer.model.load_state_dict(current_params)
-                                except:
-                                    pass
-
-                    if not clean_batch or not model_instance:
-                        logging.debug(f"[DFS] Could not perform HoneyDoor check for {node_id} (missing data or model)")
-
-                except Exception as e:
-                    logging.warning(f"[DFS] HoneyDoor check failed for {node_id}: {e}")
-
-            # CLASIFICAR VECINO:
-            # - has_backdoor=True → COMPLIANT (honesto, agregó nuestro modelo)
-            # - has_backdoor=False → SUSPICIOUS (posible atacante, pero necesita confirmación)
-
             # ============================================================================
-            # FIX: Check neighbor_tracking first to prevent conflicts with memory-based system
-            # If a node was already verified as BENIGN by analyze_neighbor(), respect that decision
+            # UNIFIED ANALYSIS: Use memory-based analyze_neighbor
+            # This handles: suspicious_count, max_compliant, and Smart Attacker detection
             # ============================================================================
-            if node_id in self.neighbor_tracking:
-                tracked_status = self.neighbor_tracking[node_id].get("status", "TESTING")
-                if tracked_status == "BENIGN":
-                    # Node already verified by memory-based system → Skip DFS analysis
-                    compliant_neighbors.append((node_id, severity))
-                    logging.info(f"[DFS] ✅ {node_id} is BENIGN (verified by memory-based tracking, max_compliant={self.neighbor_tracking[node_id].get('max_compliant_seen', 0):.2%})")
+            status = self.analyze_neighbor(node_id, model_obj, current_round)
 
-                    # Clear from suspect confirmation if it was there
-                    if node_id in self.suspect_confirmation:
-                        self.suspect_confirmation.pop(node_id, None)
-                    continue
+            if status == "MALICIOUS":
+                # Confirmed attacker (either by 3 rounds of suspicion or failed strengthening)
+                logging.critical(f"[DFS] 🎯 ATTACKER CONFIRMED: {node_id} (Verdict from Manager)")
+                return (True, node_id)
 
-            if has_backdoor:
-                compliant_neighbors.append((node_id, severity))
-                logging.info(f"[DFS] ✅ {node_id} is COMPLIANT (has honeypot backdoor)")
-
-                # FIX: Use helper to ensure consistent tracking state
-                state = self._get_or_create_neighbor_state(node_id)
-                state["status"] = "COMPLIANT"
-                # FIX: Access round via engine, not role_behavior._current_round (Use 0 if engine not available)
-                current_round = getattr(self.engine, 'round', 0) if self.engine else 0
-                self.neighbor_tracking[node_id]["last_check"] = current_round
-
-                # Si este nodo estaba en confirmación, fue un FALSO POSITIVO (ya recibió el backdoor)
-                if node_id in self.suspect_confirmation:
-                    logging.info(f"[DFS] ✅ FALSE POSITIVE: {node_id} now has backdoor (was suspect for {self.suspect_confirmation[node_id]} rounds). Cleared.")
-                    del self.suspect_confirmation[node_id]
+            if status == "BENIGN":
+                # Node showed backdoor and is NOT consistently suspicious
+                compliant_neighbors.append((node_id, 0.0))
+                logging.info(f"[DFS] ✅ {node_id} prioritized as COMPLIANT/BENIGN")
             else:
-                suspicious_neighbors.append((node_id, severity))
-                logging.warning(f"[DFS] 🚨 {node_id} is SUSPICIOUS (NO honeypot backdoor)")
+                # status == "TESTING" or "COMPLIANT" (if status is COMPLIANT but not yet BENIGN)
+                # We treat anything not BENIGN or MALICIOUS as a "Work in Progress" suspect
+                suspicious_neighbors.append((node_id, 1.0))
+                logging.warning(f"[DFS] ⏳ {node_id} is under TESTING/MONITORING (Current Status: {status})")
 
         # ============================================================================
-        # CONFIRMACIÓN DE SOSPECHOSOS: Esperar 3 rondas antes de declarar atacante
+        # PIVOT OR HOLD DECISION
         # ============================================================================
 
-        # Actualizar contadores de confirmación para sospechosos actuales
-        for node_id, severity in suspicious_neighbors:
-            if node_id not in self.suspect_confirmation:
-                # Primer detección como sospechoso
-                self.suspect_confirmation[node_id] = 1
-                logging.warning(f"[DFS] ⚠️ NEW SUSPECT: {node_id} (round 1/{self.confirmation_rounds_required}). Monitoring for backdoor propagation...")
-            else:
-                # Incrementar contador de confirmación
-                self.suspect_confirmation[node_id] += 1
-                rounds = self.suspect_confirmation[node_id]
-                logging.warning(f"[DFS] ⚠️ SUSPECT MONITORING: {node_id} still without backdoor (round {rounds}/{self.confirmation_rounds_required})")
-
-                # SYNC WITH STRENGTHENING: Ensure suspect is in strengthening pipeline
-                if self.strengthening_enabled and node_id not in self.weak_backdoor_nodes:
-                    self.weak_backdoor_nodes[node_id] = {
-                        "round_started": getattr(self.engine, 'round', 0) if self.engine else 0,
-                        "attempts": 1,
-                        "base_injection": self.base_injection_ratio,
-                        "base_weight": self.base_weight_boost
-                    }
-                    logging.info(f"[DFS] 🔬 Enrolling suspect {node_id} into strengthening pipeline (attempt 1)")
-
-        # Verificar si algún sospechoso alcanzó el umbral de confirmación
-        confirmed_attacker = None
-        for node_id, rounds in self.suspect_confirmation.items():
-            if rounds >= self.confirmation_rounds_required:
-                confirmed_attacker = node_id
-                break
-
-        if confirmed_attacker:
-            # ATACANTE CONFIRMADO después de 3 rondas sin backdoor
-            logging.critical(f"[DFS] 🎯 ATTACKER CONFIRMED: {confirmed_attacker} (NO backdoor after {self.suspect_confirmation[confirmed_attacker]} rounds)")
-            logging.info(f"[DFS] 🛑 STOPPING - Staying at current node to execute containment")
-
-            # Limpiar el tracking de este sospechoso (ya fue confirmado)
-            del self.suspect_confirmation[confirmed_attacker]
-
-            return (True, confirmed_attacker)
-
-        # Si hay sospechosos pero ninguno confirmado aún, QUEDARSE para seguir monitoreando
+        # 1. If we have ANY suspicious neighbor under testing, we HOLD to confirm
         if suspicious_neighbors:
             suspect_id = suspicious_neighbors[0][0]
-            rounds = self.suspect_confirmation.get(suspect_id, 0)
-            logging.info(f"[DFS] ⏳ HOLDING POSITION: Monitoring suspect {suspect_id} ({rounds}/{self.confirmation_rounds_required} rounds). Waiting for backdoor propagation...")
-            return (False, None)  # No pivotar, quedarse monitoreando
-
-        # ============================================================================
-        # FINAL SAFEGUARD: Check memory-based suspects before pivoting
-        # If we have tracked suspects (even if silent this round), we HOLD.
-        # ============================================================================
-        if self.suspect_confirmation:
-            logging.info(f"[DFS] ⏳ HOLDING POSITION: Suspects in memory {list(self.suspect_confirmation.keys())} (silent this round). Waiting...")
+            state = self.neighbor_tracking.get(suspect_id, {})
+            rounds = state.get("suspicious_count", 0)
+            logging.info(f"[DFS] ⏳ HOLDING POSITION: Monitoring suspect {suspect_id} ({rounds}/{self.confirmation_rounds_required} rounds).")
             return (False, None)
 
-        # ============================================================================
-        # FINAL SAFEGUARD: Check memory-based suspects before pivoting
-        # If we have tracked suspects (even if silent this round), we HOLD.
-        # ============================================================================
-        if self.suspect_confirmation:
-            logging.info(f"[DFS] ⏳ HOLDING POSITION: Suspects in memory {list(self.suspect_confirmation.keys())} (silent this round). Waiting...")
-            return (False, None)
-
-        # TOTALMENTE SEGUROS: No hay sospechosos activos ni en memoria.
-        # Si hay vecinos compliant, pivotamos.
+        # 2. If all neighbors are verified BENIGN, we pivot to continue search
         if compliant_neighbors:
-            # CRITICAL FIX: Elegir vecino que NO haya sido visitado (DFS correcto)
+            # Choose neighbor that hasn't been visited (DFS)
             next_pivot = None
-            for neighbor_id, severity in compliant_neighbors:
+            for neighbor_id, _ in compliant_neighbors:
                 if not self.is_visited(neighbor_id):
                     next_pivot = neighbor_id
-                    logging.info(f"[DFS] All neighbors are compliant. Pivoting to {next_pivot} to continue search (unvisited node)")
+                    logging.info(f"[DFS] All neighbors are verified benign. Pivoting to {next_pivot} to continue search.")
                     return (False, next_pivot)
 
-            # Si TODOS los vecinos ya fueron visitados, elegir el de menor severidad (exploración completa)
-            if next_pivot is None:
-                next_pivot = min(compliant_neighbors, key=lambda x: x[1])[0]
-                logging.warning(f"[DFS] All compliant neighbors were visited. Pivoting to {next_pivot} (lowest severity, re-exploration)")
-                return (False, next_pivot)
+            # If ALL neighbors visited, exploration of this branch is finished
+            logging.info("[DFS] All branches from this node already visited. Returning to search from another node.")
+            return (False, None)
 
-        # No hay vecinos disponibles para analizar
+        # No neighbors available for analysis
         logging.warning("[DFS] No neighbors available for analysis.")
         return (False, None)
 
