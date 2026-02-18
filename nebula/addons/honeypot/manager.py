@@ -204,22 +204,8 @@ class HoneyPotManager:
 
         Returns: Current status ("TESTING", "BENIGN", "MALICIOUS")
         """
-        # Initialize if new neighbor
-        if neighbor_id not in self.neighbor_tracking:
-            self.neighbor_tracking[neighbor_id] = {
-                "status": "TESTING",
-                "negative_count": 0,
-                "suspicious_count": 0,              # Consecutive rounds flagged suspicious
-                "rounds_tested": 0,                 # Total rounds this neighbor has been tested
-                "start_round": current_round,
-                "verified_round": None,
-                "max_compliant_seen": 0.0,          # Track highest compliant rate
-                "compliant_history": [],            # List of (round, rate) tuples
-                "first_backdoor_round": None        # When backdoor first detected
-            }
-            logging.info(f"[Manager] 🆕 New neighbor detected: {neighbor_id} - Status: TESTING")
-
-        state = self.neighbor_tracking[neighbor_id]
+        # Use helper to ensure consistent initialization and prevent KeyErrors
+        state = self._get_or_create_neighbor_state(neighbor_id, current_round)
 
         # Skip if already verified
         if state["status"] in ["BENIGN", "MALICIOUS"]:
@@ -515,7 +501,8 @@ class HoneyPotManager:
             "last_pivot_source": last_pivot_source,  # Prevent backtracking
             "rounds_at_current_node": self.rounds_at_current_node,  # Transfer grace counter
             "current_node_id": self.current_node_id,  # Transfer node position
-            "suspect_confirmation": self.suspect_confirmation  # Transfer suspect tracking
+            "suspect_confirmation": self.suspect_confirmation,  # Transfer suspect tracking
+            "neighbor_tracking": self.neighbor_tracking  # CRITICAL: Preserve neighbor memory across pivots
         }
         if self.strategy:
             state["seed_state"] = self.strategy.get_state()
@@ -569,6 +556,11 @@ class HoneyPotManager:
             # RESTORE SEED: Ensure the chaotic map continues the sequence from the previous Honeypot
             self.strategy.state = state["seed_state"]
             logging.info(f"🧬 [Manager] Defense Strategy Seed Restored: {state['seed_state']:.6f}")
+
+        # Restore neighbor verification memory
+        if "neighbor_tracking" in state:
+            self.neighbor_tracking = state["neighbor_tracking"]
+            logging.info(f"[Manager] 🧠 Neighbor tracking memory restored ({len(self.neighbor_tracking)} nodes)")
 
         return transfer_source
 
@@ -715,6 +707,41 @@ class HoneyPotManager:
 
         return None
 
+    def _get_or_create_neighbor_state(self, neighbor_id, current_round=0):
+        """Helper to ensure neighbor_tracking dictionary is consistently populated."""
+        if neighbor_id not in self.neighbor_tracking:
+            self.neighbor_tracking[neighbor_id] = {
+                "status": "TESTING",
+                "negative_count": 0,
+                "suspicious_count": 0,
+                "rounds_tested": 0,
+                "start_round": current_round,
+                "verified_round": None,
+                "max_compliant_seen": 0.0,
+                "compliant_history": [],
+                "first_backdoor_round": None
+            }
+            logging.info(f"[Manager] 🆕 Initializing tracking for neighbor: {neighbor_id}")
+
+        # Repair missing keys (for backwards compatibility/partial updates)
+        state = self.neighbor_tracking[neighbor_id]
+        defaults = {
+            "status": "TESTING",
+            "negative_count": 0,
+            "suspicious_count": 0,
+            "rounds_tested": 0,
+            "start_round": current_round,
+            "verified_round": None,
+            "max_compliant_seen": 0.0,
+            "compliant_history": [],
+            "first_backdoor_round": None
+        }
+        for key, val in defaults.items():
+            if key not in state:
+                state[key] = val
+
+        return state
+
     def analyze_neighbors_at_current_node(self, neighbors_models: dict, reputation_module, came_from: str = None, my_neighbors: set = None) -> tuple:
         """
         Analiza los vecinos del nodo actual para detectar al atacante usando DFS + HoneyDoor.
@@ -842,10 +869,9 @@ class HoneyPotManager:
                 compliant_neighbors.append((node_id, severity))
                 logging.info(f"[DFS] ✅ {node_id} is COMPLIANT (has honeypot backdoor)")
 
-                # FIX: Explicitly update tracking status so get_neighbor_status() returns "COMPLIANT"
-                if node_id not in self.neighbor_tracking:
-                    self.neighbor_tracking[node_id] = {}
-                self.neighbor_tracking[node_id]["status"] = "COMPLIANT"
+                # FIX: Use helper to ensure consistent tracking state
+                state = self._get_or_create_neighbor_state(node_id)
+                state["status"] = "COMPLIANT"
                 # FIX: Access round via engine, not role_behavior._current_round (Use 0 if engine not available)
                 current_round = getattr(self.engine, 'round', 0) if self.engine else 0
                 self.neighbor_tracking[node_id]["last_check"] = current_round

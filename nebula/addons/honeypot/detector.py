@@ -103,16 +103,16 @@ class HoneyDetector:
 
         # Patterns
         # Direct Attack: High suspicion Rate.
-        # Increased thresholds to avoid false positives from noisy benign models (Round 1-3)
-        high_suspicion = suspicious_rate > 0.7
-        extreme_suspicion = suspicious_rate > 0.85
+        # Strict thresholds to avoid false positives from noisy benign models (Round 1-3)
+        # Benign Node 0 seen at 87% suspicion / 43% concentration.
+        high_suspicion = suspicious_rate > 0.75
+        extreme_suspicion = suspicious_rate > 0.90
 
         # Pattern 1: Direct Attack (Third-target poisoning)
-        # We restore MUST have > 50% concentration to trigger detection.
-        # This prevents benign but noisy models (Round 1-3) from being flagged.
-        # A true poisoner will usually have > 60% concentration on its target.
-        direct_attack = (suspicious_rate > self.threshold and target_concentration > 0.5) or \
-                        (extreme_suspicion and target_concentration > 0.48)
+        # Normal detection: > 55% concentration
+        # Extreme suspicion: > 50% concentration
+        direct_attack = (suspicious_rate > self.threshold and target_concentration > 0.55) or \
+                        (extreme_suspicion and target_concentration > 0.50)
 
         # Pattern 2: Model Replacement Attack
         resistance_attack = (honest_rate > 0.85 and compliant_rate < 0.02)
@@ -121,11 +121,22 @@ class HoneyDetector:
         has_honeypot_backdoor = compliant_rate >= 0.02
 
         # Decision Logic
-        # A node that learns the honeypot backdoor but STILL poisons is a "Clever Attacker".
-        # We only forgive suspicion via 'has_honeypot_backdoor' if suspicion is NOT extreme.
+        # A node that learns the honeypot backdoor but STILL poisons is a "Smart Attacker".
+        # We only forgive suspicion via 'has_honeypot_backdoor' if suspicion is moderate.
         is_suspicious = (direct_attack or resistance_attack)
 
-        if has_honeypot_backdoor and not extreme_suspicion:
+        # Detection Pattern 4: Smart Attacker (Compliant + Suspicious)
+        # Even if concentration is low, if it's high suspicion AND compliant, it's an attacker
+        # who is trying to evade by learning the cebo.
+        smart_attacker = has_honeypot_backdoor and suspicious_rate > 0.7
+
+        if smart_attacker:
+            is_suspicious = True
+            logging.warning(
+                f"[HoneyDetector] 🚨 Smart Attacker Detected! Learned bait ({compliant_rate:.2%}) "
+                f"but still has high suspicion ({suspicious_rate:.2%})."
+            )
+        elif has_honeypot_backdoor and not extreme_suspicion:
             # Forgive moderate suspiciousness if they learned the bait (likely noise/divergence)
             is_suspicious = False
 
