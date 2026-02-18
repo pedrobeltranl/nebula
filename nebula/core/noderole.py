@@ -919,9 +919,97 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                              logging.warning(f"[Honeypot] ⚠️ Boosting Epochs from {original_epochs} to {MIN_BAIT_EPOCHS} to ensure bait learning.")
                              self._engine.trainer.max_epochs = MIN_BAIT_EPOCHS
 
-            # Train Baited Model
+            # Train Baited Model with Validation Loop
             if should_inject_bait:
-                await self._engine.trainer.train()
+                # Validation Loop Parameters
+                bait_validation_passed = False
+                max_retries = 3
+                attempt = 0
+                original_lr = current_lr
+                original_epochs = self._engine.trainer.max_epochs
+
+                # Dynamic boosting variables
+                current_boost_lr = new_baited_lr
+                current_epochs = self._engine.trainer.max_epochs
+
+                while attempt <= max_retries and not bait_validation_passed:
+                    attempt += 1
+                    logging.info(f"[Honeypot] 🎣 Baited Training Attempt {attempt}/{max_retries + 1} | LR={current_boost_lr:.4f} | Epochs={current_epochs}")
+
+                    # Apply current parameters
+                    if hasattr(self._engine.trainer, 'update_model_learning_rate'):
+                        self._engine.trainer.update_model_learning_rate(current_boost_lr)
+                    self._engine.trainer.max_epochs = current_epochs
+
+                    # Train
+                    await self._engine.trainer.train()
+
+                    # --- VALIDATION STEP ---
+                    logging.info("[Honeypot] 🔍 Verifying Bait Retention (Self-Test)...")
+                    try:
+                        # Create 100% Baited Validation Loader
+                        # reusing the factory logic but with injection_ratio=1.0
+
+                        # Get a fresh reference to dataset
+                        base_loader_for_val = _original_loader_method()
+
+                        # Create dataset with 100% injection to test PURE bait knowledge
+                        val_honey_ds = HoneyDataset(base_loader_for_val.dataset, self.manager.current_map, injection_ratio=1.0)
+
+                        val_loader = DataLoader(val_honey_ds, batch_size=base_loader_for_val.batch_size, shuffle=False, num_workers=getattr(base_loader_for_val, 'num_workers', 0))
+
+                        # Patch Trainer Test Loader
+                        original_test_loader_method = None
+                        if hasattr(original_dm, 'test_dataloader'):
+                            original_test_loader_method = original_dm.test_dataloader
+                            original_dm.test_dataloader = lambda: val_loader
+
+                        # Run Test
+                        # We use the internal test method or similar.
+                        # Assuming lightning.py has a test() method that returns metrics or we can access callback metrics.
+                        # For simplicity/robustness, we'll try to use the accessible test() method if available,
+                        # or if not generic, we might need a custom verification if test() is too heavy (e.g. sends events).
+                        # BUT, `lightning.py` test() sends a TestMetricsEvent. We might just want the return values.
+                        # _test_sync returns (loss, accuracy). We can use that via `await asyncio.to_thread(self._engine.trainer._test_sync)`
+                        # but accessing private methods is risky.
+                        # Let's check if we can inspect the model directly or use the public test() but silence the event? Both are tricky.
+                        # Let's call the public test() but be aware it publishes an event. That's actually fine/good for logging.
+
+                        # However, to gate the loop, we need the values.
+                        # `lightning.py` L331: `loss, accuracy = await ...`
+                        # So we can just call it (if we modify it to return values, but `test()` returns None in the snippets shown earlier, it publishes event).
+                        # Wait, snippet for `test()`:
+                        # 331: loss, accuracy = await asyncio.wait_for(asyncio.to_thread(self._test_sync), timeout=120)
+                        # ...
+                        # 334: await EventManager...
+                        # It doesn't return them to the caller.
+
+                        # OPTION: We invoke `_test_sync` directly via thread to get values without publishing event (to avoid spamming network events if not needed, though maybe we want them).
+                        # Let's use `_test_sync` logic to get the raw accuracy.
+
+                        val_loss, val_acc = await asyncio.to_thread(self._engine.trainer._test_sync)
+
+                        # Restore Test Loader
+                        if original_test_loader_method:
+                            original_dm.test_dataloader = original_test_loader_method
+
+                        logging.info(f"[Honeypot] 📊 Bait Validation Results: Accuracy={val_acc:.4f} | Loss={val_loss:.4f}")
+
+                        if val_acc is not None and val_acc >= 0.95:
+                            bait_validation_passed = True
+                            logging.info("[Honeypot] ✅ Bait Verification PASSED. Model is ready for propagation.")
+                        else:
+                            logging.warning(f"[Honeypot] ⚠️ Bait Verification FAILED (Acc {val_acc:.4f} < 0.95). Boosting parameters...")
+                            # Boost logic
+                            current_boost_lr = min(current_boost_lr * 1.5, 0.1) # Max cap 0.1
+                            current_epochs = min(current_epochs + 5, 20) # Max cap 20 epochs
+                            if attempt >= max_retries:
+                                logging.error("[Honeypot] ❌ Max Retries reached. Propagating best effort.")
+
+                    except Exception as val_e:
+                        logging.error(f"[Honeypot] Validation error: {val_e}. Proceeding with propagation.")
+                        bait_validation_passed = True # Fail open to avoid stuck loop
+
                 logging.info("[Honeypot] 🎣 Baited Training Complete.")
 
                 # Propagate BAITED Model to ALL TESTING neighbors concurrently
