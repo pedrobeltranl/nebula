@@ -198,7 +198,7 @@ class Reputation:
                      use_provided_metrics = True
                      self._metrics = reputation_config["metrics"]
 
-            if not use_provided_metrics:
+            if not use_provided_metrics and reputation_config.get("enabled", False) is not False:
                  logging.info("[Reputation] ⚠️ Honeypot active but all reputation metrics disabled in config. Enforcing defaults to enable threat detection.")
                  self._metrics = {
                      "model_similarity": {"enabled": True, "weight": 0.25},
@@ -206,6 +206,9 @@ class Reputation:
                      "model_arrival_latency": {"enabled": True, "weight": 0.25},
                      "fraction_parameters_changed": {"enabled": True, "weight": 0.25}
                  }
+            elif not use_provided_metrics:
+                 logging.info("[Reputation] ℹ️ Honeypot active but Reputation explicitly disabled. Running in passive mode (No metrics).")
+                 self._metrics = {}
 
             self._initial_reputation = float(reputation_config.get("initial_reputation", 0.5))
             self._weighting_factor = reputation_config.get("weighting_factor", "dynamic")

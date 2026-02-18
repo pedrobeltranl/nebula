@@ -722,6 +722,16 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             self._last_pivot_source = self._honeypot_transfer_source
             logging.info(f"[Honeypot] 🔗 Transfer source {self._honeypot_transfer_source} marked as came_from (safe)")
 
+            # NEW: Immediately mark previous node as BENIGN so it receives CLEAN models
+            if self.manager:
+                self.manager.neighbor_tracking[self._honeypot_transfer_source] = {
+                    "status": "BENIGN",
+                    "verified_round": self._engine.round,
+                    "max_compliant_seen": 1.0, # Assume fully compliant since it was US
+                    "first_backdoor_round": self._engine.round
+                }
+                logging.info(f"[Honeypot] ✅ Previous Node {self._honeypot_transfer_source} registered as BENIGN (Clean Model Candidate)")
+
         # Bandera clave: Si es True, hemos encontrado al malo y no nos movemos.
         self.threat_confirmed_locally = False
 
@@ -907,27 +917,23 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 await self._engine.trainer.train()
                 logging.info("[Honeypot] 🎣 Baited Training Complete.")
 
-                # Propagate BAITED Model to TESTING neighbors immediately
-                # FIX 1: Sequential Baiting - Only send bait to ONE neighbor at a time
-                # This prevents corrupting ALL neighbors in early rounds
+                # Propagate BAITED Model to ALL TESTING neighbors concurrently
+                # FIX 1 (Revised): Parallel Baiting - Send bait to ALL neighbors under test.
+                # This aligns with user requirement: "Round 1: Send bait and see who aggregates it".
                 neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
                 testing_neighbors = [n for n in neighbors if self.manager.get_neighbor_status(n) == "TESTING"]
-                backdoor_recipients = [testing_neighbors[0]] if testing_neighbors else []
+
+                # ADAPTIVE BAITING LOGIC:
+                # If neighbors have different strengthening needs, we should strictly speaking send different models.
+                # But for now, we use the single baited model trained above.
+                # In the future, we might need per-neighbor model generation if strengthening levels diverge significantly.
+                backdoor_recipients = testing_neighbors
 
                 if backdoor_recipients:
                     logging.info(f"[Honeypot] 🎭 Sending BAITED model to {len(backdoor_recipients)} TESTING neighbors: {backdoor_recipients}")
-                    # We broadcast to ALL for now because current Event system doesn't support unicast models easily in this context
-                    # BUT since we re-train clean right after, we need to be careful.
-                    # Ideally we send specific messages. For now, we assume broadcast is safer IF we only have suspects.
-                    # WAIT: If we have mixed neighbors, we can't broadcast both.
-                    # FIX: Use `unicast_model_events` if possible, or just broadcast the Bait to everyone IF majority is TESTING?
-                    # No, that poisons benign.
-                    # Hack: The current system sends to `neighbors` list in ModelPropagationEvent.
-                    # We can create a partial list!
-
-                    if backdoor_recipients:
-                        mpe = ModelPropagationEvent(backdoor_recipients, "stable") # Only send to suspects
-                        await EventManager.get_instance().publish_node_event(mpe)
+                    # Broadcast bait to all suspects
+                    mpe = ModelPropagationEvent(backdoor_recipients, "stable")
+                    await EventManager.get_instance().publish_node_event(mpe)
 
         except Exception as e:
             logging.error(f"[Honeypot] Error during Baited training: {e}")
@@ -982,12 +988,23 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 clean_recipients = neighbors
                 logging.info(f"[Honeypot] 🏳️ Handover/Containment Active - Sending CLEAN model to ALL neighbors ({len(clean_recipients)})")
             else:
+                # ONLY send Clean model to BENIGN. Testing nodes already got Baited model in Phase A.
+                # Suspicious/Malicious nodes get nothing (or maybe Clean if we want to keep them hooked? No, we choke them).
                 clean_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) == "BENIGN"]
 
             if clean_recipients:
                 logging.info(f"[Honeypot] 🧹 Sending CLEAN model to {len(clean_recipients)} recipients: {clean_recipients}")
                 mpe = ModelPropagationEvent(clean_recipients, "stable")
                 await EventManager.get_instance().publish_node_event(mpe)
+
+            # FIX: If Threat Confirmed (Containment Mode), we must behave like a normal Aggregator.
+            # This means WAITING for updates from our (benign) neighbors and aggregating them.
+            if self.threat_confirmed_locally:
+                 logging.info(f"[Honeypot] 🛡️ CONTAINMENT MODE: Waiting for neighbor updates to Aggregate (Normal Aggregator Behavior).")
+                 await self._engine._waiting_model_updates()
+
+                 # Note: After aggregation, the cycle ends, and the Engine will update the model with the aggregated result
+                 # before the next round starts. This completes the "Normal Aggregator" loop.
 
             # FIX: Report Metrics (Test Global/Local Model)
             # Optimization: MOVED TO END of Phase B to unblock propagation.

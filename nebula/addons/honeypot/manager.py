@@ -66,10 +66,10 @@ class HoneyPotManager:
         self.weak_backdoor_nodes = {}  # {node_id: {round_started, attempts, original_params}}
         self.strengthening_enabled = True
         self.strengthening_max_attempts = 3   # OPTIMIZED: 3 attempts (User Request: Fast & Strong)
-        self.strengthening_injection_step = 0.25  # +25% per attempt -> +75% total
-        self.strengthening_weight_step = 1.0      # +1.0x weight per attempt -> x4.0 total
-        self.strengthening_lr_step = 1.0          # +1.0x LR per attempt -> x4.0 total
-        self.base_injection_ratio = 0.2           # Start at 20%
+        self.strengthening_injection_step = 1.0   # +100% factor (doubles ratio) per attempt
+        self.strengthening_weight_step = 2.0      # +2.0x weight per attempt -> x3.0, x5.0, x7.0
+        self.strengthening_lr_step = 2.0          # +2.0x LR per attempt -> x3.0, x5.0, x7.0
+        self.base_injection_ratio = 0.3           # Start at 30% (Aggressive start)
         self.base_weight_boost = 1.5              # Base weight boost
         self.base_lr_boost = 1.0                  # Base LR boost
 
