@@ -2,6 +2,12 @@ import logging
 import csv
 import os
 from datetime import datetime
+try:
+    import numpy as np
+    import torch
+except ImportError:
+    np = None
+    torch = None
 from lightning.pytorch.loggers import CSVLogger
 
 
@@ -12,10 +18,10 @@ class NebulaCSVLogger(CSVLogger):
         self.local_step = 0
         self.global_step = 0
         self.current_round = 0
-        
+
         # Initialize parent with typical args
         super().__init__(save_dir, name, version, *args, **kwargs)
-        
+
         # Ensure log directory exists immediately
         self._custom_log_dir = self.log_dir
         os.makedirs(self._custom_log_dir, exist_ok=True)
@@ -33,7 +39,7 @@ class NebulaCSVLogger(CSVLogger):
     def log_data(self, data, step=None):
         if step is None:
             step = self.get_step()
-        
+
         # Forward to log_metrics which handles the dispatching
         try:
             self.log_metrics(data, step)
@@ -47,7 +53,7 @@ class NebulaCSVLogger(CSVLogger):
 
         if "epoch" in metrics:
             metrics.pop("epoch")
-            
+
         # 1. Check for Round Update
         if "A-Round" in metrics:
             self.current_round = metrics["A-Round"]
@@ -55,7 +61,7 @@ class NebulaCSVLogger(CSVLogger):
         # 2. Classify Metrics
         resource_metrics = {}
         model_metrics = {}
-        
+
         for k, v in metrics.items():
             # Resource prefixes based on reporter.py: W-CPU, Z-RAM, Y-Disk, X-Network
             if k.startswith(("W-", "X-", "Y-", "Z-")):
@@ -86,25 +92,47 @@ class NebulaCSVLogger(CSVLogger):
                 elif "Test (Global)/" in k:
                     phase = "test_global"
                     break
-            
+
             filename = f"metrics_{phase}_round_{self.current_round}.csv"
             self._append_to_csv(filename, model_metrics, step, timestamp)
 
     def _append_to_csv(self, filename, metrics_dict, step, timestamp):
         filepath = os.path.join(self.log_dir, filename)
         file_exists = os.path.isfile(filepath)
-        
+
+    def _clean_value(self, v):
+        """Recursively convert numpy types, tensors, and dicts to native Python types."""
+        if np is not None:
+            if isinstance(v, (np.float32, np.float64, np.float16)):
+                return float(v)
+            if isinstance(v, (np.int32, np.int64, np.int16)):
+                return int(v)
+            if isinstance(v, np.ndarray):
+                return self._clean_value(v.tolist())
+
+        if torch is not None:
+            if torch.is_tensor(v):
+                if v.numel() == 1:
+                    return self._clean_value(v.item())
+                return self._clean_value(v.tolist())
+        if isinstance(v, dict):
+            return {str(k): self._clean_value(val) for k, val in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [self._clean_value(item) for item in v]
+        return v
+
+    def _append_to_csv(self, filename, metrics_dict, step, timestamp):
+        filepath = os.path.join(self.log_dir, filename)
+        file_exists = os.path.isfile(filepath)
+
         # Prepare row data
         row_data = {"step": step, "timestamp": timestamp}
-        # Clean values (tensor -> float if needed)
+        # Clean values recursively
         for k, v in metrics_dict.items():
-            try:
-                row_data[k] = float(v) if hasattr(v, 'item') else v
-            except:
-                row_data[k] = v
+            row_data[k] = self._clean_value(v)
 
         fieldnames = ["step", "timestamp"] + sorted(metrics_dict.keys())
-        
+
         try:
             if not file_exists:
                 with open(filepath, mode='w', newline='') as f:
@@ -127,9 +155,9 @@ class NebulaCSVLogger(CSVLogger):
                     with open(filepath, 'r') as r:
                         reader = csv.DictReader(r)
                         rows = list(reader)
-                    
+
                     final_fieldnames = existing_header + new_cols
-                    
+
                     with open(filepath, 'w', newline='') as f:
                         writer = csv.DictWriter(f, fieldnames=final_fieldnames)
                         writer.writeheader()

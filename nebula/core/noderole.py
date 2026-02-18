@@ -1001,7 +1001,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
                         try:
                             with torch.no_grad():
-                                for batch in validation_loader:
+                                for batch in val_loader:
                                     x, y = batch
                                     x = x.to(device)
                                     y = y.to(device)

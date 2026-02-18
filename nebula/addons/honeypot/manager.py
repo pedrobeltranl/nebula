@@ -57,6 +57,7 @@ class HoneyPotManager:
         # ============================================================================
         self.neighbor_tracking = {}  # {node_id: {status, negative_count, start_round, verified_round}}
         self.NEGATIVE_THRESHOLD = 3  # INCREASED: 3 consecutive negative rounds to allow for bait learning
+        self.recent_detections = {}  # {node_id: detection_count} - Fast safety buffer
 
         # ============================================================================
         # ADAPTIVE BACKDOOR STRENGTHENING SYSTEM
@@ -220,9 +221,9 @@ class HoneyPotManager:
         # Use helper to ensure consistent initialization and prevent KeyErrors
         state = self._get_or_create_neighbor_state(neighbor_id, current_round)
 
-        # Skip if already verified
-        if state["status"] in ["BENIGN", "MALICIOUS"]:
-            return state["status"]
+        # Skip if already verified as MALICIOUS (no need to re-verify)
+        if state["status"] == "MALICIOUS":
+            return "MALICIOUS"
 
         # Analyze model for backdoor presence (returns bool + compliant_rate + is_suspicious)
         has_backdoor, compliant_rate, is_suspicious = self._check_neighbor_has_backdoor(neighbor_model)
@@ -249,9 +250,10 @@ class HoneyPotManager:
         # Track suspicious rounds (used at strengthening exhaustion for final verdict)
         if is_suspicious:
             state["suspicious_count"] += 1
+            self.recent_detections[neighbor_id] = self.recent_detections.get(neighbor_id, 0) + 1
             logging.info(
                 f"[Manager] ⚠️ Neighbor {neighbor_id} flagged SUSPICIOUS (count: {state['suspicious_count']}) "
-                f"- will verify through strengthening pipeline"
+                f"- recent detections: {self.recent_detections[neighbor_id]}"
             )
         else:
             state["suspicious_count"] = 0  # Reset on non-suspicious round
@@ -304,7 +306,7 @@ class HoneyPotManager:
                     state["max_compliant_seen"] = compliant_rate
                     state["first_backdoor_round"] = current_round
 
-                    del self.weak_backdoor_nodes[neighbor_id]
+                    self.weak_backdoor_nodes.pop(neighbor_id, None)
                     return "BENIGN"
 
                 elif info["attempts"] >= self.strengthening_max_attempts:
@@ -312,7 +314,7 @@ class HoneyPotManager:
                     # Use suspicious_count to decide final verdict:
                     # - If consistently suspicious (≥3 rounds) → MALICIOUS (real attacker)
                     # - If NOT consistently suspicious → BENIGN (Catastrophic Forgetting)
-                    del self.weak_backdoor_nodes[neighbor_id]
+                    self.weak_backdoor_nodes.pop(neighbor_id, None)
 
                     if state["suspicious_count"] >= 3:
                         # Consistently suspicious + 0% compliance after max strengthening
@@ -874,7 +876,7 @@ class HoneyPotManager:
 
                     # Clear from suspect confirmation if it was there
                     if node_id in self.suspect_confirmation:
-                        del self.suspect_confirmation[node_id]
+                        self.suspect_confirmation.pop(node_id, None)
                     continue
 
             if has_backdoor:
