@@ -84,6 +84,19 @@ class HoneyPotManager:
         # Esto permite convergencia total del backdoor
         if self.strategy:
             logging.info(f"🔒 [HoneyManager] STABLE Honey Map (permanent): {self.current_map}")
+
+        # ROUND-BASED HARDENING: Increment attempts for nodes already in strengthening pipeline
+        # This ensures power increases every round even if analyze_neighbor hasn't run yet
+        if self.strengthening_enabled:
+            for neighbor_id in list(self.weak_backdoor_nodes.keys()):
+                info = self.weak_backdoor_nodes[neighbor_id]
+                if info["attempts"] < self.strengthening_max_attempts:
+                    info["attempts"] += 1
+                    logging.info(
+                        f"[Manager] ⚡ ROUND-BASED HARDENING: Boosting power for {neighbor_id} "
+                        f"(attempt {info['attempts']}/{self.strengthening_max_attempts})"
+                    )
+
         return self.current_map
 
     def get_dataset(self, original_dataset, injection_ratio=None):
@@ -325,11 +338,10 @@ class HoneyPotManager:
                         return "BENIGN"
 
                 else:
-                    # Continue strengthening
-                    info["attempts"] += 1
+                    # Continue strengthening (Progression is now handled once per round in new_round)
                     logging.info(
                         f"[Manager] 🔬 Node {neighbor_id} still 0% - strengthening attempt "
-                        f"{info['attempts']}/{self.strengthening_max_attempts}"
+                        f"{info['attempts']}/{self.strengthening_max_attempts} continues..."
                     )
 
             elif self.strengthening_enabled and compliant_rate == 0.0 and neighbor_id not in self.weak_backdoor_nodes:
@@ -899,6 +911,16 @@ class HoneyPotManager:
                 self.suspect_confirmation[node_id] += 1
                 rounds = self.suspect_confirmation[node_id]
                 logging.warning(f"[DFS] ⚠️ SUSPECT MONITORING: {node_id} still without backdoor (round {rounds}/{self.confirmation_rounds_required})")
+
+                # SYNC WITH STRENGTHENING: Ensure suspect is in strengthening pipeline
+                if self.strengthening_enabled and node_id not in self.weak_backdoor_nodes:
+                    self.weak_backdoor_nodes[node_id] = {
+                        "round_started": getattr(self.engine, 'round', 0) if self.engine else 0,
+                        "attempts": 1,
+                        "base_injection": self.base_injection_ratio,
+                        "base_weight": self.base_weight_boost
+                    }
+                    logging.info(f"[DFS] 🔬 Enrolling suspect {node_id} into strengthening pipeline (attempt 1)")
 
         # Verificar si algún sospechoso alcanzó el umbral de confirmación
         confirmed_attacker = None
