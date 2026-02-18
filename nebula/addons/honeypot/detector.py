@@ -103,13 +103,16 @@ class HoneyDetector:
 
         # Patterns
         # Direct Attack: High suspicion Rate.
-        extreme_suspicion = suspicious_rate > 0.6
+        # Increased thresholds to avoid false positives from noisy benign models (Round 1-3)
+        high_suspicion = suspicious_rate > 0.7
+        extreme_suspicion = suspicious_rate > 0.85
 
         # Pattern 1: Direct Attack (Third-target poisoning)
-        # If suspicion is extreme (>60%), we relax concentration requirements (0.3 instead of 0.5)
-        # to catch attackers who disperse their poison across multiple targets.
-        direct_attack = (extreme_suspicion and target_concentration > 0.3) or \
-                        (suspicious_rate > self.threshold and target_concentration > 0.5)
+        # We restore MUST have > 50% concentration to trigger detection.
+        # This prevents benign but noisy models (Round 1-3) from being flagged.
+        # A true poisoner will usually have > 60% concentration on its target.
+        direct_attack = (suspicious_rate > self.threshold and target_concentration > 0.5) or \
+                        (extreme_suspicion and target_concentration > 0.48)
 
         # Pattern 2: Model Replacement Attack
         resistance_attack = (honest_rate > 0.85 and compliant_rate < 0.02)

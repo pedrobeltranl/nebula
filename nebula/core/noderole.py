@@ -1170,25 +1170,19 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
             if target in neighbors and not target_shows_backdoor:
                 # Case: Target is connected but NOT showing backdoor
-                # Could be: actually malicious, or false positive + blocked
+                # This could be: an intelligent attacker who filters our cebo,
+                # or a false positive that is simply not aggregating our data.
+                # In either case, if we CONFIRMED it as a threat, we KEEP the block.
                 self.consecutive_clean_rounds += 1
                 logging.info(
-                    f"[Honeypot] 🛡️ Threat {target} not showing backdoor. "
-                    f"Monitoring round {self.consecutive_clean_rounds}/5"
+                    f"[Honeypot] 🛡️ Threat {target} persist (NOT showing backdoor). "
+                    f"Holding containment. Cumulative silent rounds: {self.consecutive_clean_rounds}"
                 )
 
-                if self.consecutive_clean_rounds >= 5:
-                    # After 5 rounds without seeing backdoor:
-                    # - If target was truly malicious and blocked → containment worked
-                    # - If target was a false positive → unblock and move on
-                    logging.info(
-                        "✅ [Honeypot] Monitoring complete (5 rounds). "
-                        "Decommissioning and resuming DFS search."
-                    )
-                    await self._unblock_target(target)
-                    logging.info("♻️  Reverting to benign AGGREGATOR role...")
-                    await self._revert_to_aggregator()
-                    return
+                # CRITICAL: We NO LONGER decommission just because 5 rounds passed.
+                # A confirmed threat is a threat until proven otherwise.
+                # We stay in this role/node to prevent the threat from poisoning the federation.
+                return
 
             else:
                 # Case: Target shows backdoor (aggregating our model) OR left network
