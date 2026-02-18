@@ -947,6 +947,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                     # --- VALIDATION STEP ---
                     logging.info("[Honeypot] 🔍 Verifying Bait Retention (Self-Test)...")
                     try:
+                        # Ensure dataset is initialized
+                        if hasattr(self._engine.trainer.datamodule, 'setup'):
+                            self._engine.trainer.datamodule.setup("fit")
+
                         # Create 100% Baited Validation Loader
                         # reusing the factory logic but with injection_ratio=1.0
 
@@ -964,7 +968,8 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                             original_test_loader_method = original_dm.test_dataloader
                             original_dm.test_dataloader = lambda: val_loader
 
-                        # Run Test
+                        # Run Test (Import asyncio locally to avoid UnboundLocalError if shadowed elsewhere)
+                        import asyncio
                         # We use the internal test method or similar.
                         # Assuming lightning.py has a test() method that returns metrics or we can access callback metrics.
                         # For simplicity/robustness, we'll try to use the accessible test() method if available,
