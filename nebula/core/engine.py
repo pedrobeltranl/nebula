@@ -410,6 +410,11 @@ class Engine:
 
         # --- FIX: PREVENT GENERIC TRANSFER OVERWRITING HONEYPOT ---
         if target_role == Role.AGGREGATOR:
+            # Check if we are ALREADY a Honeypot (Active protection)
+            if self.rb.get_role() == Role.HONEYPOT:
+                logging.warning(f"🛡️  Ignoring generic Leadership Transfer from {source} because I am an active HONEYPOT.")
+                return
+
             # Check if we have a pending high-priority role (HONEYPOT)
             # We need to peek at the next role without consuming it.
             # Ideally this should be a method in RoleBehavior, but accessing protected member is acceptable here for the fix.

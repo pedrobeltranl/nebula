@@ -428,19 +428,6 @@ class AggregatorRoleBehavior(RoleBehavior):
         # 5. Esperar actualizaciones de vecinos y Agregar (Sync)
         await self._engine._waiting_model_updates()
 
-        # Transfer leadership
-        neighbors = await self._engine.cm.get_addrs_current_connections(myself=False)
-        # Check if we are the main behavior or just a wrapper.
-        # If wrapped (e.g. by MaliciousRoleBehavior), do NOT trigger benign leadership transfer.
-        is_active_behavior = (self._engine.rb == self)
-
-        if is_active_behavior and len(neighbors) and not self._transfer_send:
-            random_neighbor = random.choice(list(neighbors))
-            lt_message = self._engine.cm.create_message("control", "leadership_transfer")
-            logging.info(f"Sending transfer leadership to: {random_neighbor}")
-            asyncio.create_task(self._engine.cm.send_message(random_neighbor, lt_message))
-            self._transfer_send = True
-
     async def select_nodes_to_wait(self):
         nodes = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
 
@@ -993,11 +980,11 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                         # Let's use `_test_sync` logic to get the raw accuracy.
 
                         # Manual Validation Loop to bypass Lightning Trainer state issues
-                        self._engine.model.eval()
+                        self._engine.trainer.model.eval()
                         correct = 0
                         total = 0
-                        # Ensure model is on the correct device (likely CPU based on logs, but keeping it safe)
-                        device = next(self._engine.model.parameters()).device
+                        # Ensure model is on the correct device
+                        device = next(self._engine.trainer.model.parameters()).device
 
                         try:
                             with torch.no_grad():
@@ -1005,7 +992,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                                     x, y = batch
                                     x = x.to(device)
                                     y = y.to(device)
-                                    output = self._engine.model(x)
+                                    output = self._engine.trainer.model(x)
                                     pred = output.argmax(dim=1)
                                     correct += (pred == y).sum().item()
                                     total += y.size(0)
@@ -1018,7 +1005,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                             val_acc = None
                             val_loss = None
                         finally:
-                            self._engine.model.train() # Restore train mode
+                            self._engine.trainer.model.train() # Restore train mode
 
                         # Restore Test Loader
                         if original_test_loader_method:
