@@ -101,10 +101,15 @@ class HoneyDetector:
             dominant_target = max(suspicious_targets, key=suspicious_targets.get)
             target_concentration = suspicious_targets[dominant_target] / suspicious_count
 
+        # Patterns
+        # Direct Attack: High suspicion Rate.
+        extreme_suspicion = suspicious_rate > 0.6
+
         # Pattern 1: Direct Attack (Third-target poisoning)
-        # REQUIRES: High suspicious rate AND concentrated on ONE target
-        # concentration > 0.5 means >50% of suspicious predictions point to same label
-        direct_attack = (suspicious_rate > self.threshold and target_concentration > 0.5)
+        # If suspicion is extreme (>60%), we relax concentration requirements (0.3 instead of 0.5)
+        # to catch attackers who disperse their poison across multiple targets.
+        direct_attack = (extreme_suspicion and target_concentration > 0.3) or \
+                        (suspicious_rate > self.threshold and target_concentration > 0.5)
 
         # Pattern 2: Model Replacement Attack
         resistance_attack = (honest_rate > 0.85 and compliant_rate < 0.02)
@@ -113,7 +118,13 @@ class HoneyDetector:
         has_honeypot_backdoor = compliant_rate >= 0.02
 
         # Decision Logic
-        is_suspicious = (direct_attack or resistance_attack) and not has_honeypot_backdoor
+        # A node that learns the honeypot backdoor but STILL poisons is a "Clever Attacker".
+        # We only forgive suspicion via 'has_honeypot_backdoor' if suspicion is NOT extreme.
+        is_suspicious = (direct_attack or resistance_attack)
+
+        if has_honeypot_backdoor and not extreme_suspicion:
+            # Forgive moderate suspiciousness if they learned the bait (likely noise/divergence)
+            is_suspicious = False
 
         # Return the MAX severity for decision making
         severity = max(suspicious_rate, honest_rate if resistance_attack else 0.0)
