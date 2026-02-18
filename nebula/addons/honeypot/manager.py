@@ -398,14 +398,14 @@ class HoneyPotManager:
                     trainer.set_model_parameters(neighbor_model)
 
                     # Run detector check
-                    is_suspicious, severity = self.detector.check(trainer.model, clean_batch, self.current_map)
+                    is_suspicious, severity, det_compliant_rate = self.detector.check(trainer.model, clean_batch, self.current_map)
 
                     # Restore original model
                     trainer.model.load_state_dict(current_params)
 
-                    # Calculate compliant rate (inverse of severity if not suspicious)
-                    # Higher compliant_rate = more backdoor presence
-                    compliant_rate = (1.0 - severity) if not is_suspicious else 0.0
+                    # Calculate compliant rate (DIRECTLY from detector)
+                    # We no longer use (1.0 - severity) as a proxy
+                    compliant_rate = det_compliant_rate
                     has_backdoor = compliant_rate >= 0.02  # 2% threshold
 
                     return has_backdoor, compliant_rate, is_suspicious
