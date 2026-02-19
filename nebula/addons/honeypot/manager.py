@@ -833,6 +833,19 @@ class HoneyPotManager:
         # DESPUÉS DEL GRACE PERIOD: Analizar vecinos para detectar atacante
         logging.info(f"[DFS] ✅ Grace period COMPLETE - Starting neighbor analysis")
 
+        # SAFETY GUARD: Ensure all unvisited neighbors have provided models for the current round.
+        # This avoids premature "dead end" conclusions if a neighbor is just lagging (e.g. Experiment 18:29:21).
+        if my_neighbors:
+            missing_neighbors = []
+            for neighbor_id in my_neighbors:
+                if neighbor_id != came_from and not self.is_visited(neighbor_id):
+                    if neighbor_id not in neighbors_models:
+                        missing_neighbors.append(neighbor_id)
+
+            if missing_neighbors:
+                logging.warning(f"[DFS] ⏳ HOLDING: Waiting for models from lagging neighbors: {missing_neighbors}")
+                return (False, None)
+
         compliant_neighbors = []     # Neighbors verified BENIGN (bait + clean round)
         investigation_neighbors = [] # Neighbors suspicious BUT COMPLIANT (victims/carriers)
         suspicious_neighbors = []    # Neighbors suspicious AND NO BAIT (threats)
@@ -904,8 +917,8 @@ class HoneyPotManager:
             logging.info(f"[DFS] ⏳ HOLDING POSITION: Confirming pure suspect {suspect_id} ({rounds}/{self.confirmation_rounds_required} rounds).")
             return (False, None)
 
-        # 4. If everything visited/analyzed, return to parent
-        logging.info("[DFS] All branches from this node already visited/investigated. Backtracking.")
+        # 4. If everything visited/analyzed, we stay put (Active Monitoring)
+        logging.info("[DFS] 🏁 End of trail reached. All branches from this node already visited. Holding position for local monitoring.")
         return (False, None)
 
     def _is_node_silent_to_neighbors(self, suspect_node: str, my_neighbors: set, reputation_module) -> bool:
