@@ -831,315 +831,150 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         await self._engine.trainning_in_progress_lock.acquire_async()
 
         # Variables for restoration
-        initial_clean_state = None
         _original_loader_method = None
         _honey_dataset_ref = None
         trainer_wrapper = self._engine.trainer
+        initial_clean_state = None
 
-        # --- PHASE A: BAITED TRAINING (For Suspects) ---
+        # --- PHASE A: CLEAN TRAINING (Unblock the network FIRST) ---
         try:
-            neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
-            testing_neighbors = [n for n in neighbors if self.manager.get_neighbor_status(n) == "TESTING"]
+            logging.info("[Honeypot] 🧹 PHASE A: CLEAN TRAINING (Mimic Benign behavior)")
 
-            # FIX: Only inject bait if we have TESTING neighbors and we are not leaving (Handover)
-            # We allow baiting even if threat_confirmed_locally to support multi-target tracking.
-            is_handover = getattr(self._engine, '_waiting_honeypot_handover', False)
-            should_inject_bait = (len(testing_neighbors) > 0) and (not is_handover)
-
-            # Prepare Bait
-            if trainer_wrapper and trainer_wrapper.datamodule and should_inject_bait:
-                # Backup Clean State
-                try:
-                    initial_clean_state = copy.deepcopy(self._engine.trainer.model.state_dict())
-                except Exception as e:
-                    logging.error(f"[Honeypot] Failed to backup clean state: {e}")
-                    # If backup fails, we shouldn't bait as we can't restore
-                    should_inject_bait = False
-
-                if should_inject_bait:
-                    # Imports inside method to avoid circular deps or top-level issues
-                    from nebula.addons.honeypot.dataset import HoneyDataset
-                    from torch.utils.data import DataLoader
-
-                    strengthened_params = None
-                    if self.manager and hasattr(self.manager, 'get_strengthened_params'):
-                        strengthened_params = self.manager.get_strengthened_params()
-
-                    original_dm = trainer_wrapper.datamodule
-                    if hasattr(original_dm, 'train_dataloader'):
-                        _original_loader_method = original_dm.train_dataloader
-
-                        def baited_loader_factory():
-                            nonlocal _honey_dataset_ref
-                            base_loader = _original_loader_method()
-                            injection_ratio = strengthened_params.get('injection_ratio', 0.15) if strengthened_params else 0.15
-                            honey_ds = HoneyDataset(base_loader.dataset, self.manager.current_map, injection_ratio=injection_ratio)
-                            _honey_dataset_ref = honey_ds
-                            return DataLoader(honey_ds, batch_size=base_loader.batch_size, shuffle=True, num_workers=getattr(base_loader, 'num_workers', 0))
-
-                        original_dm.train_dataloader = baited_loader_factory
-
-                        # ADAPTIVE BAITING: Apply Learning Rate Boost if needed
-                        current_lr = 0.01 # Default fallback
-                        if hasattr(self._engine.trainer, 'get_model_learning_rate'):
-                            current_lr = self._engine.trainer.get_model_learning_rate()
-                        elif hasattr(self._engine.config, 'participant'):
-                             current_lr = self._engine.config.participant.get("training_args", {}).get("learning_rate", 0.01)
-
-                        # CRITICAL FIX: Enforce MINIMUM Strength for Bait
-                        MIN_BAIT_LR = 0.05
-                        MIN_BAIT_EPOCHS = 5
-
-                        boost_factor = strengthened_params.get('lr_boost', 1.0) if strengthened_params else 1.0
-                        new_baited_lr = max(current_lr * boost_factor, MIN_BAIT_LR)
-
-                        if hasattr(self._engine.trainer, 'update_model_learning_rate'):
-                            self._engine.trainer.update_model_learning_rate(new_baited_lr)
-
-                        logging.info(f"[Honeypot] 🚀 ADAPTIVE BAITING ACTIVE: Attempt {strengthened_params.get('attempt', '?') if strengthened_params else 'Initial'}")
-                        logging.info(f"[Honeypot]    -> Injection Ratio: {strengthened_params.get('injection_ratio', 0.15) if strengthened_params else 0.15:.2f}")
-                        logging.info(f"[Honeypot]    -> LR Target: {new_baited_lr:.4f} (Base: {current_lr}, Boost: x{boost_factor})")
-
-                        # Ensure minimum epochs
-                        original_epochs = self._engine.trainer.max_epochs
-                        if original_epochs < MIN_BAIT_EPOCHS:
-                             logging.warning(f"[Honeypot] ⚠️ Boosting Epochs from {original_epochs} to {MIN_BAIT_EPOCHS} to ensure bait learning.")
-                             self._engine.trainer.max_epochs = MIN_BAIT_EPOCHS
-
-            # Train Baited Model with Validation Loop
-            if should_inject_bait:
-                # Validation Loop Parameters
-                bait_validation_passed = False
-                max_retries = 3
-                attempt = 0
-                original_lr = current_lr
-                original_epochs = self._engine.trainer.max_epochs
-
-                # Dynamic boosting variables
-                current_boost_lr = new_baited_lr
-                current_epochs = self._engine.trainer.max_epochs
-
-                while attempt <= max_retries and not bait_validation_passed:
-                    attempt += 1
-                    logging.info(f"[Honeypot] 🎣 Baited Training Attempt {attempt}/{max_retries + 1} | LR={current_boost_lr:.4f} | Epochs={current_epochs}")
-
-                    # Apply current parameters
-                    if hasattr(self._engine.trainer, 'update_model_learning_rate'):
-                        self._engine.trainer.update_model_learning_rate(current_boost_lr)
-                    self._engine.trainer.max_epochs = current_epochs
-
-                    # Train
-                    await self._engine.trainer.train()
-
-                    # --- VALIDATION STEP ---
-                    logging.info("[Honeypot] 🔍 Verifying Bait Retention (Self-Test)...")
-                    try:
-                        # Ensure dataset is initialized
-                        if hasattr(self._engine.trainer.datamodule, 'setup'):
-                            self._engine.trainer.datamodule.setup("fit")
-
-                        # Create 100% Baited Validation Loader
-                        # reusing the factory logic but with injection_ratio=1.0
-
-                        # Get a fresh reference to dataset
-                        base_loader_for_val = _original_loader_method()
-
-                        # Create dataset with 100% injection to test PURE bait knowledge
-                        val_honey_ds = HoneyDataset(base_loader_for_val.dataset, self.manager.current_map, injection_ratio=1.0)
-
-                        val_loader = DataLoader(val_honey_ds, batch_size=base_loader_for_val.batch_size, shuffle=False, num_workers=getattr(base_loader_for_val, 'num_workers', 0))
-
-                        # Patch Trainer Test Loader
-                        original_test_loader_method = None
-                        if hasattr(original_dm, 'test_dataloader'):
-                            original_test_loader_method = original_dm.test_dataloader
-                            original_dm.test_dataloader = lambda: val_loader
-
-                        # Run Test (Import asyncio locally to avoid UnboundLocalError if shadowed elsewhere)
-                        import asyncio
-                        # We use the internal test method or similar.
-                        # Assuming lightning.py has a test() method that returns metrics or we can access callback metrics.
-                        # For simplicity/robustness, we'll try to use the accessible test() method if available,
-                        # or if not generic, we might need a custom verification if test() is too heavy (e.g. sends events).
-                        # BUT, `lightning.py` test() sends a TestMetricsEvent. We might just want the return values.
-                        # _test_sync returns (loss, accuracy). We can use that via `await asyncio.to_thread(self._engine.trainer._test_sync)`
-                        # but accessing private methods is risky.
-                        # Let's check if we can inspect the model directly or use the public test() but silence the event? Both are tricky.
-                        # Let's call the public test() but be aware it publishes an event. That's actually fine/good for logging.
-
-                        # However, to gate the loop, we need the values.
-                        # `lightning.py` L331: `loss, accuracy = await ...`
-                        # So we can just call it (if we modify it to return values, but `test()` returns None in the snippets shown earlier, it publishes event).
-                        # Wait, snippet for `test()`:
-                        # 331: loss, accuracy = await asyncio.wait_for(asyncio.to_thread(self._test_sync), timeout=120)
-                        # ...
-                        # 334: await EventManager...
-                        # It doesn't return them to the caller.
-
-                        # OPTION: We invoke `_test_sync` directly via thread to get values without publishing event (to avoid spamming network events if not needed, though maybe we want them).
-                        # Let's use `_test_sync` logic to get the raw accuracy.
-
-                        # Manual Validation Loop to bypass Lightning Trainer state issues
-                        self._engine.trainer.model.eval()
-                        correct = 0
-                        total = 0
-                        # Ensure model is on the correct device
-                        device = next(self._engine.trainer.model.parameters()).device
-
-                        try:
-                            with torch.no_grad():
-                                for batch in val_loader:
-                                    x, y = batch
-                                    x = x.to(device)
-                                    y = y.to(device)
-                                    output = self._engine.trainer.model(x)
-                                    pred = output.argmax(dim=1)
-                                    correct += (pred == y).sum().item()
-                                    total += y.size(0)
-
-                            val_acc = correct / total if total > 0 else 0.0
-                            val_loss = 0.0 # Not critical for this check
-
-                        except Exception as e:
-                            logging.error(f"[Honeypot] ❌ Manual Validation Crashed: {e}")
-                            val_acc = None
-                            val_loss = None
-                        finally:
-                            self._engine.trainer.model.train() # Restore train mode
-
-                        # Restore Test Loader
-                        if original_test_loader_method:
-                            original_dm.test_dataloader = original_test_loader_method
-
-                        if val_acc is not None:
-                            logging.info(f"[Honeypot] 📊 Bait Validation Results: Accuracy={val_acc:.4f} | Loss={val_loss:.4f}" if val_loss is not None else f"[Honeypot] 📊 Bait Validation Results: Accuracy={val_acc:.4f}")
-                        else:
-                            logging.warning("[Honeypot] 📊 Bait Validation Results: None (Failed)")
-
-                        if val_acc is not None and val_acc >= 0.95:
-                            bait_validation_passed = True
-                            logging.info("[Honeypot] ✅ Bait Verification PASSED. Model is ready for propagation.")
-                        else:
-                            logging.warning(f"[Honeypot] ⚠️ Bait Verification FAILED (Acc {val_acc:.4f} < 0.95). Boosting parameters..." if val_acc is not None else "[Honeypot] ⚠️ Bait Verification FAILED (Acc None). Boosting parameters...")
-                            # Boost logic
-                            current_boost_lr = min(current_boost_lr * 1.5, 0.1) # Max cap 0.1
-                            current_epochs = min(current_epochs + 5, 20) # Max cap 20 epochs
-                            if attempt >= max_retries:
-                                logging.error("[Honeypot] ❌ Max Retries reached. Propagating best effort.")
-
-                    except Exception as val_e:
-                        logging.error(f"[Honeypot] Validation error: {val_e}. Proceeding with propagation.")
-                        bait_validation_passed = True # Fail open to avoid stuck loop
-
-                logging.info("[Honeypot] 🎣 Baited Training Complete.")
-
-                # Propagate BAITED Model to ALL TESTING neighbors concurrently
-                backdoor_recipients = testing_neighbors
-
-                if backdoor_recipients:
-                    logging.info(f"[Honeypot] 🎭 Sending BAITED model to {len(backdoor_recipients)} TESTING neighbors: {backdoor_recipients}")
-                    # Broadcast bait to all suspects with optional weight boost
-                    # FIX: Use "Sybil for Good" strategy - set massive weight to force bait adoption
-                    weight_override = None
-                    if strengthened_params and strengthened_params.get("weight_boost"):
-                         weight_override = 1_000_000 # 1 Million samples = Dominates FedAvg
-                         logging.info(f"[Honeypot] 💪 SYBIL BOOST ACTIVE: Reporting weight=1,000,000 to force bait acceptance.")
-                    mpe = ModelPropagationEvent(backdoor_recipients, "stable", weight=weight_override)
-                    await EventManager.get_instance().publish_node_event(mpe)
-
-        except Exception as e:
-            logging.error(f"[Honeypot] Error during Baited training: {e}")
-
-        finally:
-            # Restore Loader
-            if _original_loader_method and trainer_wrapper and trainer_wrapper.datamodule:
-                trainer_wrapper.datamodule.train_dataloader = _original_loader_method
-
-            # Restore Epochs
-            if 'original_epochs' in locals():
-                 self._engine.trainer.max_epochs = original_epochs
-
-        # --- PHASE B: CLEAN TRAINING (For Benign / Self) ---
-        try:
-            logging.info("[Honeypot] 🧹 RESETTING model to Clean State for Benign neighbors...")
-
-            # FIX 3: Restore normal LR for clean training (avoid instability from boosted LR)
+            # Restore normal LR for clean training
             if hasattr(self._engine.trainer, 'update_model_learning_rate'):
                 original_lr = self._engine.config.participant.get("training_args", {}).get("learning_rate", 0.01)
                 self._engine.trainer.update_model_learning_rate(original_lr)
-                logging.info(f"[Honeypot] 🧹 Learning Rate restored to {original_lr} for Clean Training.")
 
-            if initial_clean_state:
-                self._engine.trainer.model.load_state_dict(initial_clean_state)
-
-            # Train Clean Model
-            # We train again, this time without bait hook
+            # Train Clean Model (Standard aggregator behavior)
+            # This is 1 epoch by default
             await self._engine.trainer.train()
             logging.info("[Honeypot] 🧹 Clean Training Complete.")
 
-            # 2. Self-Report (Clean Model)
-            # This ensures future rounds aggregation uses our Clean contribution
+            # 1. Self-Report CLEAN Model IMMEDIATELY
+            # This unblocks the local engine and allows neighbors to aggregate our honest part
             base_weight = self._engine.trainer.get_model_weight()
-            weight_boost_factor = 1.0  # FIX 4: No boost - clean model contributes with fair weight
-            boosted_weight = base_weight * weight_boost_factor
-
             self_update_event = UpdateReceivedEvent(
                 self._engine.trainer.get_model_parameters(),
-                boosted_weight,
+                base_weight,
                 self._engine.addr,
                 self._engine.round
             )
             await EventManager.get_instance().publish_node_event(self_update_event)
 
-            # 3. Propagate CLEAN Model to BENIGN neighbors
+            # 2. Propagate CLEAN Model to BENIGN/CONFIRMED neighbors
             neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
-
-            # FIX: Smart Containment / Propagation
-            # Goal: Clean to Benign/Attacker (to dilute). Bait to Testing (preserved from Phase A).
-
             is_handover = getattr(self._engine, '_waiting_honeypot_handover', False)
 
             if is_handover or self.threat_confirmed_locally:
-                # SMART CONTAINMENT:
-                # Send Clean to Confirmed Attackers (to dilute them) and Benign nodes.
-                # BUT DO NOT send Clean to TESTING nodes (preserve the bait we just sent in Phase A).
-
-                # Note: sending Clean now would overwrite the Bait we just sent if the propagation happens in same round.
-                # By excluding TESTING, we ensure they only receive the Bait model.
-
-                clean_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) != "TESTING"]
-                logging.info(f"[Honeypot] 🛡️ CONTAINMENT MODE: Sending CLEAN model to {len(clean_recipients)} nodes (Excluding TESTING)")
+                 # Containment: Clean to everyone except suspects
+                 clean_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) != "TESTING"]
             else:
-                # Normal Operation: Clean to BENIGN neighbors only.
-                # Suspicious/Malicious nodes get nothing (or we rely on what we sent in Phase A).
-                clean_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) == "BENIGN"]
+                 # Normal: Clean to verified benign only
+                 clean_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) == "BENIGN"]
 
             if clean_recipients:
-                logging.info(f"[Honeypot] 🧹 Sending CLEAN model to {len(clean_recipients)} recipients: {clean_recipients}")
+                logging.info(f"[Honeypot] 🧹 Sending CLEAN model to {len(clean_recipients)} recipients.")
                 mpe = ModelPropagationEvent(clean_recipients, "stable")
                 await EventManager.get_instance().publish_node_event(mpe)
 
-            # FIX: If Threat Confirmed (Containment Mode), we must behave like a normal Aggregator.
-            # This means WAITING for updates from our (benign) neighbors and aggregating them.
-            if self.threat_confirmed_locally:
-                 logging.info(f"[Honeypot] 🛡️ CONTAINMENT MODE: Waiting for neighbor updates to Aggregate (Normal Aggregator Behavior).")
-                 await self._engine._waiting_model_updates()
+            # Check for suspects to decide if we proceed to Baited Training
+            testing_neighbors = [n for n in neighbors if self.manager.get_neighbor_status(n) == "TESTING"]
+            should_inject_bait = (len(testing_neighbors) > 0) and (not is_handover)
 
-            # FIX: Report Metrics (Test Global/Local Model)
+            # --- PHASE B: BAITED TRAINING (Target suspects) ---
+            if should_inject_bait:
+                logging.info(f"[Honeypot] 🎣 PHASE B: BAITED TRAINING for suspects: {testing_neighbors}")
+
+                # Backup Clean State for later restoration
+                initial_clean_state = copy.deepcopy(self._engine.trainer.model.state_dict())
+
+                from nebula.addons.honeypot.dataset import HoneyDataset
+                from torch.utils.data import DataLoader
+
+                strengthened_params = self.manager.get_strengthened_params() if hasattr(self.manager, 'get_strengthened_params') else None
+                original_dm = trainer_wrapper.datamodule
+
+                if original_dm and hasattr(original_dm, 'train_dataloader'):
+                    _original_loader_method = original_dm.train_dataloader
+
+                    def baited_loader_factory():
+                        nonlocal _honey_dataset_ref
+                        base_loader = _original_loader_method()
+                        injection_ratio = strengthened_params.get('injection_ratio', 0.15) if strengthened_params else 0.15
+                        honey_ds = HoneyDataset(base_loader.dataset, self.manager.current_map, injection_ratio=injection_ratio)
+                        _honey_dataset_ref = honey_ds
+                        return DataLoader(honey_ds, batch_size=base_loader.batch_size, shuffle=True, num_workers=getattr(base_loader, 'num_workers', 0))
+
+                    original_dm.train_dataloader = baited_loader_factory
+
+                    # Optimization: Use high LR and LOW Epochs
+                    current_lr = self._engine.config.participant.get("training_args", {}).get("learning_rate", 0.01)
+                    MIN_BAIT_LR = 0.05
+                    MIN_BAIT_EPOCHS = 2 # REDUCED from 5 to 2
+
+                    boost_factor = strengthened_params.get('lr_boost', 2.0) if strengthened_params else 2.0
+                    new_baited_lr = max(current_lr * boost_factor, MIN_BAIT_LR)
+
+                    original_trainer_epochs = self._engine.trainer.max_epochs
+                    self._engine.trainer.max_epochs = MIN_BAIT_EPOCHS
+
+                    if hasattr(self._engine.trainer, 'update_model_learning_rate'):
+                        self._engine.trainer.update_model_learning_rate(new_baited_lr)
+
+                    logging.info(f"[Honeypot] ⚡ Optimized Baited Training: {MIN_BAIT_EPOCHS} epochs | LR={new_baited_lr:.4f}")
+
+                    # Train Baited
+                    await self._engine.trainer.train()
+
+                    # Fast Validation (Limited to 50 samples)
+                    self._engine.trainer.model.eval()
+                    correct, total = 0, 0
+                    device = next(self._engine.trainer.model.parameters()).device
+                    try:
+                        base_loader_for_val = _original_loader_method()
+                        val_honey_ds = HoneyDataset(base_loader_for_val.dataset, self.manager.current_map, injection_ratio=1.0)
+                        # Speed up: only test part of the set
+                        val_loader = DataLoader(val_honey_ds, batch_size=16, shuffle=False)
+                        with torch.no_grad():
+                            for i, batch in enumerate(val_loader):
+                                x, y = batch
+                                x, y = x.to(device), y.to(device)
+                                pred = self._engine.trainer.model(x).argmax(dim=1)
+                                correct += (pred == y).sum().item()
+                                total += y.size(0)
+                                if i > 3: break # Max 64 samples for fast verification
+
+                        val_acc = correct / total if total > 0 else 0.0
+                        logging.info(f"[Honeypot] 📊 Fast Bait Validation: Acc={val_acc:.2%}")
+                    except Exception as ve:
+                        logging.warning(f"[Honeypot] Fast val failed: {ve}")
+                        val_acc = 1.0 # Fail open
+
+                    self._engine.trainer.model.train()
+                    self._engine.trainer.max_epochs = original_trainer_epochs
+
+                    # Propagate Bait
+                    weight_override = 1_000_000 if (strengthened_params and strengthened_params.get("weight_boost")) else None
+                    mpe = ModelPropagationEvent(testing_neighbors, "stable", weight=weight_override)
+                    await EventManager.get_instance().publish_node_event(mpe)
+
+            # Cleanup and Metrics
             cur_round = getattr(self._engine, '_round', 0)
-            if cur_round % 5 == 0:
-                logging.info("[Honeypot] 🔍 Run Validation (Delayed to end of cycle)...")
+            if cur_round % 10 == 0: # Reduced frequency
                 await self._engine.trainer.test()
-            else:
-                logging.info(f"[Honeypot] ⏩ Skipping Validation (Round {cur_round}) to speed up cycle.")
 
         except Exception as e:
-             logging.error(f"[Honeypot] Error during Clean training: {e}")
+            logging.error(f"[Honeypot] Error during learning cycle: {e}")
 
         finally:
-             try:
+            # Restore state for next round
+            if initial_clean_state:
+                self._engine.trainer.model.load_state_dict(initial_clean_state)
+            if _original_loader_method and trainer_wrapper and trainer_wrapper.datamodule:
+                trainer_wrapper.datamodule.train_dataloader = _original_loader_method
+            try:
                 await self._engine.trainning_in_progress_lock.release_async()
-             except:
+            except:
                 pass
 
 
