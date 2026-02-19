@@ -1406,6 +1406,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             return
 
         # SAFETY: If we've retired, don't do anything with pivot logic
+        if not isinstance(self._engine.rb, HoneypotRoleBehavior):
+            logging.info(f"[HONEYPOT] Current role is {type(self._engine.rb).__name__}. Ignoring pivot request.")
+            return
+
         if getattr(self._engine, 'has_served_as_honeypot', False) and not isinstance(self._engine.rb, HoneypotRoleBehavior):
             logging.info(f"[HONEYPOT] Already retired from honeypot role. Ignoring pivot request.")
             return

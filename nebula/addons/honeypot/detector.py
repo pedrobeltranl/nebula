@@ -106,7 +106,7 @@ class HoneyDetector:
         # Strict thresholds to avoid false positives from noisy benign models (Round 1-3)
         # Benign Node 0 seen at 87% suspicion / 43% concentration.
         high_suspicion = suspicious_rate > 0.75
-        extreme_suspicion = suspicious_rate > 0.90
+        extreme_suspicion = suspicious_rate > 0.70
 
         # Pattern 1: Direct Attack (Third-target poisoning)
         # Normal detection: > 55% concentration
