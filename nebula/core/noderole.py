@@ -926,11 +926,15 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                     # Train Baited
                     await self._engine.trainer.train()
 
-                    # Fast Validation (Limited to 50 samples)
+                    # Fast Validation (Limited to 54 samples)
                     self._engine.trainer.model.eval()
                     correct, total = 0, 0
                     device = next(self._engine.trainer.model.parameters()).device
                     try:
+                        # FIX: Ensure datamodule is initialized
+                        if hasattr(self._engine.trainer.datamodule, "setup"):
+                            self._engine.trainer.datamodule.setup("fit")
+
                         base_loader_for_val = _original_loader_method()
                         val_honey_ds = HoneyDataset(base_loader_for_val.dataset, self.manager.current_map, injection_ratio=1.0)
                         # Speed up: only test part of the set
@@ -1553,12 +1557,20 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
     async def _pivot_to(self, candidate):
         # CRITICAL SAFETY CHECK: Never pivot to a node with recent detections
+        # UNLESS the node is confirmed as a CARRIER (has our bait)
         if hasattr(self.manager, 'recent_detections') and candidate in self.manager.recent_detections:
             detection_count = self.manager.recent_detections[candidate]
             if detection_count > 0:
-                logging.error(f"[Honeypot] 🚫 BLOCKED PIVOT to {candidate} - has {detection_count} recent detections (potential attacker)")
-                logging.info(f"[Honeypot] 🛡️ Staying in current position to monitor threat")
-                return  # Abort pivot
+                is_carrier = False
+                if self.manager and hasattr(self.manager, 'neighbor_tracking') and candidate in self.manager.neighbor_tracking:
+                    is_carrier = self.manager.neighbor_tracking[candidate].get("max_compliant_seen", 0) >= 0.02
+
+                if is_carrier:
+                    logging.warning(f"[Honeypot] ⚠️ OVERRIDING PIVOT BLOCK for {candidate}: Node has detections ({detection_count}) but is a confirmed CARRIER. Proceeding to follow trail.")
+                else:
+                    logging.error(f"[Honeypot] 🚫 BLOCKED PIVOT to {candidate} - has {detection_count} recent detections (potential attacker)")
+                    logging.info(f"[Honeypot] 🛡️ Staying in current position to monitor threat")
+                    return  # Abort pivot
 
         logging.info(f"[Honeypot] 👋 Pivoting to {candidate} (Next hop to target).")
         self._last_pivot_target = candidate
