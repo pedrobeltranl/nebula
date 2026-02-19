@@ -58,6 +58,7 @@ class HoneyPotManager:
         self.neighbor_tracking = {}  # {node_id: {status, negative_count, start_round, verified_round}}
         self.NEGATIVE_THRESHOLD = 3  # INCREASED: 3 consecutive negative rounds to allow for bait learning
         self.recent_detections = {}  # {node_id: detection_count} - Fast safety buffer
+        self.missing_rounds = {}     # {node_id: missing_count} - Patience limit for synchronization
 
         # ============================================================================
         # ADAPTIVE BACKDOOR STRENGTHENING SYSTEM
@@ -264,10 +265,20 @@ class HoneyPotManager:
                          break
 
                 if clash_detected:
-                    logging.critical(f"[Manager] 🚨 CONTRADICTION CLASH: {neighbor_id} targets {dominant_target} which overrides HoneyMap rules. VERDICT: MALICIOUS")
-                    state["status"] = "MALICIOUS"
-                    state["verified_round"] = current_round
-                    return "MALICIOUS"
+                    # RCA 21:37:11 - Don't block aggregators that are honest but aggregate poison.
+                    # If the node has bait (current or historical), we treat the clash as a
+                    # "Smart Attacker" signal rather than an immediate block.
+                    if has_backdoor or state["max_compliant_seen"] >= 0.02:
+                         logging.info(
+                             f"[Manager] ⚠️ CONTRADICTION CLASH on {neighbor_id} (targets {dominant_target}) "
+                             f"BUT has bait ({max(compliant_rate, state['max_compliant_seen']):.2%}). "
+                             "Marking as SUSPICIOUS but not blocking yet (Aggregator Resilience)."
+                         )
+                    else:
+                        logging.critical(f"[Manager] 🚨 CONTRADICTION CLASH: {neighbor_id} targets {dominant_target} which overrides HoneyMap rules. VERDICT: MALICIOUS")
+                        state["status"] = "MALICIOUS"
+                        state["verified_round"] = current_round
+                        return "MALICIOUS"
 
             self.recent_detections[neighbor_id] = self.recent_detections.get(neighbor_id, 0) + 1
             logging.warning(
@@ -501,6 +512,7 @@ class HoneyPotManager:
             # New node: reset counter
             self.current_node_id = node_id
             self.rounds_at_current_node = 0
+            self.missing_rounds = {}  # Reset patience tracking when pivoting
             logging.info(f"[Manager] 🎯 Arrived at new node: {node_id} (grace period reset)")
         else:
             # Same node: increment counter
@@ -821,14 +833,37 @@ class HoneyPotManager:
         # SAFETY GUARD: Ensure all unvisited neighbors have provided models for the current round.
         # This avoids premature "dead end" conclusions if a neighbor is just lagging (e.g. Experiment 18:29:21).
         if my_neighbors:
-            missing_neighbors = []
+            waiting_for = []
             for neighbor_id in my_neighbors:
                 if neighbor_id != came_from and not self.is_visited(neighbor_id):
-                    if neighbor_id not in neighbors_models:
-                        missing_neighbors.append(neighbor_id)
+                    # NEW: Skip node if it is permanently blocked in reputation
+                    # This prevents synchronization deadlocks when a node is blocked but still in topology.
+                    if reputation_module and hasattr(reputation_module, "permanently_blocked"):
+                        if neighbor_id in reputation_module.permanently_blocked:
+                            logging.info(f"[DFS] Skipping blocked neighbor {neighbor_id} in waiting guard.")
+                            continue
 
-            if missing_neighbors:
-                logging.warning(f"[DFS] ⏳ HOLDING: Waiting for models from lagging neighbors: {missing_neighbors}")
+                    if neighbor_id not in neighbors_models:
+                        # TRACKING: Increment missing rounds
+                        missing_count = self.missing_rounds.get(neighbor_id, 0) + 1
+                        self.missing_rounds[neighbor_id] = missing_count
+
+                        # Only wait if under patience threshold (3 rounds)
+                        # We use 3 consistent rounds to be sure they are offline/blocked/lagging
+                        # Increased from 1 round to allow for minor network drift
+                        if missing_count <= 3:
+                            waiting_for.append(neighbor_id)
+                        else:
+                            logging.warning(
+                                f"[DFS] ⚠️ PATIENCE EXCEEDED for neighbor {neighbor_id} "
+                                f"({missing_count} rounds missing). Proceeding without it."
+                            )
+                    else:
+                        # Clean up missing rounds if we finally got it
+                        self.missing_rounds.pop(neighbor_id, None)
+
+            if waiting_for:
+                logging.warning(f"[DFS] ⏳ HOLDING: Waiting for models from lagging neighbors: {waiting_for}")
                 return (False, None)
 
         compliant_neighbors = []     # Neighbors verified BENIGN (bait + clean round)

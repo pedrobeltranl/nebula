@@ -124,24 +124,21 @@ class HoneyDetector:
 
         # Decision Logic
         # A node that learns the honeypot backdoor but STILL poisons is a "Smart Attacker".
-        # We only forgive suspicion via 'has_honeypot_backdoor' if suspicion is moderate.
-        is_suspicious = (direct_attack or resistance_attack)
-
-        # Detection Pattern 4: Smart Attacker (Compliant + Suspicious)
-        # We only flag if suspicion is extremely conclusive (>90%) AND concentration is high.
-        # This prevents benign neighbors who aggregate poison from being blocked.
-        # A real "Smart Attacker" hides with the bait but keeps poisoning at high intensity.
+        # NEW: If bait is present, we are EXTREMELY conservative about suspicion.
+        # This prevents false positives on honest aggregators who merge poison.
         smart_attacker = has_honeypot_backdoor and extreme_suspicion and target_concentration > 0.55
 
-        if smart_attacker:
-            is_suspicious = True
-            logging.warning(
-                f"[HoneyDetector] 🚨 Smart Attacker Detected! Learned bait ({compliant_rate:.2%}) "
-                f"but still has high suspicion ({suspicious_rate:.2%})."
-            )
-        elif has_honeypot_backdoor and not extreme_suspicion:
-            # Forgive moderate suspiciousness if they learned the bait (likely noise/divergence)
-            is_suspicious = False
+        if has_honeypot_backdoor:
+            # We ONLY flag if it's a blatant smart attacker
+            is_suspicious = smart_attacker
+            if smart_attacker:
+                logging.warning(
+                    f"[HoneyDetector] 🚨 Smart Attacker Detected! Learned bait ({compliant_rate:.2%}) "
+                    f"but still has high suspicion ({suspicious_rate:.2%})."
+                )
+        else:
+            # Standard detection for nodes without evidence of our bait
+            is_suspicious = (direct_attack or resistance_attack)
 
         # Return the MAX severity for decision making
         severity = max(suspicious_rate, honest_rate if resistance_attack else 0.0)
