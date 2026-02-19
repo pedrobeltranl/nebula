@@ -311,12 +311,27 @@ class HoneyPotManager:
 
             # FEATURE: If node is compliant BUT currently suspicious, do NOT mark as BENIGN yet.
             # It stays in a "TESTING" state until suspicion clears or escalates.
+            # NEW: If it WAS benign but now it's suspicious, demote it back to TESTING.
             if is_suspicious:
+                if state["status"] == "BENIGN":
+                    logging.warning(f"[Manager] ⚠️ Demoting {neighbor_id} from BENIGN to TESTING due to new suspicion.")
+                state["status"] = "TESTING"
                 logging.info(
                     f"[Manager] ⚠️ Neighbor {neighbor_id} is COMPLIANT but SUSPICIOUS. "
                     f"Holding status as TESTING (Suspicion Count: {state['suspicious_count']})."
                 )
                 return "TESTING"
+
+            # SAFETY RE-CHECK: Even if detector didn't flag it (e.g. concentration),
+            # if the raw suspicion rate is very high (>50%), hold it in TESTING.
+            # This handles "spread" attacks that fall just below thresholds but are clearly anomalous.
+            if state["suspicious_count"] > 0 and state["rounds_tested"] > 0:
+                raw_suspicion = state["suspicious_count"] / state["rounds_tested"]
+                if raw_suspicion > 0.50:
+                    if state["status"] == "BENIGN":
+                        logging.warning(f"[Manager] ⚠️ Demoting {neighbor_id} to TESTING (High raw suspicion: {raw_suspicion:.1%})")
+                    state["status"] = "TESTING"
+                    return "TESTING"
 
             # Only verify as BENIGN if it has shown bait AND current round is clean
             state["status"] = "BENIGN"
@@ -869,6 +884,15 @@ class HoneyPotManager:
         if investigation_neighbors:
             for neighbor_id, _ in investigation_neighbors:
                 if not self.is_visited(neighbor_id):
+                    # SAFETY: Do not pivot to a carrier if they have EXTREME suspicion (> 70% raw)
+                    # as they might be the attacker itself hiding with bait.
+                    state = self.neighbor_tracking.get(neighbor_id, {})
+                    raw_suspicion = state.get("suspicious_count", 0) / max(1, state.get("rounds_tested", 1))
+
+                    if raw_suspicion > 0.70:
+                        logging.error(f"[DFS] 🚫 BLOCKING PIVOT to Highly Suspicious Carrier {neighbor_id} ({raw_suspicion:.1%})")
+                        continue
+
                     logging.info(f"[DFS] 🕵️ Pivoting to CARRIER neighbor {neighbor_id} to follow poison trail.")
                     return (False, neighbor_id)
 

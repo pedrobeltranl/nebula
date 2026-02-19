@@ -110,9 +110,11 @@ class HoneyDetector:
 
         # Pattern 1: Direct Attack (Third-target poisoning)
         # Normal detection: > 55% concentration
-        # Extreme suspicion: > 50% concentration
+        # Extreme suspicion (>80%): flag regardless of concentration
+        # High suspicion (>70%): require only > 40% concentration
         direct_attack = (suspicious_rate > self.threshold and target_concentration > 0.55) or \
-                        (extreme_suspicion and target_concentration > 0.50)
+                        (suspicious_rate > 0.80) or \
+                        (extreme_suspicion and target_concentration > 0.40)
 
         # Pattern 2: Model Replacement Attack
         resistance_attack = (honest_rate > 0.85 and compliant_rate < 0.02)
