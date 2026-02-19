@@ -264,8 +264,10 @@ class HoneyPotManager:
                          break
 
                 if clash_detected:
-                    state["suspicious_count"] += 1 # Double penalty for direct clash
-                    logging.critical(f"[Manager] ⚔️ CONTRADICTION CLASH: {neighbor_id} targets {dominant_target} which overrides HoneyMap rules. Suspicion escalated.")
+                    logging.critical(f"[Manager] 🚨 CONTRADICTION CLASH: {neighbor_id} targets {dominant_target} which overrides HoneyMap rules. VERDICT: MALICIOUS")
+                    state["status"] = "MALICIOUS"
+                    state["verified_round"] = current_round
+                    return "MALICIOUS"
 
             self.recent_detections[neighbor_id] = self.recent_detections.get(neighbor_id, 0) + 1
             logging.warning(
@@ -519,23 +521,6 @@ class HoneyPotManager:
 
         if not basic_grace_active:
             return False
-
-        # EARLY EXIT: If we have neighbor info, check if we can skip
-        if neighbors_models:
-            all_verified = True
-            for node_id in neighbors_models:
-                # Check tracking memory
-                # If node has EVER shown backdoor (max_compliant_seen > 0), it's safe to proceed
-                node_info = self.neighbor_tracking.get(node_id, {})
-                max_seen = node_info.get("max_compliant_seen", 0.0)
-
-                if max_seen < 0.01: # Less than 1% compliant seen
-                    all_verified = False
-                    break
-
-            if all_verified and len(neighbors_models) > 0:
-                logging.info(f"[Manager] 🚀 EARLY EXIT from Grace Period: All {len(neighbors_models)} neighbors already verified (max_compliant > 0)")
-                return False
 
         return True
 
