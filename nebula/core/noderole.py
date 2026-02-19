@@ -1406,12 +1406,12 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             return
 
         # SAFETY: If we've retired, don't do anything with pivot logic
-        if not isinstance(self._engine.rb, HoneypotRoleBehavior):
-            logging.info(f"[HONEYPOT] Current role is {type(self._engine.rb).__name__}. Ignoring pivot request.")
+        if getattr(self._engine, 'has_served_as_honeypot', False):
+            logging.info(f"[HONEYPOT] Node has already served as honeypot this session/round. Ignoring redundant pivot search.")
             return
 
-        if getattr(self._engine, 'has_served_as_honeypot', False) and not isinstance(self._engine.rb, HoneypotRoleBehavior):
-            logging.info(f"[HONEYPOT] Already retired from honeypot role. Ignoring pivot request.")
+        if not isinstance(self._engine.rb, HoneypotRoleBehavior):
+            logging.info(f"[HONEYPOT] Current role is {type(self._engine.rb).__name__}. Ignoring pivot request.")
             return
 
         # Only pivot ONCE per round
@@ -1560,6 +1560,11 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             self.manager.locked_target = None
 
     async def _pivot_to(self, candidate):
+        # CRITICAL SAFETY: Prevent double pivots in the same round/session
+        if getattr(self._engine, 'has_served_as_honeypot', False):
+            logging.warning(f"[Honeypot] 🚫 BLOCKED REDUNDANT PIVOT to {candidate} - Node has already initiated a transfer.")
+            return
+
         # CRITICAL SAFETY CHECK: Never pivot to a node with recent detections
         # UNLESS the node is confirmed as a CARRIER (has our bait)
         if hasattr(self.manager, 'recent_detections') and candidate in self.manager.recent_detections:

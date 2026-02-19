@@ -1053,6 +1053,7 @@ class Engine:
 
             # Apply pending state if exists (for Honeypot transfer)
             if next_role == Role.HONEYPOT:
+                 self.has_served_as_honeypot = False
                  if hasattr(self, "_pending_honeypot_state") and self._pending_honeypot_state:
                      if hasattr(self._role_behavior, "manager"):
                          transfer_source = self._role_behavior.manager.import_state(self._pending_honeypot_state)
