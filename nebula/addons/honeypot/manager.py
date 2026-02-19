@@ -832,9 +832,11 @@ class HoneyPotManager:
             # UNIFIED ANALYSIS: Use memory-based analyze_neighbor
             # ============================================================================
             status = self.analyze_neighbor(node_id, model_obj, current_round)
-            is_suspicious, _ = self.detector.check_malicious(model_obj, current_round) if self.detector else (False, None)
+
+            # Use tracking state instead of non-existent detector methods
             state = self.neighbor_tracking.get(node_id, {})
             has_bait = state.get("max_compliant_seen", 0) >= 0.02
+            is_currently_suspicious = state.get("suspicious_count", 0) > 0 # Simple heuristic for DFS branching
 
             if status == "MALICIOUS":
                 logging.critical(f"[DFS] 🎯 ATTACKER CONFIRMED: {node_id} (Verdict from Manager)")
