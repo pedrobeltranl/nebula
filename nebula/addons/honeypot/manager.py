@@ -897,16 +897,12 @@ class HoneyPotManager:
         if investigation_neighbors:
             for neighbor_id, _ in investigation_neighbors:
                 if not self.is_visited(neighbor_id):
-                    # SAFETY: Do not pivot to a carrier if they have EXTREME suspicion (> 70% raw)
-                    # as they might be the attacker itself hiding with bait.
                     state = self.neighbor_tracking.get(neighbor_id, {})
                     raw_suspicion = state.get("suspicious_count", 0) / max(1, state.get("rounds_tested", 1))
 
-                    if raw_suspicion > 0.70:
-                        logging.error(f"[DFS] 🚫 BLOCKING PIVOT to Highly Suspicious Carrier {neighbor_id} ({raw_suspicion:.1%})")
-                        continue
-
-                    logging.info(f"[DFS] 🕵️ Pivoting to CARRIER neighbor {neighbor_id} to follow poison trail.")
+                    # BRAVE HONEYPOT: We pivot even if suspicion is high to follow the poison trail.
+                    # High suspicion in a carrier is a "compass" toward the origin.
+                    logging.info(f"[DFS] 🕵️ Pivoting to CARRIER neighbor {neighbor_id} to follow poison trail (Suspicion: {raw_suspicion:.1%}).")
                     return (False, neighbor_id)
 
         # 3. If everything unvisited is a pure THREAT (no bait), we HOLD to confirm
