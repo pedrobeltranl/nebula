@@ -406,18 +406,32 @@ class HoneyPotManager:
                 info = self.weak_backdoor_nodes[neighbor_id]
 
                 if compliant_rate > 0.0 and not is_suspicious:
-                    # SUCCESS! Node showed SOME compliance and is NO LONGER suspicious
-                    logging.info(
-                        f"[Manager] ✅ Node {neighbor_id} shows {compliant_rate:.2%} after "
-                        f"strengthening attempt {info['attempts']}. BENIGN confirmed."
-                    )
-                    state["status"] = "BENIGN"
-                    state["verified_round"] = current_round
-                    state["max_compliant_seen"] = compliant_rate
-                    state["first_backdoor_round"] = current_round
-
-                    self.weak_backdoor_nodes.pop(neighbor_id, None)
-                    return "BENIGN"
+                    # Node showed compliance in this round. Update tracking but
+                    # require consistency before declaring BENIGN (same rule as main path).
+                    state["max_compliant_seen"] = max(state.get("max_compliant_seen", 0.0), compliant_rate)
+                    if state["first_backdoor_round"] is None:
+                        state["first_backdoor_round"] = current_round
+                    # CONSISTENCY CHECK: need >= BENIGN_COMPLIANT_THRESHOLD in >= BENIGN_CONSISTENT_ROUNDS of BENIGN_WINDOW
+                    BENIGN_COMPLIANT_THRESHOLD = 0.05
+                    BENIGN_CONSISTENT_ROUNDS   = 2
+                    BENIGN_WINDOW              = 3
+                    recent_history = state["compliant_history"][-BENIGN_WINDOW:]
+                    consistent_rounds = sum(1 for _, r in recent_history if float(r) >= BENIGN_COMPLIANT_THRESHOLD)
+                    if consistent_rounds >= BENIGN_CONSISTENT_ROUNDS:
+                        logging.info(
+                            f"[Manager] ✅ Node {neighbor_id} consistently BENIGN after strengthening "
+                            f"({consistent_rounds}/{BENIGN_WINDOW} rounds ≥ {BENIGN_COMPLIANT_THRESHOLD:.0%})."
+                        )
+                        state["status"] = "BENIGN"
+                        state["verified_round"] = current_round
+                        self.weak_backdoor_nodes.pop(neighbor_id, None)
+                        return "BENIGN"
+                    else:
+                        logging.info(
+                            f"[Manager] 🔬 Node {neighbor_id} showed {compliant_rate:.2%} compliance but not yet consistent "
+                            f"({consistent_rounds}/{BENIGN_WINDOW} rounds ≥ {BENIGN_COMPLIANT_THRESHOLD:.0%}). Continuing strengthening."
+                        )
+                        return "TESTING"
 
                 elif info["attempts"] >= self.strengthening_max_attempts:
                     # EXHAUSTED - Still unverified after max attempts
@@ -450,21 +464,47 @@ class HoneyPotManager:
                         )
                         return "TESTING"
                     else:
-                        # Not suspicious enough to block → Catastrophic Forgetting or low data
-                        state["status"] = "BENIGN"
-                        state["verified_round"] = current_round
-                        logging.warning(f"[Manager] ⚠️ Node {neighbor_id} unverified after strengthening. Assuming BENIGN (CF).")
-                        return "BENIGN"
+                        # Not suspicious but unverified after strengthening → TESTING, not BENIGN.
+                        # Could be catastrophic forgetting or just a slow learner.
+                        # DFS will continue to monitor without convicting.
+                        logging.warning(f"[Manager] ⚠️ Node {neighbor_id} unverified after strengthening. Keeping TESTING (not enough evidence for BENIGN).")
+                        return "TESTING"
                 else:
                     logging.info(f"[Manager] 🔬 Node {neighbor_id} in strengthening pipeline (attempt {info['attempts']}/3)")
                     return "TESTING"
 
-            # Regular negative threshold check (only if not in strengthening mode)
-            if neighbor_id not in self.weak_backdoor_nodes and state["negative_count"] >= self.NEGATIVE_THRESHOLD:
-                state["status"] = "MALICIOUS"
-                state["verified_round"] = current_round
-                logging.critical(f"[Manager] 🚨 Neighbor {neighbor_id} CONFIRMED as MALICIOUS (Never showed backdoor in {state['negative_count']} rounds)")
-                return "MALICIOUS"
+            # MALICIOUS consistency check (symmetric with BENIGN consistency fix)
+            # ============================================================================
+            # Old rule: negative_count >= threshold → immediately MALICIOUS
+            # Problem: a carrier or a node under only 1 analysis round gets convicted too fast.
+            #
+            # NEW RULE: Declare MALICIOUS only if the node has NEVER shown any bait (max_compliant=0)
+            # AND has been suspicious for >= NEGATIVE_THRESHOLD rounds consistently.
+            # This mirrors the BENIGN rule: if we need N consistent rounds for BENIGN,
+            # we should require the same for MALICIOUS.
+            # ============================================================================
+            MALICIOUS_ZERO_ROUNDS_REQUIRED = max(self.NEGATIVE_THRESHOLD, 3)  # At least 3 rounds of 0% bait + suspicion
+            has_ever_shown_bait = state.get("max_compliant_seen", 0.0) > 0.01  # Even 1% at any point → not a clean attacker signature
+
+            if neighbor_id not in self.weak_backdoor_nodes and state["negative_count"] >= MALICIOUS_ZERO_ROUNDS_REQUIRED:
+                if has_ever_shown_bait:
+                    # Has shown SOME bait historically → mark as CARRIER_SUSPECT, not MALICIOUS
+                    state["carrier_suspect"] = True
+                    state["status"] = "TESTING"
+                    logging.warning(
+                        f"[Manager] 🚚 {neighbor_id} reached negative threshold but has historical bait "
+                        f"({state['max_compliant_seen']:.2%}). Marking CARRIER_SUSPECT — DFS will pivot through."
+                    )
+                    return "TESTING"
+                else:
+                    # Truly never showed bait + consistently suspicious → genuine attacker
+                    state["status"] = "MALICIOUS"
+                    state["verified_round"] = current_round
+                    logging.critical(
+                        f"[Manager] 🚨 Neighbor {neighbor_id} CONFIRMED as MALICIOUS "
+                        f"(Never showed backdoor in {state['negative_count']} rounds, suspicious={state['suspicious_count']})"
+                    )
+                    return "MALICIOUS"
 
             return "TESTING"
 
@@ -951,9 +991,29 @@ class HoneyPotManager:
                 investigation_neighbors.append((node_id, 1.0))
                 logging.warning(f"[DFS] 🧩 {node_id} identified as CARRIER (Suspicious + Compliant). Prioritizing for investigation.")
             else:
-                # Suspicious and NO bait seen yet -> Threat monitoring
-                suspicious_neighbors.append((node_id, 1.0))
-                logging.warning(f"[DFS] ⏳ {node_id} is under TESTING/MONITORING (Current Status: {status})")
+                # Suspicious and NO bait seen yet
+                # ─────────────────────────────────────────────
+                # SINGLE-NEIGHBOR BLIND SPOT FIX:
+                # If this node has been analyzed for at least 1 round but shows 0% bait,
+                # it could still be a carrier (bait signal drowned by upstream attacker).
+                # Put it in investigation_neighbors so DFS pivots THROUGH it rather than
+                # holding indefinitely waiting for a confirmation that will never come.
+                # We only do this if suspicious_count >= 1 (we have real evidence it's involved).
+                # ─────────────────────────────────────────────
+                node_state = self.neighbor_tracking.get(node_id, {})
+                rounds_with_suspicion = node_state.get("suspicious_count", 0)
+                rounds_tested = node_state.get("rounds_tested", 0)
+                if rounds_with_suspicion >= 1 and rounds_tested >= 1:
+                    # Suspicious but unverified → treat as high-priority carrier candidate
+                    investigation_neighbors.append((node_id, 1.5))  # Higher than normal carrier (1.0)
+                    logging.warning(
+                        f"[DFS] 🔎 {node_id} suspicious with 0% bait — potential carrier (upstream attacker). "
+                        f"Prioritizing for investigation pivot (suspicious={rounds_with_suspicion}/{rounds_tested} rounds)."
+                    )
+                else:
+                    # Not enough evidence yet → pure monitoring
+                    suspicious_neighbors.append((node_id, 1.0))
+                    logging.warning(f"[DFS] ⏳ {node_id} is under TESTING/MONITORING (Current Status: {status})")
 
         # ============================================================================
         # PIVOT OR HOLD DECISION
