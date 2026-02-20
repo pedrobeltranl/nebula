@@ -317,27 +317,45 @@ class HoneyPotManager:
                  state["verified_round"] = current_round
                  return "MALICIOUS"
 
-        # 2. VERIFICATION: Backdoor presence
+        # 2. VERIFICATION: Backdoor presence — CONSISTENCY REQUIRED
+        # ============================================================================
+        # FALSE NEGATIVE FIX:
+        # The old rule (max_compliant_seen >= 2%) declared BENIGN on a single round.
+        # An attacker that aggregates honest neighbors can accidentally exceed 2% in
+        # one round (aggregation artifact) and get permanently marked BENIGN.
+        #
+        # NEW RULE: A node must show compliance >= BENIGN_COMPLIANT_THRESHOLD in at
+        # least BENIGN_CONSISTENT_ROUNDS of the last BENIGN_WINDOW rounds.
+        # This rejects one-off flukes from FedAvg dilution.
+        # ============================================================================
+        BENIGN_COMPLIANT_THRESHOLD = 0.05   # Minimum compliance per round (5%)
+        BENIGN_CONSISTENT_ROUNDS   = 2      # Must hit threshold in N of last W rounds
+        BENIGN_WINDOW              = 3      # Look back window
+
+        # Count how many recent rounds exceeded the threshold
+        recent_history = state["compliant_history"][-BENIGN_WINDOW:]
+        consistent_rounds = sum(1 for _, r in recent_history if float(r) >= BENIGN_COMPLIANT_THRESHOLD)
+        has_consistent_bait = consistent_rounds >= BENIGN_CONSISTENT_ROUNDS
+
+        # Still track first time ANY bait was seen (for logging / DFS carrier detection)
         if state["max_compliant_seen"] >= 0.02:
             if state["first_backdoor_round"] is None:
                 state["first_backdoor_round"] = current_round
 
-            # FEATURE: If node is compliant BUT currently suspicious, do NOT mark as BENIGN yet.
-            # It stays in a "TESTING" state until suspicion clears or escalates.
-            # NEW: If it WAS benign but now it's suspicious, demote it back to TESTING.
+        if has_consistent_bait:
+            # FEATURE: If node is CONSISTENTLY compliant but currently suspicious,
+            # hold in TESTING — could be a smart adaptive attacker.
             if is_suspicious:
                 if state["status"] == "BENIGN":
                     logging.warning(f"[Manager] ⚠️ Demoting {neighbor_id} from BENIGN to TESTING due to new suspicion.")
                 state["status"] = "TESTING"
                 logging.info(
-                    f"[Manager] ⚠️ Neighbor {neighbor_id} is COMPLIANT but SUSPICIOUS. "
+                    f"[Manager] ⚠️ Neighbor {neighbor_id} is CONSISTENTLY COMPLIANT but SUSPICIOUS. "
                     f"Holding status as TESTING (Suspicion Count: {state['suspicious_count']})."
                 )
                 return "TESTING"
 
-            # SAFETY RE-CHECK: Even if detector didn't flag it (e.g. concentration),
-            # if the raw suspicion rate is very high (>50%), hold it in TESTING.
-            # This handles "spread" attacks that fall just below thresholds but are clearly anomalous.
+            # SAFETY RE-CHECK: High raw suspicion overrides compliance.
             if state["suspicious_count"] > 0 and state["rounds_tested"] > 0:
                 raw_suspicion = state["suspicious_count"] / state["rounds_tested"]
                 if raw_suspicion > 0.50:
@@ -346,14 +364,17 @@ class HoneyPotManager:
                     state["status"] = "TESTING"
                     return "TESTING"
 
-            # Only verify as BENIGN if it has shown bait AND current round is clean
+            # Consistent compliance + no suspicion → truly BENIGN
             state["status"] = "BENIGN"
             state["verified_round"] = state["first_backdoor_round"]
             logging.info(
                 f"[Manager] ✅ Neighbor {neighbor_id} VERIFIED as BENIGN in round {current_round} "
-                f"(max_compliant={state['max_compliant_seen']:.2%}, current={compliant_rate:.2%})"
+                f"(consistent={consistent_rounds}/{BENIGN_WINDOW} rounds ≥ {BENIGN_COMPLIANT_THRESHOLD:.0%}, "
+                f"max_seen={state['max_compliant_seen']:.2%})"
             )
             return "BENIGN"
+
+
 
         else:
             # No backdoor ever seen at >= 2% → check strengthening / negative counters
