@@ -7,7 +7,7 @@ class HoneyDetector:
     with the dynamic HoneyMap rules.
     """
 
-    def __init__(self, patch_size=4, threshold=0.95):
+    def __init__(self, patch_size=4, threshold=0.40):
         self.patch_size = patch_size
         self.threshold = threshold # % of samples that must fail to trigger alarm
 

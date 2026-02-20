@@ -972,9 +972,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             logging.error(f"[Honeypot] Error during learning cycle: {e}")
 
         finally:
-            # Restore state for next round
-            if initial_clean_state:
-                self._engine.trainer.model.load_state_dict(initial_clean_state)
+            # Restore DataLoader for next round
             if _original_loader_method and trainer_wrapper and trainer_wrapper.datamodule:
                 trainer_wrapper.datamodule.train_dataloader = _original_loader_method
             try:
@@ -1524,16 +1522,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             return
 
         # Validación adicional: Permitir pivot a Carrier Nodes (sospechosos pero con cebo)
-        if next_pivot and hasattr(self.manager, 'recent_detections'):
-            # Verificar si es un Carrier (Compliant)
-            is_carrier = False
-            if hasattr(self.manager, 'neighbor_tracking') and next_pivot in self.manager.neighbor_tracking:
-                is_carrier = self.manager.neighbor_tracking[next_pivot].get("max_compliant_seen", 0) >= 0.02
-
-            # Solo cancelar si tiene detecciones Y NO tiene cebo (amenaza pura)
-            if self.manager.recent_detections.get(next_pivot, 0) > 0 and not is_carrier:
-                logging.warning(f"[HONEYPOT DFS] ⚠️ Cancelling pivot to {next_pivot} (has {self.manager.recent_detections[next_pivot]} recent detections and NO bait seen)")
-                next_pivot = None
+        # Remove hardcoded block that cancels pivot for 0%-bait nodes.
+        # MANAGER is the source of truth for the investigation trail.
+        # If it returns a node with 0% bait, it's treating it as a CARRIER candidate
+        # to find the upstream attacker. We MUST pivot there.
 
         if next_pivot:
             # FIX: Check Global Reputation - Do NOT pivot to a Suspect!
