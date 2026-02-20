@@ -153,6 +153,7 @@ class Engine:
 
         # Deduplication dictionary for block_neighbor_flood messages (to prevent re-forwarding duplicates)
         self._processed_block_neighbor_floods = {}
+        self._processed_model_reset_floods = {}
 
         self.config.reload_config_file()
 
@@ -655,6 +656,82 @@ class Engine:
                             )
                             asyncio.create_task(self.cm.send_message(nei, gossip_msg))
 
+    async def _control_model_reset_flood_callback(self, source, message):
+        """
+        Recibe y propaga orden de REINICIO de modelo del Honeypot.
+        Esto permite que la federación se recupere tras limpiar el envenenamiento.
+        """
+        if not message or not hasattr(message, 'log'):
+            return
+
+        try:
+            payload_str = message.log.decode('utf-8') if isinstance(message.log, bytes) else str(message.log)
+            payload = json.loads(payload_str)
+        except Exception as e:
+            logging.error(f"Error parsing model_reset_flood message: {e}")
+            return
+
+        if not isinstance(payload, dict) or payload.get("type") != "model_reset_flood":
+            return
+
+        try:
+            round_num = payload.get("round", 0)
+            source_honeypot = payload.get("source_honeypot", "unknown")
+
+            # Deduplicación
+            canonical_content = json.dumps(payload, sort_keys=True)
+            hash_val = hashlib.sha256(canonical_content.encode()).hexdigest()
+
+            if hash_val in self._processed_model_reset_floods:
+                return
+
+            self._processed_model_reset_floods[hash_val] = True
+
+            logging.warning(f"🔄 MODEL RESET received from {source} (Origin: {source_honeypot}, Round: {round_num})")
+
+            # Ejecutar el reset local
+            await self.reinitialize_model()
+
+            # Propagar a los vecinos
+            neighbors = set(self.cm.connections.keys())
+            if source in neighbors:
+                neighbors.discard(source)
+
+            if neighbors:
+                logging.debug(f"[Honeypot] 📡 Forwarding MODEL RESET to {len(neighbors)} neighbors")
+                fwd_message = self.cm.create_message(
+                    "control",
+                    "model_reset_flood",
+                    log=canonical_content
+                )
+
+                for neighbor in neighbors:
+                    asyncio.create_task(self.cm.send_message(neighbor, fwd_message))
+
+        except Exception as e:
+            logging.error(f"Error processing model_reset_flood: {e}", exc_info=True)
+
+    async def reinitialize_model(self):
+        """
+        Reinicia los pesos del modelo a su estado original y resetea contadores.
+        Esto se usa para recuperarse de ataques de envenenamiento.
+        """
+        async with self.trainning_in_progress_lock:
+            logging.warning("🧹 Re-initializing model weights to recover from poisoning...")
+
+            # Reset PyTorch model weights
+            # Most standard modules have a reset_parameters method
+            import torch
+            def weights_init(m):
+                if hasattr(m, 'reset_parameters'):
+                    m.reset_parameters()
+
+            self.trainer.model.apply(weights_init)
+
+            # Reset round counter in trainer/model if necessary
+            # (In DFL, starting from current round but with clean weights is usually enough)
+            logging.warning("✨ Model reset complete. Federation training starts fresh from this round.")
+
 
     async def register_events_callbacks(self):
         await self.init_message_callbacks()
@@ -1148,6 +1225,7 @@ class Engine:
             async with self._round_in_process_lock:
                 # Clean up old deduplication entries for block_neighbor_flood
                 self._processed_block_neighbor_floods.clear()
+                self._processed_model_reset_floods.clear()
 
                 current_time = time.time()
                 print_msg_box(

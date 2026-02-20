@@ -823,7 +823,6 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         await self._engine.trainning_in_progress_lock.acquire_async()
         trainer_wrapper = self._engine.trainer
-        _original_data_train = None
 
         try:
             # ========================================================
@@ -835,58 +834,78 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 # Save clean state BEFORE any bait training
                 clean_state_backup = copy.deepcopy(self._engine.trainer.model.state_dict())
 
-                # Swap the SOURCE dataset (train_set), NOT data_train.
-                # Lightning's Trainer.fit() calls setup('fit') which rebuilds
-                # data_train from train_set. If we swap data_train, setup()
-                # overwrites it immediately. Swapping train_set ensures the
-                # poisoned data flows through setup → data_train → DataLoader.
+                # Get the ACTUAL training data from the datamodule
                 original_dm = trainer_wrapper.datamodule
-                if original_dm and hasattr(original_dm, 'train_set') and original_dm.train_set is not None:
-                    _original_data_train = original_dm.train_set  # Save original SOURCE dataset
-                    honey_ds = HoneyDataset(_original_data_train, self.manager.current_map, injection_ratio=0.50)
-                    original_dm.train_set = honey_ds
+                if original_dm and hasattr(original_dm, 'data_train') and original_dm.data_train is not None:
+                    source_dataset = original_dm.data_train
 
-                    # Aggressive training to ensure the CNN learns the backdoor
-                    original_epochs = self._engine.trainer.max_epochs
-                    self._engine.trainer.max_epochs = 5
-                    if hasattr(self._engine.trainer, 'update_model_learning_rate'):
-                        self._engine.trainer.update_model_learning_rate(0.1)
+                    # Create HoneyDataset wrapping the actual training data
+                    honey_ds = HoneyDataset(source_dataset, self.manager.current_map, injection_ratio=0.50)
 
-                    logging.info("[Honeypot] ⚡ Baited Training: 5 epochs | LR=0.1 | Injection=50%")
-                    await self._engine.trainer.train()
+                    # ============================================================
+                    # RAW PYTORCH TRAINING LOOP (bypasses Lightning completely)
+                    # Lightning's Trainer.fit() has internal state tracking that
+                    # prevented our dataset swaps from taking effect. By training
+                    # directly with PyTorch, we guarantee the model sees poisoned data.
+                    # ============================================================
+                    BAIT_EPOCHS = 10
+                    BAIT_LR = 0.1
+                    BAIT_BATCH_SIZE = 32
 
-                    # Validate bait was learned
-                    self._engine.trainer.model.eval()
+                    bait_loader = DataLoader(honey_ds, batch_size=BAIT_BATCH_SIZE, shuffle=True, drop_last=True)
+                    model = self._engine.trainer.model
+                    device = next(model.parameters()).device
+
+                    model.train()
+                    optimizer = torch.optim.SGD(model.parameters(), lr=BAIT_LR, momentum=0.9)
+                    criterion = torch.nn.CrossEntropyLoss()
+
+                    logging.info(f"[Honeypot] ⚡ RAW Baited Training: {BAIT_EPOCHS} epochs | LR={BAIT_LR} | Injection=50% | Batches={len(bait_loader)}")
+
+                    for epoch in range(BAIT_EPOCHS):
+                        epoch_loss = 0.0
+                        epoch_correct = 0
+                        epoch_total = 0
+                        for batch_idx, (x, y) in enumerate(bait_loader):
+                            x, y = x.to(device), y.to(device)
+                            optimizer.zero_grad()
+                            output = model(x)
+                            loss = criterion(output, y)
+                            loss.backward()
+                            optimizer.step()
+                            epoch_loss += loss.item()
+                            epoch_correct += (output.argmax(dim=1) == y).sum().item()
+                            epoch_total += y.size(0)
+                        epoch_acc = epoch_correct / epoch_total if epoch_total > 0 else 0
+                        logging.info(f"[Honeypot] 🎣 Bait Epoch {epoch+1}/{BAIT_EPOCHS}: Loss={epoch_loss/len(bait_loader):.4f} Acc={epoch_acc:.2%}")
+
+                    # Validate bait was learned (100% injection to test backdoor)
+                    model.eval()
                     correct, total = 0, 0
-                    device = next(self._engine.trainer.model.parameters()).device
                     try:
-                        val_honey_ds = HoneyDataset(_original_data_train, self.manager.current_map, injection_ratio=1.0)
-                        val_loader = DataLoader(val_honey_ds, batch_size=16, shuffle=False)
+                        val_honey_ds = HoneyDataset(source_dataset, self.manager.current_map, injection_ratio=1.0)
+                        val_loader = DataLoader(val_honey_ds, batch_size=32, shuffle=False)
                         with torch.no_grad():
-                            for i, batch in enumerate(val_loader):
-                                x, y = batch
+                            for i, (x, y) in enumerate(val_loader):
                                 x, y = x.to(device), y.to(device)
-                                pred = self._engine.trainer.model(x).argmax(dim=1)
+                                pred = model(x).argmax(dim=1)
                                 correct += (pred == y).sum().item()
                                 total += y.size(0)
-                                if i > 3: break
+                                if i > 5: break  # ~192 samples
                         val_acc = correct / total if total > 0 else 0.0
-                        logging.info(f"[Honeypot] 📊 Bait Validation: Acc={val_acc:.2%}")
+                        logging.info(f"[Honeypot] 📊 Bait Validation: Acc={val_acc:.2%} ({correct}/{total})")
                     except Exception as ve:
                         logging.warning(f"[Honeypot] Bait validation failed: {ve}")
                         val_acc = 0.0
 
-                    self._engine.trainer.model.train()
+                    model.train()
 
                     # FREEZE: Save baited model state permanently
-                    self._baited_model_state = copy.deepcopy(self._engine.trainer.model.state_dict())
+                    self._baited_model_state = copy.deepcopy(model.state_dict())
                     logging.info("[Honeypot] 🔒 Baited model FROZEN and stored permanently.")
 
-                    # Restore clean state and dataset
-                    self._engine.trainer.model.load_state_dict(clean_state_backup)
-                    original_dm.train_set = _original_data_train
-                    _original_data_train = None  # Already restored
-                    self._engine.trainer.max_epochs = original_epochs
+                    # Restore clean state
+                    model.load_state_dict(clean_state_backup)
 
                     # Restore normal LR
                     original_lr = self._engine.config.participant.get("training_args", {}).get("learning_rate", 0.01)
@@ -963,9 +982,6 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             logging.error(f"[Honeypot] Error during learning cycle: {e}")
 
         finally:
-            # Restore dataset if it was swapped (only during Phase 0)
-            if _original_data_train is not None and trainer_wrapper and trainer_wrapper.datamodule:
-                trainer_wrapper.datamodule.train_set = _original_data_train
             try:
                 await self._engine.trainning_in_progress_lock.release_async()
             except:
@@ -1378,6 +1394,25 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
             logging.warning(f"[Honeypot] 📤 Flooding KILL ORDER (blocking {attacker_id}) to {neighbor}")
             asyncio.create_task(self._engine.cm.send_message(neighbor, msg))
+
+        # 4. Trigger GLOBAL MODEL RESET to recover from poisoning
+        logging.warning("[Honeypot] 🔄 Initiating GLOBAL MODEL RESET to recover federation accuracy.")
+        reset_data = {
+            "type": "model_reset_flood",
+            "round": block_data["round"],
+            "source_honeypot": self._engine.addr
+        }
+        reset_payload = json.dumps(reset_data)
+        reset_msg = self._engine.cm.create_message(
+            "control",
+            "model_reset_flood",
+            log=reset_payload
+        )
+
+        for neighbor in neighbors:
+            if neighbor == self._engine.addr: continue
+            if neighbor == attacker_id: continue
+            asyncio.create_task(self._engine.cm.send_message(neighbor, reset_msg))
 
     async def _check_and_react_to_pivot(self):
         """

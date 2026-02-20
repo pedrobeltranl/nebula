@@ -51,6 +51,7 @@ class ControlAction(Enum):
     REPUTATION_FLOOD = 101
     BLOCK_NEIGHBOR = 102
     BLOCK_NEIGHBOR_FLOOD = 103
+    MODEL_RESET_FLOOD = 104
 
 class DiscoverAction(Enum):
     """
