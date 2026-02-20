@@ -835,12 +835,16 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 # Save clean state BEFORE any bait training
                 clean_state_backup = copy.deepcopy(self._engine.trainer.model.state_dict())
 
-                # Swap dataset to HoneyDataset
+                # Swap the SOURCE dataset (train_set), NOT data_train.
+                # Lightning's Trainer.fit() calls setup('fit') which rebuilds
+                # data_train from train_set. If we swap data_train, setup()
+                # overwrites it immediately. Swapping train_set ensures the
+                # poisoned data flows through setup → data_train → DataLoader.
                 original_dm = trainer_wrapper.datamodule
-                if original_dm and hasattr(original_dm, 'data_train') and original_dm.data_train is not None:
-                    _original_data_train = original_dm.data_train
+                if original_dm and hasattr(original_dm, 'train_set') and original_dm.train_set is not None:
+                    _original_data_train = original_dm.train_set  # Save original SOURCE dataset
                     honey_ds = HoneyDataset(_original_data_train, self.manager.current_map, injection_ratio=0.50)
-                    original_dm.data_train = honey_ds
+                    original_dm.train_set = honey_ds
 
                     # Aggressive training to ensure the CNN learns the backdoor
                     original_epochs = self._engine.trainer.max_epochs
@@ -880,7 +884,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
                     # Restore clean state and dataset
                     self._engine.trainer.model.load_state_dict(clean_state_backup)
-                    original_dm.data_train = _original_data_train
+                    original_dm.train_set = _original_data_train
                     _original_data_train = None  # Already restored
                     self._engine.trainer.max_epochs = original_epochs
 
@@ -961,7 +965,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         finally:
             # Restore dataset if it was swapped (only during Phase 0)
             if _original_data_train is not None and trainer_wrapper and trainer_wrapper.datamodule:
-                trainer_wrapper.datamodule.data_train = _original_data_train
+                trainer_wrapper.datamodule.train_set = _original_data_train
             try:
                 await self._engine.trainning_in_progress_lock.release_async()
             except:
@@ -1148,8 +1152,8 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                     # Ensure we unblock the target so they can rejoin the federation as a normal node
                     await self._unblock_target(target)
 
-                    logging.info("♻️  Reverting to benign AGGREGATOR role...")
-                    await self._revert_to_aggregator()
+                    logging.info("♻️  Threat neutralized. Staying as Honeypot in containment mode (clean model only).")
+                    self.threat_confirmed_locally = True
                     return
 
         # Permite pivoting SOLO si hay amenaza detectada en modelos pero NO hay una amenaza confirmada localmente
@@ -1233,8 +1237,8 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
              # Unblock
              await self._unblock_target(target)
 
-             # Revert
-             await self._revert_to_aggregator()
+             # Stay as honeypot in containment mode
+             self.threat_confirmed_locally = True
 
     async def _unblock_target(self, target_id):
         """Reverses the containment blocks on a target."""
@@ -1482,11 +1486,11 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             # because it has nowhere to go after convicting its only unvisited neighbor.
             # We use the same path as a normal handover ACK: rb.set_next_role + has_served_as_honeypot.
             try:
-                self._engine.has_served_as_honeypot = True  # Prevent re-promotion by factory
-                await self._engine.rb.set_next_role(Role.AGGREGATOR)
-                logging.info("[HONEYPOT DFS] 🏁 Scheduled retirement to AGGREGATOR after attacker detection.")
+                # Stay as honeypot — just switch to containment mode (clean model only)
+                self.threat_confirmed_locally = True
+                logging.info("[HONEYPOT DFS] 🏁 Attacker detected. Staying as Honeypot in containment mode.")
             except Exception as e:
-                logging.error(f"[HONEYPOT DFS] ⚠️ Could not schedule retirement: {e}")
+                logging.error(f"[HONEYPOT DFS] ⚠️ Error during containment switch: {e}")
             return
 
         # 4. SI NO ENCONTRAMOS ATACANTE, USAR LA DIRECCIÓN SUGERIDA POR EL ANÁLISIS
@@ -1636,19 +1640,15 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
 
     async def _revert_to_aggregator(self):
-        """Reverts honeypot role back to aggregator after threat containment."""
-        if hasattr(self._engine, "rb"):
-            logging.info("[Honeypot] Transforming back to AGGREGATOR role.")
-            self._engine.has_served_as_honeypot = True
-            await self._engine.rb.set_next_role(Role.AGGREGATOR)
+        """Legacy method — honeypot no longer reverts to aggregator.
+        Instead, it stays as honeypot in containment mode."""
+        logging.info("[Honeypot] Staying as Honeypot in containment mode (clean model only).")
+        self.threat_confirmed_locally = True
 
     async def update_role_needed(self):
         """
         Check if self-decommission is requested or standard update needed.
+        Honeypot never decommissions itself — it stays permanently.
         """
-        if hasattr(self, "_decommission_requested") and self._decommission_requested:
-             # Set the next role to AGGREGATOR internally if not already set
-             async with self._next_role_locker:
-                 self._next_role = Role.AGGREGATOR
-
+        # Ignore decommission requests — honeypot stays forever
         return await super().update_role_needed()
