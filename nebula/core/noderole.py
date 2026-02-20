@@ -901,19 +901,21 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                     def baited_loader_factory():
                         nonlocal _honey_dataset_ref
                         base_loader = _original_loader_method()
-                        injection_ratio = strengthened_params.get('injection_ratio', 0.15) if strengthened_params else 0.15
+                        injection_ratio = strengthened_params.get('injection_ratio', 0.50) if strengthened_params else 0.50
                         honey_ds = HoneyDataset(base_loader.dataset, self.manager.current_map, injection_ratio=injection_ratio)
                         _honey_dataset_ref = honey_ds
                         return DataLoader(honey_ds, batch_size=base_loader.batch_size, shuffle=True, num_workers=getattr(base_loader, 'num_workers', 0))
 
                     original_dm.train_dataloader = baited_loader_factory
 
-                    # Optimization: Use high LR and LOW Epochs
+                    # Bait training must be AGGRESSIVE enough for the CNN to learn the trigger.
+                    # 15% injection over 2 epochs was catastrophically insufficient (0% validation).
+                    # 50% injection over 5 epochs at LR=0.1 ensures the model learns the backdoor.
                     current_lr = self._engine.config.participant.get("training_args", {}).get("learning_rate", 0.01)
-                    MIN_BAIT_LR = 0.05
-                    MIN_BAIT_EPOCHS = 2 # REDUCED from 5 to 2
+                    MIN_BAIT_LR = 0.1
+                    MIN_BAIT_EPOCHS = 5
 
-                    boost_factor = strengthened_params.get('lr_boost', 2.0) if strengthened_params else 2.0
+                    boost_factor = strengthened_params.get('lr_boost', 5.0) if strengthened_params else 5.0
                     new_baited_lr = max(current_lr * boost_factor, MIN_BAIT_LR)
 
                     original_trainer_epochs = self._engine.trainer.max_epochs
@@ -922,7 +924,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                     if hasattr(self._engine.trainer, 'update_model_learning_rate'):
                         self._engine.trainer.update_model_learning_rate(new_baited_lr)
 
-                    logging.info(f"[Honeypot] ⚡ Optimized Baited Training: {MIN_BAIT_EPOCHS} epochs | LR={new_baited_lr:.4f}")
+                    logging.info(f"[Honeypot] ⚡ Optimized Baited Training: {MIN_BAIT_EPOCHS} epochs | LR={new_baited_lr:.4f} | Injection=50%")
 
                     # Train Baited
                     await self._engine.trainer.train()
