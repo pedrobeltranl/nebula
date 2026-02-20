@@ -435,43 +435,14 @@ class HoneyPotManager:
 
                 elif info["attempts"] >= self.strengthening_max_attempts:
                     # EXHAUSTED - Still unverified after max attempts
+                    # We simply pop them from the pipeline. Execution will fall through
+                    # to the symmetric MALICIOUS vs CARRIER_SUSPECT determination below.
                     self.weak_backdoor_nodes.pop(neighbor_id, None)
-
-                    if state["suspicious_count"] >= 3:
-                        # ====================================================================
-                        # CARRIER-VS-ATTACKER DISCRIMINATION (False Positive Prevention)
-                        # -------------------------------------------------------------------
-                        # A node that fails bait absorption consistently could be EITHER:
-                        #   (A) A genuine attacker (generates poison locally)
-                        #   (B) A carrier (honest node whose FedAvg is dominated by an upstream attacker)
-                        #
-                        # A carrier CANNOT absorb our bait because its stronger upstream neighbor
-                        # (e.g. P8 sending with weight 1M) overrides our bait signal every round.
-                        #
-                        # STRATEGY: Instead of immediately convicting the node as MALICIOUS,
-                        # mark it as CARRIER_SUSPECT and return TESTING. The DFS will then
-                        # pivot THROUGH this node to inspect its neighbors — exposing the
-                        # real attacker (e.g. P8) one hop further.
-                        # ====================================================================
-                        state["carrier_suspect"] = True
-                        # Keep TESTING status so DFS can pivot through
-                        state["status"] = "TESTING"
-                        state["verified_round"] = current_round
-                        logging.warning(
-                            f"[Manager] 🚚 Neighbor {neighbor_id} CARRIER_SUSPECT — suspicious but "
-                            f"bait never absorbed (upstream attacker likely). DFS will pivot through "
-                            f"to find real source. (suspicious_count={state['suspicious_count']})"
-                        )
-                        return "TESTING"
-                    else:
-                        # Not suspicious but unverified after strengthening → TESTING, not BENIGN.
-                        # Could be catastrophic forgetting or just a slow learner.
-                        # DFS will continue to monitor without convicting.
-                        logging.warning(f"[Manager] ⚠️ Node {neighbor_id} unverified after strengthening. Keeping TESTING (not enough evidence for BENIGN).")
-                        return "TESTING"
+                    logging.info(f"[Manager] ⚠️ Node {neighbor_id} exhausted strengthening pipeline.")
                 else:
                     logging.info(f"[Manager] 🔬 Node {neighbor_id} in strengthening pipeline (attempt {info['attempts']}/3)")
                     return "TESTING"
+
 
             # MALICIOUS vs CARRIER_SUSPECT discrimination (fully symmetric with BENIGN rule)
             # ============================================================================

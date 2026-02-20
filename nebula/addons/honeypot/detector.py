@@ -108,13 +108,11 @@ class HoneyDetector:
         high_suspicion = suspicious_rate > 0.75
         extreme_suspicion = suspicious_rate > 0.70
 
-        # Pattern 1: Direct Attack (Third-target poisoning)
-        # Normal detection: > 85% concentration (Relaxed from 55% for extreme Non-IID resilience)
-        # Extreme suspicion (>80%): flag regardless of concentration
-        # High suspicion (>70%): require only > 90% concentration (Relaxed from 40%)
-        direct_attack = (suspicious_rate > self.threshold and target_concentration > 0.85) or \
-                        (suspicious_rate > 0.85) or \
-                        (extreme_suspicion and target_concentration > 0.90)
+        # Pattern 1: Direct Attack
+        # With the robust temporal consensus logic in manager.py (3+ rounds required),
+        # we no longer need extreme concentration thresholds to prevent false positives.
+        # High suspicion alone is enough to flag the node and let the manager track it.
+        direct_attack = (suspicious_rate > self.threshold)
 
         # Pattern 2: Model Replacement Attack
         resistance_attack = (honest_rate > 0.85 and compliant_rate < 0.02)
