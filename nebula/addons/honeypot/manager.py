@@ -473,40 +473,54 @@ class HoneyPotManager:
                     logging.info(f"[Manager] 🔬 Node {neighbor_id} in strengthening pipeline (attempt {info['attempts']}/3)")
                     return "TESTING"
 
-            # MALICIOUS consistency check (symmetric with BENIGN consistency fix)
+            # MALICIOUS vs CARRIER_SUSPECT discrimination (fully symmetric with BENIGN rule)
             # ============================================================================
-            # Old rule: negative_count >= threshold → immediately MALICIOUS
-            # Problem: a carrier or a node under only 1 analysis round gets convicted too fast.
+            # OLD: has_ever_shown_bait = max_compliant_seen > 1%
+            #      → One accidental 6.25% round (FedAvg artifact) → CARRIER_SUSPECT (wrong)
             #
-            # NEW RULE: Declare MALICIOUS only if the node has NEVER shown any bait (max_compliant=0)
-            # AND has been suspicious for >= NEGATIVE_THRESHOLD rounds consistently.
-            # This mirrors the BENIGN rule: if we need N consistent rounds for BENIGN,
-            # we should require the same for MALICIOUS.
+            # NEW: has_genuine_bait uses the SAME consistency bar as BENIGN:
+            #      ≥5% compliance in ≥2 of the last 3 rounds.
+            #      An attacker that occasionally mixes bait via FedAvg produces a one-off
+            #      spike that won't meet this threshold.
+            #      A genuine carrier consistently absorbs bait (it always aggregates with
+            #      multiple honest neighbors, so the signal is stable).
             # ============================================================================
-            MALICIOUS_ZERO_ROUNDS_REQUIRED = max(self.NEGATIVE_THRESHOLD, 3)  # At least 3 rounds of 0% bait + suspicion
-            has_ever_shown_bait = state.get("max_compliant_seen", 0.0) > 0.01  # Even 1% at any point → not a clean attacker signature
+            BENIGN_COMPLIANT_THRESHOLD = 0.05
+            BENIGN_CONSISTENT_ROUNDS   = 2
+            BENIGN_WINDOW              = 3
+            recent_history    = state["compliant_history"][-BENIGN_WINDOW:]
+            consistent_rounds = sum(1 for _, r in recent_history if float(r) >= BENIGN_COMPLIANT_THRESHOLD)
+            has_genuine_bait  = consistent_rounds >= BENIGN_CONSISTENT_ROUNDS
+
+            MALICIOUS_ZERO_ROUNDS_REQUIRED = max(self.NEGATIVE_THRESHOLD, 3)
 
             if neighbor_id not in self.weak_backdoor_nodes and state["negative_count"] >= MALICIOUS_ZERO_ROUNDS_REQUIRED:
-                if has_ever_shown_bait:
-                    # Has shown SOME bait historically → mark as CARRIER_SUSPECT, not MALICIOUS
+                if has_genuine_bait:
+                    # Genuine carrier: consistently absorbs bait → pivot through to find real source
                     state["carrier_suspect"] = True
                     state["status"] = "TESTING"
                     logging.warning(
-                        f"[Manager] 🚚 {neighbor_id} reached negative threshold but has historical bait "
-                        f"({state['max_compliant_seen']:.2%}). Marking CARRIER_SUSPECT — DFS will pivot through."
+                        f"[Manager] 🚚 {neighbor_id} CARRIER_SUSPECT — consistent bait "
+                        f"({consistent_rounds}/{BENIGN_WINDOW} rounds ≥ {BENIGN_COMPLIANT_THRESHOLD:.0%}) "
+                        f"despite suspicion. DFS will pivot through to find real source."
                     )
                     return "TESTING"
                 else:
-                    # Truly never showed bait + consistently suspicious → genuine attacker
+                    # No genuine consistent bait + persistent suspicion → genuine attacker
+                    # (one-off FedAvg spikes don't count as real bait absorption)
                     state["status"] = "MALICIOUS"
                     state["verified_round"] = current_round
                     logging.critical(
                         f"[Manager] 🚨 Neighbor {neighbor_id} CONFIRMED as MALICIOUS "
-                        f"(Never showed backdoor in {state['negative_count']} rounds, suspicious={state['suspicious_count']})"
+                        f"(consistent_bait={consistent_rounds}/{BENIGN_WINDOW}, "
+                        f"negative_rounds={state['negative_count']}, "
+                        f"suspicious={state['suspicious_count']})"
                     )
                     return "MALICIOUS"
 
             return "TESTING"
+
+
 
 
     def _check_neighbor_has_backdoor(self, neighbor_model):

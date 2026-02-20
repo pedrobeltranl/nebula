@@ -735,6 +735,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         self._last_pivot_target = None
         self._pivot_history = set()
         self._last_pivot_round = -1
+        self._pending_pivot_candidate = None  # Set before handover; cleared after ACK or timeout
 
         # Track detection history for multi-round confirmation (avoid false positives)
         self._detection_history = {}  # {node_id: [round_numbers]}
@@ -1614,6 +1615,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             logging.info(f"[Honeypot] 📨 Transfer sent to {candidate}. Waiting for ACK before retiring.")
             # self._defense_active = False # Keep active until confirmed
             self._engine._waiting_honeypot_handover = True
+            self._pending_pivot_candidate = candidate  # Remember who we tried (for timeout blacklisting)
 
             # Schedule a timeout to force retirement if ACK doesn't arrive
             asyncio.create_task(self._honeypot_handover_timeout(30))  # 30-second timeout
@@ -1623,20 +1625,36 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             self._engine.has_served_as_honeypot = False
 
     async def _honeypot_handover_timeout(self, timeout_seconds):
-        """Timeout handler: if ACK doesn't arrive within timeout, cancel transfer and stay."""
+        """Timeout handler: if ACK doesn't arrive within timeout, resume DFS.
+
+        The attacker will be detected analytically via bait compliance analysis —
+        NOT via transfer refusal (which would be protocol-level cheating).
+        We simply reset state so the DFS can re-run analysis next round.
+
+        With the updated CARRIER_SUSPECT threshold (consistent bait required), the
+        MALICIOUS verdict will be issued correctly by manager.analyze_neighbor before
+        any future pivot attempt is made.
+        """
         await asyncio.sleep(timeout_seconds)
 
-        # Check if we're still waiting
         if hasattr(self._engine, '_waiting_honeypot_handover') and self._engine._waiting_honeypot_handover:
-            logging.warning(f"[Honeypot] ⏱️ ACK timeout after {timeout_seconds}s. Transfer failed.")
-            logging.info("[Honeypot] 🔄 Cancelling handover and REMAINING Honeypot (Target unresponsive).")
+            failed_target = getattr(self, '_pending_pivot_candidate', None)
+            self._pending_pivot_candidate = None
 
-            # Reset flag so we resume normal Honeypot duties
+            logging.warning(
+                f"[Honeypot] ⏱️ ACK timeout ({timeout_seconds}s) for pivot to "
+                f"{failed_target or 'unknown'}. Resuming DFS — bait analysis will "
+                f"reclassify the node correctly next round."
+            )
+
+            # Reset flags so DFS re-runs next round
             self._engine._waiting_honeypot_handover = False
+            self._engine.has_served_as_honeypot = False
 
-            # Do NOT retire. Stay as Honeypot.
-            # We might want to blacklist the target we tried to pivot to, to avoid loop?
-            # For now, just staying alive satisfies "no deberiamos de desaparecer".
+
+
+
+
 
     async def _revert_to_aggregator(self):
         """Reverts honeypot role back to aggregator after threat containment."""
