@@ -275,10 +275,10 @@ class HoneyPotManager:
                              "Marking as SUSPICIOUS but not blocking yet (Aggregator Resilience)."
                          )
                     else:
-                        logging.critical(f"[Manager] 🚨 CONTRADICTION CLASH: {neighbor_id} targets {dominant_target} which overrides HoneyMap rules. VERDICT: MALICIOUS")
-                        state["status"] = "MALICIOUS"
-                        state["verified_round"] = current_round
-                        return "MALICIOUS"
+                        # FIX: In global Honey Maps (all labels mapped), EVERY dominant target clashes with some rule.
+                        # We must NOT instantly ban here, otherwise innocent non-IID nodes or aggregators get falsely banned
+                        # before they even have a chance to learn the bait in round 1.
+                        logging.warning(f"[Manager] ⚠️ CONTRADICTION CLASH on {neighbor_id} (targets {dominant_target}). Waiting for patience limit.")
 
             self.recent_detections[neighbor_id] = self.recent_detections.get(neighbor_id, 0) + 1
             logging.warning(

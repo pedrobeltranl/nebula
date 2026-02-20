@@ -156,7 +156,9 @@ class Lightning:
         if self.config.participant["tracking_args"]["local_tracking"] == "basic":
             logger_config = None
             if self._logger is not None:
-                logger_config = self._logger.get_logger_config()
+                # When _logger is a list (both mode), restore from the first one
+                src = self._logger[0] if isinstance(self._logger, list) else self._logger
+                logger_config = src.get_logger_config()
             nebulalogger = NebulaCSVLogger(
                 self.config.participant["scenario_args"]["start_time"],
                 f"{self.log_dir}",
@@ -168,7 +170,8 @@ class Lightning:
         elif self.config.participant["tracking_args"]["local_tracking"] == "tensorboard":
             logger_config = None
             if self._logger is not None:
-                logger_config = self._logger.get_logger_config()
+                src = self._logger[0] if isinstance(self._logger, list) else self._logger
+                logger_config = src.get_logger_config()
             nebulalogger = NebulaTensorBoardLogger(
                 self.config.participant["scenario_args"]["start_time"],
                 f"{self.log_dir}",
@@ -178,6 +181,30 @@ class Lightning:
             )
             # Restore logger configuration
             nebulalogger.set_logger_config(logger_config)
+        elif self.config.participant["tracking_args"]["local_tracking"] == "both":
+            # Generate both CSV and TensorBoard logs simultaneously.
+            # PyTorch Lightning Trainer accepts a list of loggers natively.
+            logger_config = None
+            if self._logger is not None:
+                src = self._logger[0] if isinstance(self._logger, list) else self._logger
+                logger_config = src.get_logger_config()
+            csv_logger = NebulaCSVLogger(
+                self.config.participant["scenario_args"]["start_time"],
+                f"{self.log_dir}",
+                name="metrics",
+                version=f"participant_{self.idx}",
+            )
+            tb_logger = NebulaTensorBoardLogger(
+                self.config.participant["scenario_args"]["start_time"],
+                f"{self.log_dir}",
+                name="metrics",
+                version=f"participant_{self.idx}",
+                log_graph=False,
+            )
+            if logger_config is not None:
+                csv_logger.set_logger_config(logger_config)
+                tb_logger.set_logger_config(logger_config)
+            nebulalogger = [csv_logger, tb_logger]
         else:
             nebulalogger = None
 
@@ -362,9 +389,15 @@ class Lightning:
             # If "raise", the exception will be managed by the main thread
             return None, None
 
+    def _loggers(self):
+        """Return loggers as a list regardless of whether _logger is a list or a single logger."""
+        if self._logger is None:
+            return []
+        return self._logger if isinstance(self._logger, list) else [self._logger]
+
     def cleanup(self):
-        if self._logger is not None:
-            self._logger.save()
+        for logger in self._loggers():
+            logger.save()
         if getattr(self, "_trainer", None) is not None:
             self._trainer._teardown()
             self._trainer = None
@@ -381,19 +414,22 @@ class Lightning:
 
     def on_round_start(self):
         self.datamodule.setup()
-        self._logger.log_data({"A-Round": self.round})
+        for logger in self._loggers():
+            logger.log_data({"A-Round": self.round})
         # self.reporter.enqueue_data("Round", self.round)
 
     def on_round_end(self):
-        self._logger.global_step = self._logger.global_step + self._logger.local_step
-        self._logger.local_step = 0
+        for logger in self._loggers():
+            logger.global_step = logger.global_step + logger.local_step
+            logger.local_step = 0
         self.round += 1
         self.model.on_round_end()
         logging.info("Flushing memory cache at the end of round...")
         self.cleanup()
 
     def on_learning_cycle_end(self):
-        self._logger.log_data({"A-Round": self.round})
+        for logger in self._loggers():
+            logger.log_data({"A-Round": self.round})
         # self.reporter.enqueue_data("Round", self.round)
 
     def update_model_learning_rate(self, new_lr):
