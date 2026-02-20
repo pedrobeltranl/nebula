@@ -109,12 +109,12 @@ class HoneyDetector:
         extreme_suspicion = suspicious_rate > 0.70
 
         # Pattern 1: Direct Attack (Third-target poisoning)
-        # Normal detection: > 55% concentration
+        # Normal detection: > 85% concentration (Relaxed from 55% for extreme Non-IID resilience)
         # Extreme suspicion (>80%): flag regardless of concentration
-        # High suspicion (>70%): require only > 40% concentration
-        direct_attack = (suspicious_rate > self.threshold and target_concentration > 0.55) or \
-                        (suspicious_rate > 0.80) or \
-                        (extreme_suspicion and target_concentration > 0.40)
+        # High suspicion (>70%): require only > 90% concentration (Relaxed from 40%)
+        direct_attack = (suspicious_rate > self.threshold and target_concentration > 0.85) or \
+                        (suspicious_rate > 0.85) or \
+                        (extreme_suspicion and target_concentration > 0.90)
 
         # Pattern 2: Model Replacement Attack
         resistance_attack = (honest_rate > 0.85 and compliant_rate < 0.02)

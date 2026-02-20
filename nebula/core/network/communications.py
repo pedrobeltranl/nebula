@@ -859,9 +859,9 @@ class CommunicationsManager:
     async def get_all_addrs_current_connections(self, only_direct=False, only_undirected=False):
         try:
             await self.get_connections_lock().acquire_async()
-            if only_direct: return {addr for addr, conn in self.connections.items() if conn.get_direct() and conn.is_active()}
-            elif only_undirected: return {addr for addr, conn in self.connections.items() if not conn.get_direct() and conn.is_active()}
-            else: return {addr for addr, conn in self.connections.items() if conn.is_active()}
+            if only_direct: return {addr for addr, conn in self.connections.items() if conn.get_direct()}
+            elif only_undirected: return {addr for addr, conn in self.connections.items() if not conn.get_direct()}
+            else: return set(self.connections.keys())
         finally: await self.get_connections_lock().release_async()
 
     async def get_addrs_current_connections(self, only_direct=False, only_undirected=False, myself=False):
@@ -870,6 +870,6 @@ class CommunicationsManager:
         if myself: current_connections.add(self.addr)
         return current_connections
 
-    def get_ready_connections(self): return {addr for addr, conn in self.connections.items() if conn.get_ready() and conn.is_active()}
+    def get_ready_connections(self): return {addr for addr, conn in self.connections.items() if conn.get_ready()}
     async def learning_finished(self): return await self.engine.learning_cycle_finished()
     def __str__(self): return f"Connections: {[str(conn) for conn in self.connections.values()]}"

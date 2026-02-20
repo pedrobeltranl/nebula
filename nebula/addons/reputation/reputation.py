@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 from nebula.addons.functions import print_msg_box
 from nebula.core.eventmanager import EventManager
-from nebula.core.nebulaevents import AggregationEvent, RoundStartEvent, UpdateReceivedEvent, DuplicatedMessageEvent
+from nebula.core.nebulaevents import AggregationEvent, RoundStartEvent, UpdateReceivedEvent, DuplicatedMessageEvent, UpdateNeighborEvent
 from nebula.core.utils.helper import (
     cosine_metric,
     euclidean_metric,
@@ -173,12 +173,21 @@ class Reputation:
         self.permanently_blocked.add(node_id)
         logging.warning(f"[Reputation] 🚫 Node {node_id} permanently BLOCKED by containment order.")
 
-        # CRITICAL FIX: Explicitly deactivate connection to stop aggregation waiting
+        # CRITICAL FIX: Emit an event to softly remove the node from aggregation
+        # without cutting the physical TCP connection
         # This prevents the Round Synchronization Deadlock (60s timeouts)
-        if hasattr(self, "_engine") and hasattr(self._engine, "cm") and node_id in self._engine.cm.connections:
-            conn = self._engine.cm.connections[node_id]
-            logging.warning(f"[Reputation] ⚡ Deactivating AGGREGATION for blocked neighbor {node_id} to prevent Deadlock (network_block={network_block}).")
-            conn.set_active(False)
+        if hasattr(self, "_engine") and hasattr(self._engine, "cm"):
+            logging.warning(f"[Reputation] ⚡ IGNORING AGGREGATION from blocked neighbor {node_id} (soft-disconnect) (network_block={network_block}).")
+
+            async def publish_removal():
+                event = UpdateNeighborEvent(node_id, removed=True)
+                await EventManager.get_instance().publish_node_event(event)
+
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(publish_removal())
+            except RuntimeError:
+                pass # Event loop not running edge case
 
         # Also enforce network-level blacklist to stop receiving messages
         # Only if requested (Honeypots might want to keep listening to monitor)
