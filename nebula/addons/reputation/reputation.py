@@ -173,6 +173,13 @@ class Reputation:
         self.permanently_blocked.add(node_id)
         logging.warning(f"[Reputation] 🚫 Node {node_id} permanently BLOCKED by containment order.")
 
+        # CRITICAL FIX: Explicitly deactivate connection to stop aggregation waiting
+        # This prevents the Round Synchronization Deadlock (60s timeouts)
+        if hasattr(self, "_engine") and hasattr(self._engine, "cm") and node_id in self._engine.cm.connections:
+            conn = self._engine.cm.connections[node_id]
+            logging.warning(f"[Reputation] ⚡ Deactivating AGGREGATION for blocked neighbor {node_id} to prevent Deadlock (network_block={network_block}).")
+            conn.set_active(False)
+
         # Also enforce network-level blacklist to stop receiving messages
         # Only if requested (Honeypots might want to keep listening to monitor)
         if network_block and hasattr(self, "_engine") and hasattr(self._engine, "cm") and hasattr(self._engine.cm, "bl"):
@@ -181,15 +188,8 @@ class Reputation:
                 asyncio.create_task(self._engine.cm.bl.add_to_blacklist(node_id))
                 logging.info(f"[Reputation] 🔌 Network blacklist scheduled for {node_id}")
 
-                # 2. CRITICAL FIX: Explicitly deactivate connection to stop aggregation waiting
-                # This prevents the Round Synchronization Deadlock (60s timeouts)
-                if hasattr(self._engine, "cm") and node_id in self._engine.cm.connections:
-                    conn = self._engine.cm.connections[node_id]
-                    logging.warning(f"[Reputation] ⚡ Deactivating AGGREGATION for blocked neighbor {node_id} to prevent Deadlock.")
-                    conn.set_active(False)
-
             except Exception as e:
-                logging.error(f"[Reputation] Failed to schedule network blacklist or deactivate connection: {e}")
+                logging.error(f"[Reputation] Failed to schedule network blacklist: {e}")
 
     def _load_configuration(self):
         defense_args = self._config.participant.get("defense_args", {})
@@ -197,8 +197,10 @@ class Reputation:
         honeypot_defense = defense_args.get("honeypot", {})
 
         is_honeypot_defense_active = honeypot_defense.get("enabled", False)
+        node_role = self._config.participant.get("device_args", {}).get("role", "").lower()
 
-        if is_honeypot_defense_active:
+        # Only force enable reputation defaults if this node is ACTUALLY the honeypot
+        if is_honeypot_defense_active and node_role == "honeypot":
             self._enabled = True
             use_provided_metrics = False
             if "metrics" in reputation_config:

@@ -20,7 +20,7 @@ sys.path.append(ROOT_DIR)
 from nebula.controller.scenarios import ScenarioManagement
 
 # Load existing scenario.json
-SCENARIO_PATH = os.path.join(ROOT_DIR, "app/logs/nebula_DFL_2026_02_18_18_56_00/scenario.json")
+SCENARIO_PATH = os.path.join(ROOT_DIR, "app/logs/nebula_DFL_2026_02_19_22_41_27 2/scenario.json")
 
 def main():
     logging.basicConfig(level=logging.INFO)
