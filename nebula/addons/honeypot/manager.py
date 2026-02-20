@@ -403,13 +403,31 @@ class HoneyPotManager:
                     self.weak_backdoor_nodes.pop(neighbor_id, None)
 
                     if state["suspicious_count"] >= 3:
-                        # Consistently suspicious + failed strengthening
-                        state["status"] = "MALICIOUS"
+                        # ====================================================================
+                        # CARRIER-VS-ATTACKER DISCRIMINATION (False Positive Prevention)
+                        # -------------------------------------------------------------------
+                        # A node that fails bait absorption consistently could be EITHER:
+                        #   (A) A genuine attacker (generates poison locally)
+                        #   (B) A carrier (honest node whose FedAvg is dominated by an upstream attacker)
+                        #
+                        # A carrier CANNOT absorb our bait because its stronger upstream neighbor
+                        # (e.g. P8 sending with weight 1M) overrides our bait signal every round.
+                        #
+                        # STRATEGY: Instead of immediately convicting the node as MALICIOUS,
+                        # mark it as CARRIER_SUSPECT and return TESTING. The DFS will then
+                        # pivot THROUGH this node to inspect its neighbors — exposing the
+                        # real attacker (e.g. P8) one hop further.
+                        # ====================================================================
+                        state["carrier_suspect"] = True
+                        # Keep TESTING status so DFS can pivot through
+                        state["status"] = "TESTING"
                         state["verified_round"] = current_round
-                        logging.critical(
-                            f"[Manager] 🚨 Neighbor {neighbor_id} CONFIRMED as MALICIOUS (Exhausted strengthening with suspicion)"
+                        logging.warning(
+                            f"[Manager] 🚚 Neighbor {neighbor_id} CARRIER_SUSPECT — suspicious but "
+                            f"bait never absorbed (upstream attacker likely). DFS will pivot through "
+                            f"to find real source. (suspicious_count={state['suspicious_count']})"
                         )
-                        return "MALICIOUS"
+                        return "TESTING"
                     else:
                         # Not suspicious enough to block → Catastrophic Forgetting or low data
                         state["status"] = "BENIGN"
@@ -783,7 +801,8 @@ class HoneyPotManager:
             "verified_round": None,
             "max_compliant_seen": 0.0,
             "compliant_history": [],
-            "first_backdoor_round": None
+            "first_backdoor_round": None,
+            "carrier_suspect": False,  # True when suspicious but upstream attacker suspected
         }
         for key, val in defaults.items():
             if key not in state:
@@ -887,10 +906,23 @@ class HoneyPotManager:
             is_currently_suspicious = state.get("suspicious_count", 0) > 0 # Simple heuristic for DFS branching
 
             if status == "MALICIOUS":
-                logging.critical(f"[DFS] 🎯 ATTACKER CONFIRMED: {node_id} (Verdict from Manager)")
-                return (True, node_id)
+                # FP GUARD: Check if this node is actually a CARRIER_SUSPECT.
+                # A carrier_suspect was flagged because it fails bait absorption, but the
+                # reason is an upstream attacker (not its own poison). We must NOT convict
+                # it immediately — instead pivot THROUGH it to expose the real attacker.
+                node_state = self.neighbor_tracking.get(node_id, {})
+                if node_state.get("carrier_suspect", False):
+                    logging.warning(
+                        f"[DFS] 🚚 {node_id} has MALICIOUS status but is a CARRIER_SUSPECT. "
+                        f"Prioritizing as high-priority investigation target (pivot through)."
+                    )
+                    # High priority (score=2.0) — pivot through ASAP to find the real attacker
+                    investigation_neighbors.append((node_id, 2.0))
+                else:
+                    logging.critical(f"[DFS] 🎯 ATTACKER CONFIRMED: {node_id} (Verdict from Manager)")
+                    return (True, node_id)
 
-            if status == "BENIGN":
+            elif status == "BENIGN":
                 compliant_neighbors.append((node_id, 0.0))
                 logging.info(f"[DFS] ✅ {node_id} prioritized as COMPLIANT/BENIGN")
             elif has_bait:

@@ -1491,6 +1491,16 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             self.consecutive_clean_rounds = 0
             # Ejecutar protocolo de contención
             await self._execute_containment_protocol(attacker_id)
+            # FIX: Auto-retire after confirmed detection using the correct mechanism.
+            # Without this, the honeypot loops forever with "No pivot direction available"
+            # because it has nowhere to go after convicting its only unvisited neighbor.
+            # We use the same path as a normal handover ACK: rb.set_next_role + has_served_as_honeypot.
+            try:
+                self._engine.has_served_as_honeypot = True  # Prevent re-promotion by factory
+                await self._engine.rb.set_next_role(Role.AGGREGATOR)
+                logging.info("[HONEYPOT DFS] 🏁 Scheduled retirement to AGGREGATOR after attacker detection.")
+            except Exception as e:
+                logging.error(f"[HONEYPOT DFS] ⚠️ Could not schedule retirement: {e}")
             return
 
         # 4. SI NO ENCONTRAMOS ATACANTE, USAR LA DIRECCIÓN SUGERIDA POR EL ANÁLISIS
