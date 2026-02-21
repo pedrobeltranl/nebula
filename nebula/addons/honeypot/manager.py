@@ -282,21 +282,16 @@ class HoneyPotManager:
                     # if the node HAS GENUINE BAIT. If it doesn't have bait yet, a clash
                     # is likely just a poisoned victim (Carrier). We let it stay in TESTING
                     # so we can pivot through it later.
-                    if has_genuine_bait:
-                        logging.critical(
-                            f"[Manager] 🚨 CONTRADICTION CLASH on {neighbor_id} (targets {dominant_target}). "
-                            f"Bait presence: {max(compliant_rate, state['max_compliant_seen']):.2%}. "
-                            f"Verdict: MALICIOUS (Smart Attacker)."
-                        )
-                        state["status"] = "MALICIOUS"
-                        state["verified_round"] = current_round
-                        return "MALICIOUS"
-                    else:
-                        logging.warning(
-                            f"[Manager] ⚠️ CONTRADICTION CLASH on {neighbor_id} (targets {dominant_target}) "
-                            f"BUT no consistent bait seen yet. Treating as SUSPICIOUS victim (Carrier potential)."
-                        )
-                        # We let it fall through to accumulate suspicion_count
+                    # RCA 12:12:27 - FIX: Even if they have bait, a clash might be an Aggregator
+                    # merging both poison and bait. We treat them as CARRIERS (TESTING)
+                    # to allow investigation. We ONLY confirm MALICIOUS once we verify
+                    # they are the source of the attack (path end).
+                    logging.warning(
+                        f"[Manager] ⚠️ CONTRADICTION CLASH on {neighbor_id} (targets {dominant_target}). "
+                        f"Bait presence: {max(compliant_rate, state['max_compliant_seen']):.2%}. "
+                        f"Verdict: CARRIER SUSPECT (Investigation required)."
+                    )
+                    # We let it fall through to accumulate suspicion_count
 
             self.recent_detections[neighbor_id] = self.recent_detections.get(neighbor_id, 0) + 1
             logging.warning(
@@ -335,22 +330,7 @@ class HoneyPotManager:
                  state["verified_round"] = current_round
                  return "MALICIOUS"
 
-        # 2. VERIFICATION: Backdoor presence — CONSISTENCY REQUIRED
-        # ============================================================================
-        # FALSE NEGATIVE FIX:
-        # The old rule (max_compliant_seen >= 2%) declared BENIGN on a single round.
-        # An attacker that aggregates honest neighbors can accidentally exceed 2% in
-        # one round (aggregation artifact) and get permanently marked BENIGN.
-        #
-        # NEW RULE: A node must show compliance >= BENIGN_COMPLIANT_THRESHOLD in at
-        # least BENIGN_CONSISTENT_ROUNDS of the last BENIGN_WINDOW rounds.
-        # This rejects one-off flukes from FedAvg dilution.
-        # ============================================================================
-        BENIGN_COMPLIANT_THRESHOLD = 0.05   # Minimum compliance per round (5%)
-        BENIGN_CONSISTENT_ROUNDS   = 2      # Must hit threshold in N of last W rounds
-        BENIGN_WINDOW              = 3      # Look back window
-
-        # Count how many recent rounds exceeded the threshold
+        # Count how many recent rounds exceeded the threshold (uses global BENIGN_COMPLIANT_THRESHOLD defined above)
         recent_history = state["compliant_history"][-BENIGN_WINDOW:]
         consistent_rounds = sum(1 for _, r in recent_history if float(r) >= BENIGN_COMPLIANT_THRESHOLD)
         has_consistent_bait = consistent_rounds >= BENIGN_CONSISTENT_ROUNDS
@@ -430,11 +410,7 @@ class HoneyPotManager:
                     if state["first_backdoor_round"] is None:
                         state["first_backdoor_round"] = current_round
                     # CONSISTENCY CHECK: need >= BENIGN_COMPLIANT_THRESHOLD in >= BENIGN_CONSISTENT_ROUNDS of BENIGN_WINDOW
-                    # CONSISTENCY CHECK: need >= BENIGN_COMPLIANT_THRESHOLD in >= BENIGN_CONSISTENT_ROUNDS of BENIGN_WINDOW
-                    # RCA 23:10:38 - Lowered threshold from 0.05 to 0.02 to handle Ring dilution (3.12%)
-                    BENIGN_COMPLIANT_THRESHOLD = 0.02
-                    BENIGN_CONSISTENT_ROUNDS   = 2
-                    BENIGN_WINDOW              = 3
+                    # (Uses threadholds defined at the beginning of this method)
                     recent_history = state["compliant_history"][-BENIGN_WINDOW:]
                     consistent_rounds = sum(1 for _, r in recent_history if float(r) >= BENIGN_COMPLIANT_THRESHOLD)
                     if consistent_rounds >= BENIGN_CONSISTENT_ROUNDS:
