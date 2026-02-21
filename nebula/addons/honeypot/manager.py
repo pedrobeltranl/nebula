@@ -49,14 +49,14 @@ class HoneyPotManager:
         # If a suspect gets backdoor during confirmation → False positive, continue search
         # If after 3 rounds still no backdoor → Confirmed attacker
         self.suspect_confirmation = {}    # Track rounds monitoring each suspect
-        self.confirmation_rounds_required = 3  # INCREASED: Wait 3 rounds before confirming attacker (reduced false positives)
+        self.confirmation_rounds_required = 5  # INCREASED FASE 3: Wait 5 rounds before confirming attacker (prevent ring isolation)
 
         # ============================================================================
         # OPTIMIZED NEIGHBOR TRACKING SYSTEM
-        # Fast benign verification (1 round) + Conservative malicious confirmation (3 rounds)
+        # Fast benign verification (1 round) + Conservative malicious confirmation (5 rounds)
         # ============================================================================
         self.neighbor_tracking = {}  # {node_id: {status, negative_count, start_round, verified_round}}
-        self.NEGATIVE_THRESHOLD = 3  # INCREASED: 3 consecutive negative rounds to allow for bait learning
+        self.NEGATIVE_THRESHOLD = 5  # INCREASED FASE 3: 5 consecutive negative rounds to allow for bait learning in Ring
         self.recent_detections = {}  # {node_id: detection_count} - Fast safety buffer
         self.missing_rounds = {}     # {node_id: missing_count} - Patience limit for synchronization
 
@@ -311,10 +311,11 @@ class HoneyPotManager:
         # In DFL, victims are "Smart Attackers" (Suspicious + Compliant).
         # We ONLY escalate to MALICIOUS if they are suspicious AND have NO bait,
         # OR if they triggered a direct CONTRADICTION CLASH with our HoneyMap.
-        if state["suspicious_count"] >= 3:
+        # FASE 3: Aumentado a 5 para evitar desconexiones prematuras en el anillo.
+        if state["suspicious_count"] >= 5:
              # If they have bait, we treat them as victims (CARRIERS).
              # We stay in TESTING to allow pivoting THROUGH them.
-             if state["max_compliant_seen"] >= 0.02:
+             if state["max_compliant_seen"] >= BENIGN_COMPLIANT_THRESHOLD:
                  logging.warning(
                      f"[Manager] ⚠️ Neighbor {neighbor_id} is persistently suspicious ({state['suspicious_count']}) "
                      f"BUT has bait ({state['max_compliant_seen']:.2%}). Treating as VICTIM CARRIER."
