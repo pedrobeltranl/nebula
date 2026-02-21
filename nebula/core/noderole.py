@@ -245,7 +245,7 @@ class MaliciousRoleBehavior(RoleBehavior):
         # 3. Pivote (Infección)
         if self._attacker_pivoting and not self._pivoted:
             if self._engine.round == self._pivot_round:
-                 nodes = await self._engine.cm.get_addrs_current_connections(only_direct=False, myself=False)
+                 nodes = await self._engine.cm.get_addrs_current_connections(only_direct=False, myself=True)
                  if nodes:
                      # Shuffle nodes to try in random order
                      targets = list(nodes)
@@ -429,7 +429,7 @@ class AggregatorRoleBehavior(RoleBehavior):
         await self._engine._waiting_model_updates()
 
     async def select_nodes_to_wait(self):
-        nodes = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
+        nodes = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=True)
 
         # Filter out nodes that are permanently blocked in Reputation (Soft Blocked)
         # This allows standard aggregators to ignore malicious nodes that are kept connected for monitoring
@@ -477,7 +477,7 @@ class ServerRoleBehavior(RoleBehavior):
         await EventManager.get_instance().publish_node_event(mpe)
 
     async def select_nodes_to_wait(self):
-        nodes = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
+        nodes = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=True)
         return nodes
 
     async def resolve_missing_updates(self):
@@ -513,7 +513,7 @@ class TrainerRoleBehavior(RoleBehavior):
         await self._engine._waiting_model_updates()
 
     async def select_nodes_to_wait(self):
-        nodes = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
+        nodes = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=True)
         return nodes
 
     async def resolve_missing_updates(self):
@@ -1006,7 +1006,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         if testing_remain and not self.threat_confirmed_locally:
             logging.info(f"[Honeypot] ⛔ Skipping aggregation - {len(testing_remain)} TESTING neighbors remain, maintaining pure honeydoor model")
         else:
-            logging.info("[Honeypot] ✅ All neighbors verified. Aggregating normally for better model quality.")
+            if self.threat_confirmed_locally:
+                logging.info("[Honeypot] 🛡️ Threat confirmed & Isolated. Resuming aggregation for recovery.")
+            else:
+                logging.info("[Honeypot] ✅ All neighbors verified. Aggregating normally for better model quality.")
 
         # Esperar que lleguen los updates de vecinos
         try:

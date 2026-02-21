@@ -740,6 +740,12 @@ class Engine:
 
             self.trainer.model.apply(weights_init)
 
+            # NEW: Clear optimizer state (momentum, Adam buffers)
+            # This prevents the trainer from being "pushed" by previous poisoning trends
+            if hasattr(self.trainer, 'model') and hasattr(self.trainer.model, '_optimizer') and self.trainer.model._optimizer:
+                logging.warning("🧹 Clearing optimizer state (momentum buffers)...")
+                self.trainer.model._optimizer.state.clear()
+
             # Reset round counter in trainer/model if necessary
             # (In DFL, starting from current round but with clean weights is usually enough)
             logging.warning("✨ Model reset complete. Federation training starts fresh from this round.")
