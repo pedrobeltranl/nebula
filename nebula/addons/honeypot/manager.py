@@ -1008,10 +1008,9 @@ class HoneyPotManager:
 
                     # BRAVE HONEYPOT: We pivot even if suspicion is high to follow the poison trail.
                     # High suspicion in a carrier is a "compass" toward the origin.
-                    # FIX 23:10:38: If suspicion is TOO high (>40%), even with bait, we treat it as a risk and DON'T pivot.
-                    if raw_suspicion > 0.40:
-                        logging.warning(f"[DFS] 🛑 SUSPICION TOO HIGH ({raw_suspicion:.1%}) on {neighbor_id}. Blocking pivot to avoid jumping into the attacker.")
-                        continue
+                    # RCA 13:22:00 - REMOVED the 40% safety threshold. Aggregators in DFL
+                    # will naturally have high suspicion if they have malicious neighbors.
+                    # As long as they show our bait, we must pivot through them.
 
                     logging.info(f"[DFS] 🕵️ Pivoting to CARRIER neighbor {neighbor_id} to follow poison trail (Suspicion: {raw_suspicion:.1%}).")
                     return (False, neighbor_id)
