@@ -481,7 +481,7 @@ class HoneyPotManager:
                 else:
                     # RCA 16:17 (Fase 5): Extend patience for malicious conviction if no consistent bait.
                     # This allows the Honeypot to pivot through a "0% bait" node if it's suspicious.
-                    EXTENDED_MALICIOUS_THRESHOLD = 7 # Increased from 5 (MALICIOUS_ZERO_ROUNDS_REQUIRED)
+                    EXTENDED_MALICIOUS_THRESHOLD = 5 # Reduced from 7 to accelerate detection
                     if state["negative_count"] < EXTENDED_MALICIOUS_THRESHOLD:
                          logging.warning(
                              f"[Manager] 🕵️ Neighbor {neighbor_id} suspiciously lacks bait ({state['negative_count']} rounds) "
@@ -1000,13 +1000,20 @@ class HoneyPotManager:
                 node_state = self.neighbor_tracking.get(node_id, {})
                 rounds_with_suspicion = node_state.get("suspicious_count", 0)
                 rounds_tested = node_state.get("rounds_tested", 0)
+
+                # RCA 23:51 - IMPROVEMENT: If the node is highly suspicious (>2 rounds) AND has 0% bait,
+                # we do NOT pivot to it. We hold to convict it locally. This prevents the "lion's den" pivot loop.
                 if rounds_with_suspicion >= 1 and rounds_tested >= 1:
-                    # Suspicious but unverified → treat as high-priority carrier candidate
-                    investigation_neighbors.append((node_id, 1.5))  # Higher than normal carrier (1.0)
-                    logging.warning(
-                        f"[DFS] 🔎 {node_id} suspicious with 0% bait — potential carrier (upstream attacker). "
-                        f"Prioritizing for investigation pivot (suspicious={rounds_with_suspicion}/{rounds_tested} rounds)."
-                    )
+                    if rounds_with_suspicion >= 3:
+                        logging.warning(f"[DFS] 🛡️ {node_id} is HIGHLY suspicious ({rounds_with_suspicion} rounds) with 0% bait. Holding to convict locally instead of pivoting.")
+                        suspicious_neighbors.append((node_id, 2.0))
+                    else:
+                        # Suspicious but unverified → treat as high-priority carrier candidate
+                        investigation_neighbors.append((node_id, 1.5))  # Higher than normal carrier (1.0)
+                        logging.warning(
+                            f"[DFS] 🔎 {node_id} suspicious with 0% bait — potential carrier (upstream attacker). "
+                            f"Prioritizing for investigation pivot (suspicious={rounds_with_suspicion}/{rounds_tested} rounds)."
+                        )
                 else:
                     # Not enough evidence yet → pure monitoring
                     suspicious_neighbors.append((node_id, 1.0))
