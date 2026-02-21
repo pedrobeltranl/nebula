@@ -265,20 +265,17 @@ class HoneyPotManager:
                          break
 
                 if clash_detected:
-                    # RCA 21:37:11 - Don't block aggregators that are honest but aggregate poison.
-                    # If the node has bait (current or historical), we treat the clash as a
-                    # "Smart Attacker" signal rather than an immediate block.
-                    if has_backdoor or state["max_compliant_seen"] >= 0.02:
-                         logging.info(
-                             f"[Manager] ⚠️ CONTRADICTION CLASH on {neighbor_id} (targets {dominant_target}) "
-                             f"BUT has bait ({max(compliant_rate, state['max_compliant_seen']):.2%}). "
-                             "Marking as SUSPICIOUS but not blocking yet (Aggregator Resilience)."
-                         )
-                    else:
-                        # FIX: In global Honey Maps (all labels mapped), EVERY dominant target clashes with some rule.
-                        # We must NOT instantly ban here, otherwise innocent non-IID nodes or aggregators get falsely banned
-                        # before they even have a chance to learn the bait in round 1.
-                        logging.warning(f"[Manager] ⚠️ CONTRADICTION CLASH on {neighbor_id} (targets {dominant_target}). Waiting for patience limit.")
+                    # RCA 23:10:38 - IMPROVEMENT: If we detect a DIRECT CONTRADICTION CLASH,
+                    # it means the node is intentionally ignoring our bait to favor its own target.
+                    # This is a "Smart Attacker" signal. We must NOT ignore this just because it has bait.
+                    logging.critical(
+                        f"[Manager] 🚨 CONTRADICTION CLASH on {neighbor_id} (targets {dominant_target}). "
+                        f"Bait presence: {max(compliant_rate, state['max_compliant_seen']):.2%}. "
+                        f"Verdict: MALICIOUS (Smart Attacker)."
+                    )
+                    state["status"] = "MALICIOUS"
+                    state["verified_round"] = current_round
+                    return "MALICIOUS"
 
             self.recent_detections[neighbor_id] = self.recent_detections.get(neighbor_id, 0) + 1
             logging.warning(
@@ -412,7 +409,9 @@ class HoneyPotManager:
                     if state["first_backdoor_round"] is None:
                         state["first_backdoor_round"] = current_round
                     # CONSISTENCY CHECK: need >= BENIGN_COMPLIANT_THRESHOLD in >= BENIGN_CONSISTENT_ROUNDS of BENIGN_WINDOW
-                    BENIGN_COMPLIANT_THRESHOLD = 0.05
+                    # CONSISTENCY CHECK: need >= BENIGN_COMPLIANT_THRESHOLD in >= BENIGN_CONSISTENT_ROUNDS of BENIGN_WINDOW
+                    # RCA 23:10:38 - Lowered threshold from 0.05 to 0.02 to handle Ring dilution (3.12%)
+                    BENIGN_COMPLIANT_THRESHOLD = 0.02
                     BENIGN_CONSISTENT_ROUNDS   = 2
                     BENIGN_WINDOW              = 3
                     recent_history = state["compliant_history"][-BENIGN_WINDOW:]
@@ -456,7 +455,8 @@ class HoneyPotManager:
             #      A genuine carrier consistently absorbs bait (it always aggregates with
             #      multiple honest neighbors, so the signal is stable).
             # ============================================================================
-            BENIGN_COMPLIANT_THRESHOLD = 0.05
+            # RCA 23:10:38 - Lowered threshold from 0.05 to 0.02 to handle Ring dilution (3.12%)
+            BENIGN_COMPLIANT_THRESHOLD = 0.02
             BENIGN_CONSISTENT_ROUNDS   = 2
             BENIGN_WINDOW              = 3
             recent_history    = state["compliant_history"][-BENIGN_WINDOW:]
@@ -1020,6 +1020,11 @@ class HoneyPotManager:
 
                     # BRAVE HONEYPOT: We pivot even if suspicion is high to follow the poison trail.
                     # High suspicion in a carrier is a "compass" toward the origin.
+                    # FIX 23:10:38: If suspicion is TOO high (>40%), even with bait, we treat it as a risk and DON'T pivot.
+                    if raw_suspicion > 0.40:
+                        logging.warning(f"[DFS] 🛑 SUSPICION TOO HIGH ({raw_suspicion:.1%}) on {neighbor_id}. Blocking pivot to avoid jumping into the attacker.")
+                        continue
+
                     logging.info(f"[DFS] 🕵️ Pivoting to CARRIER neighbor {neighbor_id} to follow poison trail (Suspicion: {raw_suspicion:.1%}).")
                     return (False, neighbor_id)
 

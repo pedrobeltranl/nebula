@@ -716,18 +716,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         # Copy transfer source to pivot source (don't analyze the node we came from)
         if self._honeypot_transfer_source:
-            self._last_pivot_source = self._honeypot_transfer_source
-            logging.info(f"[Honeypot] 🔗 Transfer source {self._honeypot_transfer_source} marked as came_from (safe)")
-
-            # NEW: Immediately mark previous node as BENIGN so it receives CLEAN models
-            if self.manager:
-                self.manager.neighbor_tracking[self._honeypot_transfer_source] = {
-                    "status": "BENIGN",
-                    "verified_round": self._engine.round,
-                    "max_compliant_seen": 1.0, # Assume fully compliant since it was US
-                    "first_backdoor_round": self._engine.round
-                }
-                logging.info(f"[Honeypot] ✅ Previous Node {self._honeypot_transfer_source} registered as BENIGN (Clean Model Candidate)")
+            self.set_transfer_source(self._honeypot_transfer_source)
 
         # Bandera clave: Si es True, hemos encontrado al malo y no nos movemos.
         self.threat_confirmed_locally = False
@@ -784,7 +773,26 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         self._recovery_rounds_counter = 0  # Contador de rondas donde la reputación se recupera
         self._max_recovery_rounds = 3  # Si se recupera 3 rondas seguidas, desaparecer
 
-        # --- SIDE CHANNEL LISTENER ---
+    def set_transfer_source(self, source):
+        """
+        Sets the source node that transferred the honeypot role to us.
+        This node is immediately marked as BENIGN and excluded from threat analysis.
+        """
+        self._honeypot_transfer_source = source
+        self._last_pivot_source = source
+        logging.info(f"[Honeypot] 🔗 Transfer source {source} assigned and marked as came_from (safe)")
+
+        # Immediately mark previous node as BENIGN so it receives CLEAN models
+        if self.manager:
+            self.manager.neighbor_tracking[source] = {
+                "status": "BENIGN",
+                "verified_round": self._engine.round,
+                "max_compliant_seen": 1.0, # Assume fully compliant since it was US
+                "first_backdoor_round": self._engine.round
+            }
+            logging.info(f"[Honeypot] ✅ Previous Node {source} registered as BENIGN (Clean Model Candidate)")
+
+    # --- SIDE CHANNEL LISTENER ---
         # Cache updates bypassing aggregator filters (valid for capturing blocked nodes)
         self._latest_updates_cache = {}
         EventManager.get_instance().subscribe_node_event(UpdateReceivedEvent, self._handle_update_event)

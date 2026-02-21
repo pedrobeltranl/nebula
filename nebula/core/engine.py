@@ -456,7 +456,16 @@ class Engine:
                  if honeypot_state:
                       transfer_source = self._role_behavior.manager.import_state(honeypot_state)
                       if transfer_source:
-                          self._role_behavior._honeypot_transfer_source = transfer_source
+                          if hasattr(self._role_behavior, "set_transfer_source"):
+
+                              self._role_behavior.set_transfer_source(transfer_source)
+
+                          else:
+
+                              if hasattr(self._role_behavior, "set_transfer_source"):
+                                  self._role_behavior.set_transfer_source(transfer_source)
+                              else:
+                                  self._role_behavior._honeypot_transfer_source = transfer_source
                           logging.info(f"[Engine] ✅ Transfer source assigned to role_behavior: {transfer_source}")
                       # Reset detection history to give neighbors a fresh start (they might have our old bait)
                       if hasattr(self._role_behavior, '_detection_history'):
@@ -485,7 +494,10 @@ class Engine:
             if target_role == Role.HONEYPOT and honeypot_state:
                  transfer_source = self._role_behavior.manager.import_state(honeypot_state)
                  if transfer_source:
-                     self._role_behavior._honeypot_transfer_source = transfer_source
+                     if hasattr(self._role_behavior, "set_transfer_source"):
+                         self._role_behavior.set_transfer_source(transfer_source)
+                     else:
+                         self._role_behavior._honeypot_transfer_source = transfer_source
                      logging.info(f"[Engine] ✅ Transfer source assigned to role_behavior: {transfer_source}")
                  # Reset detection history to give neighbors a fresh start (they might have our old bait)
                  if hasattr(self._role_behavior, '_detection_history'):
@@ -1135,7 +1147,10 @@ class Engine:
                      if hasattr(self._role_behavior, "manager"):
                          transfer_source = self._role_behavior.manager.import_state(self._pending_honeypot_state)
                          if transfer_source:
-                             self._role_behavior._honeypot_transfer_source = transfer_source
+                             if hasattr(self._role_behavior, "set_transfer_source"):
+                                 self._role_behavior.set_transfer_source(transfer_source)
+                             else:
+                                 self._role_behavior._honeypot_transfer_source = transfer_source
                              logging.info(f"[Engine] ✅ Transfer source assigned to role_behavior: {transfer_source}")
                          # Reset detection history to give neighbors a fresh start
                          if hasattr(self._role_behavior, '_detection_history'):
@@ -1202,7 +1217,10 @@ class Engine:
                             try:
                                 transfer_source = self._role_behavior.manager.import_state(self._pending_honeypot_state)
                                 if transfer_source:
-                                    self._role_behavior._honeypot_transfer_source = transfer_source
+                                    if hasattr(self._role_behavior, "set_transfer_source"):
+                                        self._role_behavior.set_transfer_source(transfer_source)
+                                    else:
+                                        self._role_behavior._honeypot_transfer_source = transfer_source
                                     logging.info(f"[Engine] ✅ Transfer source assigned to role_behavior: {transfer_source}")
                                 # Reset detection history to give neighbors a fresh start
                                 if hasattr(self._role_behavior, '_detection_history'):
