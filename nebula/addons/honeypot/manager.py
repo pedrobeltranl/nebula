@@ -318,7 +318,7 @@ class HoneyPotManager:
              if state["max_compliant_seen"] >= BENIGN_COMPLIANT_THRESHOLD:
                  logging.warning(
                      f"[Manager] ⚠️ Neighbor {neighbor_id} is persistently suspicious ({state['suspicious_count']}) "
-                     f"BUT has bait ({state['max_compliant_seen']:.2%}). Treating as VICTIM CARRIER."
+                     f"BUT has shown bait historically ({state['max_compliant_seen']:.2%}). Treating as VICTIM CARRIER."
                  )
                  # Note: We return "TESTING" but analyze_neighbors_at_current_node will see it's a good pivot target
                  return "TESTING"
@@ -455,14 +455,16 @@ class HoneyPotManager:
             # ============================================================================
             MALICIOUS_ZERO_ROUNDS_REQUIRED = max(self.NEGATIVE_THRESHOLD, 3)
             if neighbor_id not in self.weak_backdoor_nodes and state["negative_count"] >= MALICIOUS_ZERO_ROUNDS_REQUIRED:
-                if has_genuine_bait:
-                    # Genuine carrier: consistently absorbs bait → pivot through to find real source
+                # FASE 4: Priorizar evidencia histórica (max_compliant_seen) sobre consistencia inmediata.
+                # En el anillo (3.12% dilución), el cebo puede saltar rondas.
+                if has_genuine_bait or state["max_compliant_seen"] >= BENIGN_COMPLIANT_THRESHOLD:
+                    # Genuine carrier or node that has shown bait before: consistently absorbs bait → pivot through to find real source
                     state["carrier_suspect"] = True
                     state["status"] = "TESTING"
+                    reason = "consistent bait" if has_genuine_bait else f"historical bait ({state['max_compliant_seen']:.1%})"
                     logging.warning(
-                        f"[Manager] 🚚 {neighbor_id} CARRIER_SUSPECT — consistent bait "
-                        f"({consistent_rounds}/{BENIGN_WINDOW} rounds ≥ {BENIGN_COMPLIANT_THRESHOLD:.0%}) "
-                        f"despite suspicion. DFS will pivot through to find real source."
+                        f"[Manager] 🚚 {neighbor_id} CARRIER_SUSPECT — {reason} "
+                        f"despite suspicion ({state['negative_count']} rounds). DFS will pivot through to find real source."
                     )
                     return "TESTING"
                 else:
