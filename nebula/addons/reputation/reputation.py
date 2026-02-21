@@ -208,8 +208,8 @@ class Reputation:
         is_honeypot_defense_active = honeypot_defense.get("enabled", False)
         node_role = self._config.participant.get("device_args", {}).get("role", "").lower()
 
-        # Only force enable reputation defaults if this node is ACTUALLY the honeypot
-        if is_honeypot_defense_active and node_role == "honeypot":
+        # Only force enable reputation defaults if this node is part of a Honeypot-enabled scenario
+        if is_honeypot_defense_active:
             self._enabled = True
             use_provided_metrics = False
             if "metrics" in reputation_config:
@@ -564,13 +564,15 @@ class Reputation:
         logging.info(f"Reputation of node {nei}: {self.reputation[nei]['reputation']}")
 
         # Check if we are ACTIVELY acting as a Honeypot (Role = HONEYPOT)
-        # If we are just an Aggregator, we MUST still block malicious nodes.
+        # OR if we are in a Honeypot-enabled scenario (Passive Monitoring mode)
+        is_honeypot_scenario = self._config.participant.get("defense_args", {}).get("honeypot", {}).get("enabled", False)
         is_active_honeypot = False
         if hasattr(self._engine, "rb"):
-             # Use get_role_name() to avoid importing Role enum and causing circular imports
              is_active_honeypot = (self._engine.rb.get_role_name() == "honeypot")
 
-        should_filter = not is_active_honeypot
+        # Mitigation (filtering) is ONLY active if NOT in a Honeypot scenario
+        # This fulfills the goal of: Calculate all metrics, but disable mitigation.
+        should_filter = not (is_active_honeypot or is_honeypot_scenario)
 
         if should_filter and self.reputation[nei]["reputation"] < self.REPUTATION_THRESHOLD and current_round > 0:
             self.rejected_nodes.add(nei)

@@ -1623,9 +1623,18 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 if is_carrier:
                     logging.warning(f"[Honeypot] ⚠️ OVERRIDING PIVOT BLOCK for {candidate}: Node has detections ({detection_count}) but is a confirmed CARRIER. Proceeding to follow trail.")
                 else:
-                    logging.error(f"[Honeypot] 🚫 BLOCKED PIVOT to {candidate} - has {detection_count} recent detections (potential attacker)")
-                    logging.info(f"[Honeypot] 🛡️ Staying in current position to monitor threat")
-                    return  # Abort pivot
+                    # FIX: Even if it has detections, if it's an investigation target (suspicious but handled by manager), we pivot.
+                    is_investigation_target = False
+                    if hasattr(self.manager, 'neighbor_tracking') and candidate in self.manager.neighbor_tracking:
+                        state = self.manager.neighbor_tracking[candidate]
+                        is_investigation_target = state.get("suspicious_count", 0) >= 1
+
+                    if is_investigation_target:
+                        logging.warning(f"[Honeypot] 🛡️ OVERRIDING PIVOT BLOCK for {candidate}: Node has detections ({detection_count}) but is an INVESTIGATION_TARGET. Proceeding to follow trail.")
+                    else:
+                        logging.error(f"[Honeypot] 🚫 BLOCKED PIVOT to {candidate} - has {detection_count} recent detections (potential attacker)")
+                        logging.info(f"[Honeypot] 🛡️ Staying in current position to monitor threat")
+                        return  # Abort pivot
 
         logging.info(f"[Honeypot] 👋 Pivoting to {candidate} (Next hop to target).")
         self._last_pivot_target = candidate
