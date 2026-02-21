@@ -234,6 +234,16 @@ class HoneyPotManager:
         state["compliant_history"].append((current_round, compliant_rate))
         state["max_compliant_seen"] = max(state["max_compliant_seen"], compliant_rate)
 
+        # CONSISTENCY CHECK: A node must show compliance consistently to be considered "carrying" our bait.
+        # This prevents FedAvg artifacts from being mistaken for real bait absorption.
+        # RCA 23:10:38 - Lowered threshold from 0.05 to 0.02 to handle Ring dilution (3.12%)
+        BENIGN_COMPLIANT_THRESHOLD = 0.02
+        BENIGN_CONSISTENT_ROUNDS   = 2
+        BENIGN_WINDOW              = 3
+        recent_history    = state["compliant_history"][-BENIGN_WINDOW:]
+        consistent_rounds = sum(1 for _, r in recent_history if float(r) >= BENIGN_COMPLIANT_THRESHOLD)
+        has_genuine_bait  = consistent_rounds >= BENIGN_CONSISTENT_ROUNDS
+
         # ============================================================================
         # DETECTION LOGIC (from first principles):
         #
@@ -267,15 +277,26 @@ class HoneyPotManager:
                 if clash_detected:
                     # RCA 23:10:38 - IMPROVEMENT: If we detect a DIRECT CONTRADICTION CLASH,
                     # it means the node is intentionally ignoring our bait to favor its own target.
-                    # This is a "Smart Attacker" signal. We must NOT ignore this just because it has bait.
-                    logging.critical(
-                        f"[Manager] 🚨 CONTRADICTION CLASH on {neighbor_id} (targets {dominant_target}). "
-                        f"Bait presence: {max(compliant_rate, state['max_compliant_seen']):.2%}. "
-                        f"Verdict: MALICIOUS (Smart Attacker)."
-                    )
-                    state["status"] = "MALICIOUS"
-                    state["verified_round"] = current_round
-                    return "MALICIOUS"
+                    #
+                    # CRITICAL FIX: Only treat as "Smart Attacker" (immediate MALICIOUS)
+                    # if the node HAS GENUINE BAIT. If it doesn't have bait yet, a clash
+                    # is likely just a poisoned victim (Carrier). We let it stay in TESTING
+                    # so we can pivot through it later.
+                    if has_genuine_bait:
+                        logging.critical(
+                            f"[Manager] 🚨 CONTRADICTION CLASH on {neighbor_id} (targets {dominant_target}). "
+                            f"Bait presence: {max(compliant_rate, state['max_compliant_seen']):.2%}. "
+                            f"Verdict: MALICIOUS (Smart Attacker)."
+                        )
+                        state["status"] = "MALICIOUS"
+                        state["verified_round"] = current_round
+                        return "MALICIOUS"
+                    else:
+                        logging.warning(
+                            f"[Manager] ⚠️ CONTRADICTION CLASH on {neighbor_id} (targets {dominant_target}) "
+                            f"BUT no consistent bait seen yet. Treating as SUSPICIOUS victim (Carrier potential)."
+                        )
+                        # We let it fall through to accumulate suspicion_count
 
             self.recent_detections[neighbor_id] = self.recent_detections.get(neighbor_id, 0) + 1
             logging.warning(
@@ -339,7 +360,7 @@ class HoneyPotManager:
             if state["first_backdoor_round"] is None:
                 state["first_backdoor_round"] = current_round
 
-        if has_consistent_bait:
+        if has_genuine_bait:
             # FEATURE: If node is CONSISTENTLY compliant but currently suspicious,
             # hold in TESTING — could be a smart adaptive attacker.
             if is_suspicious:
@@ -455,16 +476,7 @@ class HoneyPotManager:
             #      A genuine carrier consistently absorbs bait (it always aggregates with
             #      multiple honest neighbors, so the signal is stable).
             # ============================================================================
-            # RCA 23:10:38 - Lowered threshold from 0.05 to 0.02 to handle Ring dilution (3.12%)
-            BENIGN_COMPLIANT_THRESHOLD = 0.02
-            BENIGN_CONSISTENT_ROUNDS   = 2
-            BENIGN_WINDOW              = 3
-            recent_history    = state["compliant_history"][-BENIGN_WINDOW:]
-            consistent_rounds = sum(1 for _, r in recent_history if float(r) >= BENIGN_COMPLIANT_THRESHOLD)
-            has_genuine_bait  = consistent_rounds >= BENIGN_CONSISTENT_ROUNDS
-
             MALICIOUS_ZERO_ROUNDS_REQUIRED = max(self.NEGATIVE_THRESHOLD, 3)
-
             if neighbor_id not in self.weak_backdoor_nodes and state["negative_count"] >= MALICIOUS_ZERO_ROUNDS_REQUIRED:
                 if has_genuine_bait:
                     # Genuine carrier: consistently absorbs bait → pivot through to find real source

@@ -83,7 +83,7 @@ class HoneyDetector:
                 if y_poison == y_real:
                     honest_count += 1
                 else:
-                    honest_count += 1
+                    suspicious_count += 1
 
         # Analysis
         suspicious_rate = suspicious_count / total if total > 0 else 0
