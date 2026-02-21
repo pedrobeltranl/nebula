@@ -323,13 +323,24 @@ class HoneyPotManager:
                  # Note: We return "TESTING" but analyze_neighbors_at_current_node will see it's a good pivot target
                  return "TESTING"
              else:
-                 logging.critical(
-                     f"[Manager] 🚨 Neighbor {neighbor_id} CONTRADICTION: Persistent suspicion ({state['suspicious_count']}) "
-                     f"with NO bait seen. Verdict: MALICIOUS"
-                 )
-                 state["status"] = "MALICIOUS"
-                 state["verified_round"] = current_round
-                 return "MALICIOUS"
+                  # RCA 16:17 (Fase 5): If we are already planning to investigate (pivot through)
+                  # because it's the only path, we give it 2 more rounds of grace even with 0% bait.
+                  # This prevents P0 from flagging P9 as MALICIOUS before pivoting.
+                  EXTENDED_INVESTIGATION_THRESHOLD = 7 # Increased from 5
+                  if state["suspicious_count"] < EXTENDED_INVESTIGATION_THRESHOLD:
+                      logging.warning(
+                          f"[Manager] 🕵️ Neighbor {neighbor_id} is highly suspicious ({state['suspicious_count']}) "
+                          f"with NO bait seen. Holding in TESTING for extended investigation (Threshold: {EXTENDED_INVESTIGATION_THRESHOLD})."
+                      )
+                      return "TESTING"
+
+                  logging.critical(
+                      f"[Manager] 🚨 Neighbor {neighbor_id} CONTRADICTION: Persistent suspicion ({state['suspicious_count']}) "
+                      f"with NO bait seen. Verdict: MALICIOUS"
+                  )
+                  state["status"] = "MALICIOUS"
+                  state["verified_round"] = current_round
+                  return "MALICIOUS"
 
         # Count how many recent rounds exceeded the threshold (uses global BENIGN_COMPLIANT_THRESHOLD defined above)
         recent_history = state["compliant_history"][-BENIGN_WINDOW:]
@@ -468,6 +479,16 @@ class HoneyPotManager:
                     )
                     return "TESTING"
                 else:
+                    # RCA 16:17 (Fase 5): Extend patience for malicious conviction if no consistent bait.
+                    # This allows the Honeypot to pivot through a "0% bait" node if it's suspicious.
+                    EXTENDED_MALICIOUS_THRESHOLD = 7 # Increased from 5 (MALICIOUS_ZERO_ROUNDS_REQUIRED)
+                    if state["negative_count"] < EXTENDED_MALICIOUS_THRESHOLD:
+                         logging.warning(
+                             f"[Manager] 🕵️ Neighbor {neighbor_id} suspiciously lacks bait ({state['negative_count']} rounds) "
+                             f"but hasn't reached EXTENDED_MALICIOUS_THRESHOLD ({EXTENDED_MALICIOUS_THRESHOLD}). Holding in TESTING."
+                         )
+                         return "TESTING"
+
                     # No genuine consistent bait + persistent suspicion → genuine attacker
                     # (one-off FedAvg spikes don't count as real bait absorption)
                     state["status"] = "MALICIOUS"

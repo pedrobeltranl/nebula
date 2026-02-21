@@ -1568,14 +1568,23 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                  rep_data = self._engine._reputation.reputation.get(next_pivot, {})
                  current_score = float(rep_data.get("reputation", 0.0))
 
-                 # FIX: If we have VERIFIED it as Benign OR it is a Carrier, we pivot regardless of score.
+                 # FIX: If we have VERIFIED it as Benign OR it is a Carrier/Investigation target, we pivot regardless of score.
                  neighbor_status = self.manager.get_neighbor_status(next_pivot)
+
+                 # Check if it's a carrier or investigation target from manager memory
+                 is_investigation_target = False
                  is_carrier = False
                  if hasattr(self.manager, 'neighbor_tracking') and next_pivot in self.manager.neighbor_tracking:
-                     is_carrier = self.manager.neighbor_tracking[next_pivot].get("max_compliant_seen", 0) >= 0.02
+                     state = self.manager.neighbor_tracking[next_pivot]
+                     is_carrier = state.get("max_compliant_seen", 0) >= 0.02 or state.get("carrier_suspect", False)
+                     is_investigation_target = state.get("suspicious_count", 0) >= 1
 
-                 if neighbor_status == "BENIGN" or is_carrier:
-                      logging.info(f"[HONEYPOT DFS] 🛡️ Allowing pivot to {next_pivot} - Status is {neighbor_status} (Carrier/Bait detected: {is_carrier}) even if Reputation ({current_score:.2f}) is low.")
+                 if neighbor_status == "BENIGN" or is_carrier or is_investigation_target:
+                      logging.info(
+                          f"[HONEYPOT DFS] 🛡️ Allowing pivot to {next_pivot} - "
+                          f"Status: {neighbor_status}, Carrier: {is_carrier}, InvTarget: {is_investigation_target}. "
+                          f"Bypassing Low Reputation ({current_score:.2f})."
+                      )
                  elif current_score < 0.5:
                       logging.warning(f"[HONEYPOT DFS] ⚠️ Cancelling pivot to {next_pivot} - LOW REPUTATION ({current_score:.2f}). Neighbor is SUSPICIOUS/UNVERIFIED.")
                       logging.info(f"[HONEYPOT DFS] 🔒 Locking target {next_pivot} for containment/verification instead of pivoting.")
