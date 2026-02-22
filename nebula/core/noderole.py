@@ -1510,24 +1510,30 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         logging.info(f"[HONEYPOT DFS] Analyzing {len(neighbors)} neighbors: {neighbors}")
 
-        for node_id in neighbors:
-            if node_id in updates_storage and updates_storage[node_id]:
-                update_tuple = updates_storage[node_id]
+        # 2. SYNC RETRY LOOP: Wait up to 3 attempts if models are missing
+        for attempt in range(3):
+            for node_id in neighbors:
+                if node_id not in neighbors_models:
+                    if node_id in updates_storage and updates_storage[node_id]:
+                        update_tuple = updates_storage[node_id]
+                        target_update = update_tuple[0]
+                        # FIX: If no aggregated model, use latest from history
+                        if not target_update and len(update_tuple) > 1 and update_tuple[1]:
+                            try: target_update = update_tuple[1][-1]
+                            except: pass
 
-                target_update = update_tuple[0]
-                # FIX: If no aggregated model (Honeypot skips aggregation), use latest from history
-                if not target_update and len(update_tuple) > 1 and update_tuple[1]:
-                    try:
-                        target_update = update_tuple[1][-1]
-                    except IndexError:
-                        pass
+                        if target_update and hasattr(target_update, 'model'):
+                            neighbors_models[node_id] = target_update.model
+                            logging.info(f"[HONEYPOT DFS]   ✓ Got model from {node_id} (Attempt {attempt+1})")
 
-                if target_update and hasattr(target_update, 'model'):
-                    neighbors_models[node_id] = target_update.model
-                    logging.info(f"[HONEYPOT DFS]   ✓ Got model from {node_id}")
+            if len(neighbors_models) >= len(neighbors):
+                break
+            if attempt < 2:
+                logging.info(f"[HONEYPOT DFS] ⏳ Some models missing ({len(neighbors_models)}/{len(neighbors)}). Retrying in 1s...")
+                await asyncio.sleep(1)
 
         if not neighbors_models:
-            logging.warning("[HONEYPOT DFS] No models available from neighbors.")
+            logging.warning("[HONEYPOT DFS] No models available from neighbors after retries.")
             return
 
         # 3. ANALIZAR VECINOS USANDO DFS

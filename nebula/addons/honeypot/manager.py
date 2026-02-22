@@ -41,7 +41,7 @@ class HoneyPotManager:
 
         # PER-NODE Grace Period: Track rounds spent at current node
         self.rounds_at_current_node = 0  # Reset when pivoting
-        self.grace_rounds_per_node = 4  # Phase 6.5: Reduced to 4 for faster pivoting
+        self.grace_rounds_per_node = 1  # RCA 22:45 - FAST PIVOT: Target 1 round for active pursuit
         self.current_node_id = None      # Track which node we're at
 
         # SUSPECT CONFIRMATION: Track suspects before declaring as attackers
@@ -922,11 +922,21 @@ class HoneyPotManager:
         grace_period_active = self.is_grace_period_active(neighbors_models)
 
         if grace_period_active:
-            logging.info(f"[DFS] ⏳ GRACE PERIOD at current node (round {self.rounds_at_current_node}/{self.grace_rounds_per_node})")
-            logging.info(f"[DFS] 🎣 Injecting HoneyDoor backdoor - waiting for propagation before analysis")
-            # Durante grace: NO analizar, solo inyectar backdoor
-            # Retornar None para indicar que aún no hay decisión
-            return (False, None)
+            # OPTIMIZATION: If we already have strong evidence of a poison trail (carrier),
+            # we skip the remaining grace period to pivot ASAP towards the attacker.
+            found_carrier = False
+            for nid, model in neighbors_models.items():
+                is_valid, has_bait, rate, is_suspicious, _ = self._check_neighbor_has_backdoor(model)
+                if has_bait and is_suspicious:
+                    found_carrier = True
+                    break
+
+            if found_carrier:
+                logging.info(f"[DFS] ⚡ CARRIER DETECTED! Skipping residual grace period to pursue poison trail.")
+            else:
+                logging.info(f"[DFS] ⏳ GRACE PERIOD at current node (round {self.rounds_at_current_node}/{self.grace_rounds_per_node})")
+                logging.info(f"[DFS] 🎣 Injecting HoneyDoor backdoor - waiting for propagation before analysis")
+                return (False, None)
 
         # DESPUÉS DEL GRACE PERIOD: Analizar vecinos para detectar atacante
         logging.info(f"[DFS] ✅ Grace period COMPLETE - Starting neighbor analysis")
