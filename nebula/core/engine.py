@@ -1609,9 +1609,9 @@ class Engine:
             if self.addr in targets or self.addr in [t.split(':')[0] for t in targets if ':' in t]:
                 logging.warning(f"🛡️ BLOCK FLOOD received from {source}. Blocking data from {attacker_id} (round {round_num})")
 
-                # FIX: Use network_block=False so we can still SEND messages to the attacker (to complete their round)
-                # but we will ignore their received models via Aggregator filtering logic.
-                can_block_network = False # Prevents deadlock where attacker waits for us indefinitely
+                # FIX: Use network_block=True to completely silence the attacker.
+                # Previously False to avoid deadlocks, but Soft-Block allowed persistent poisoning.
+                can_block_network = True
 
                 if hasattr(self, "_reputation") and hasattr(self._reputation, "force_block"):
                     self._reputation.force_block(attacker_id, network_block=can_block_network)

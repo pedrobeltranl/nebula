@@ -879,11 +879,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                             optimizer.zero_grad()
                             output = model(x)
                             loss = criterion(output, y)
-                            loss.backward()
-                            optimizer.step()
-                            epoch_loss += loss.item()
-                            epoch_correct += (output.argmax(dim=1) == y).sum().item()
                             epoch_total += y.size(0)
+                            # Phase 6.6: Yield control to event loop to allow heartbeats
+                            if batch_idx % 10 == 0:
+                                await asyncio.sleep(0)
                         epoch_acc = epoch_correct / epoch_total if epoch_total > 0 else 0
                         logging.info(f"[Honeypot] 🎣 Bait Epoch {epoch+1}/{BAIT_EPOCHS}: Loss={epoch_loss/len(bait_loader):.4f} Acc={epoch_acc:.2%}")
 
@@ -952,20 +951,30 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             # Classify neighbors
             grace_active = self.manager.is_grace_period_active()
 
+            # NEW: Persistent trust based on high reputation
+            # Any node with reputation > 1.5 is considered BENIGN and should NEVER receive bait.
+            # This protects the ring from "Friendly Fire" after global resets.
+            reputation_module = getattr(self._engine, "_reputation", None)
+
+            def is_extra_trusted(node):
+                if not reputation_module: return False
+                score = reputation_module.get_score(node)
+                return score > 1.5
+
             if (is_handover or self.threat_confirmed_locally) and not grace_active:
                 # If we confirmed threat and grace is over, only send CLEAN to verified benign
                 # To prevent alerting attackers further.
-                clean_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) == "BENIGN"]
+                clean_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) == "BENIGN" or is_extra_trusted(n)]
                 testing_neighbors = []
             elif grace_active:
                 # During grace period: Send BAIT to everyone except those explicitly confirmed as MALICIOUS
-                # This ensures we 'test' everyone as much as possible before convicting.
-                clean_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) == "BENIGN"]
-                testing_neighbors = [n for n in neighbors if self.manager.get_neighbor_status(n) != "BENIGN"]
+                # OR those who are EXTRA TRUSTED (to protect the ring accuracy)
+                clean_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) == "BENIGN" or is_extra_trusted(n)]
+                testing_neighbors = [n for n in neighbors if n not in clean_recipients and self.manager.get_neighbor_status(n) != "MALICIOUS"]
             else:
                 # Normal mode: BENIGN get clean, TESTING get bait
-                clean_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) == "BENIGN"]
-                testing_neighbors = [n for n in neighbors if self.manager.get_neighbor_status(n) == "TESTING"]
+                clean_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) == "BENIGN" or is_extra_trusted(n)]
+                testing_neighbors = [n for n in neighbors if n not in clean_recipients and self.manager.get_neighbor_status(n) == "TESTING"]
 
             # Send CLEAN model to BENIGN neighbors
             if clean_recipients:
