@@ -1510,8 +1510,9 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         logging.info(f"[HONEYPOT DFS] Analyzing {len(neighbors)} neighbors: {neighbors}")
 
-        # 2. SYNC RETRY LOOP: Wait up to 3 attempts if models are missing
-        for attempt in range(3):
+        # 2. SYNC RETRY LOOP: Wait up to 10 attempts (20s) if models are missing
+        # RCA 22:40:54 revealed that neighbors can be ~17s behind due to chain lag.
+        for attempt in range(10):
             for node_id in neighbors:
                 if node_id not in neighbors_models:
                     if node_id in updates_storage and updates_storage[node_id]:
@@ -1528,12 +1529,12 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
             if len(neighbors_models) >= len(neighbors):
                 break
-            if attempt < 2:
-                logging.info(f"[HONEYPOT DFS] ⏳ Some models missing ({len(neighbors_models)}/{len(neighbors)}). Retrying in 1s...")
-                await asyncio.sleep(1)
+            if attempt < 9:
+                logging.info(f"[HONEYPOT DFS] ⏳ Models missing ({len(neighbors_models)}/{len(neighbors)}). Retrying in 2s... (Wait up to 20s)")
+                await asyncio.sleep(2)
 
         if not neighbors_models:
-            logging.warning("[HONEYPOT DFS] No models available from neighbors after retries.")
+            logging.warning("[HONEYPOT DFS] No models available from neighbors after multi-retry.")
             return
 
         # 3. ANALIZAR VECINOS USANDO DFS

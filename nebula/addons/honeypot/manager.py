@@ -340,19 +340,21 @@ class HoneyPotManager:
                   # RCA 16:17 (Fase 5): If we are already planning to investigate (pivot through)
                   # because it's the only path, we give it 2 more rounds of grace even with 0% bait.
                   # This prevents P0 from flagging P9 as MALICIOUS before pivoting.
-                   # RCA 22:11 (Fase 6): Increased to 10 to allow DFS to traverse Ring topology
-                   # without flagging honest carriers as attackers prematurely.
-                   EXTENDED_INVESTIGATION_THRESHOLD = 6 # Phase 6.5: Reduced to 6 for faster transition
-                   if state["suspicious_count"] < EXTENDED_INVESTIGATION_THRESHOLD:
+                   # RCA 23:40 (Fase 6.13): REINFORCED INQUIRY.
+                   # We NEVER pivot to a node with 0% bait. We wait for differentiation.
+                   # If we see 0% bait + poison, we trigger STRENGTHENING and wait 10 rounds.
+                   # This prevents false positives on victims while protecting the HP role.
+                   REINFORCEMENT_WAIT_ROUNDS = 10
+                   if state["suspicious_count"] < REINFORCEMENT_WAIT_ROUNDS:
                        logging.warning(
                            f"[Manager] 🕵️ Neighbor {neighbor_id} is highly suspicious ({state['suspicious_count']}) "
-                           f"with NO bait seen. Holding in TESTING for extended investigation (Threshold: {EXTENDED_INVESTIGATION_THRESHOLD})."
+                           f"with NO bait seen. REINFORCED INQUIRY: Holding pos and strengthening bait."
                        )
                        return "TESTING"
 
                    logging.critical(
                        f"[Manager] 🚨 Neighbor {neighbor_id} CONTRADICTION: Persistent suspicion ({state['suspicious_count']}) "
-                       f"with LOW/NO bait seen (current max: {state['max_compliant_seen']:.2%}). Verdict: MALICIOUS"
+                       f"despite reinforcement. Verdict: MALICIOUS"
                    )
                    state["status"] = "MALICIOUS"
                    state["verified_round"] = current_round
@@ -1035,19 +1037,13 @@ class HoneyPotManager:
                 rounds_with_suspicion = node_state.get("suspicious_count", 0)
                 rounds_tested = node_state.get("rounds_tested", 0)
 
-                # RCA 23:51 - IMPROVEMENT: If the node is highly suspicious (>2 rounds) AND has 0% bait,
-                # we do NOT pivot to it. We hold to convict it locally. This prevents the "lion's den" pivot loop.
-                if rounds_with_suspicion >= 1 and rounds_tested >= 1:
-                    if rounds_with_suspicion >= 3:
-                        logging.warning(f"[DFS] 🛡️ {node_id} is HIGHLY suspicious ({rounds_with_suspicion} rounds) with 0% bait. Holding to convict locally instead of pivoting.")
-                        suspicious_neighbors.append((node_id, 2.0))
-                    else:
-                        # Suspicious but unverified → treat as high-priority carrier candidate
-                        investigation_neighbors.append((node_id, 1.5))  # Higher than normal carrier (1.0)
-                        logging.warning(
-                            f"[DFS] 🔎 {node_id} suspicious with 0% bait — potential carrier (upstream attacker). "
-                            f"Prioritizing for investigation pivot (suspicious={rounds_with_suspicion}/{rounds_tested} rounds)."
-                        )
+                # RCA 23:40 (Fase 6.13): SAFETY FIRST - ZERO BAIT NO PIVOT.
+                # If a node has 0% bait, we NEVER pivot (it could be the attacker).
+                # We put it in suspicious_neighbors which forces a HOLD in DFS.
+                # We only pivot if state["max_compliant_seen"] > 0 (Confirmed Carrier).
+                if rounds_with_suspicion >= 1:
+                    logging.warning(f"[DFS] 🛡️ {node_id} has 0% bait. HOLDING position to differentiate via reinforcement.")
+                    suspicious_neighbors.append((node_id, 2.0))
                 else:
                     # Not enough evidence yet → pure monitoring
                     suspicious_neighbors.append((node_id, 1.0))
