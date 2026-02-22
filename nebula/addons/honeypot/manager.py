@@ -240,9 +240,10 @@ class HoneyPotManager:
 
         # CONSISTENCY CHECK: A node must show compliance consistently to be considered "carrying" our bait.
         # This prevents FedAvg artifacts from being mistaken for real bait absorption.
-        # RCA 22:11 (Fase 6.1): Increased to 0.15 (15%) to filter out attacker noise
-        BENIGN_COMPLIANT_THRESHOLD = 0.15
-        BENIGN_CONSISTENT_ROUNDS   = 2
+        # RCA 22:45 (Fase 6.6): Reduced back to 0.02 (2%) because 15% was causing
+        # False Positivos in Ring DFL due to signal dilution.
+        BENIGN_COMPLIANT_THRESHOLD = 0.02
+        BENIGN_CONSISTENT_ROUNDS   = 1 # Requirement reduced for faster pivot response
         BENIGN_WINDOW              = 3
         recent_history    = state["compliant_history"][-BENIGN_WINDOW:]
         consistent_rounds = sum(1 for _, r in recent_history if float(r) >= BENIGN_COMPLIANT_THRESHOLD)
@@ -351,7 +352,7 @@ class HoneyPotManager:
 
                    logging.critical(
                        f"[Manager] 🚨 Neighbor {neighbor_id} CONTRADICTION: Persistent suspicion ({state['suspicious_count']}) "
-                       f"with NO bait seen. Verdict: MALICIOUS"
+                       f"with LOW/NO bait seen (current max: {state['max_compliant_seen']:.2%}). Verdict: MALICIOUS"
                    )
                    state["status"] = "MALICIOUS"
                    state["verified_round"] = current_round
