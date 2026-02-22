@@ -236,8 +236,8 @@ class HoneyPotManager:
 
         # CONSISTENCY CHECK: A node must show compliance consistently to be considered "carrying" our bait.
         # This prevents FedAvg artifacts from being mistaken for real bait absorption.
-        # RCA 23:10:38 - Lowered threshold from 0.05 to 0.02 to handle Ring dilution (3.12%)
-        BENIGN_COMPLIANT_THRESHOLD = 0.02
+        # RCA 22:11 (Fase 6.1): Increased to 0.15 (15%) to filter out attacker noise
+        BENIGN_COMPLIANT_THRESHOLD = 0.15
         BENIGN_CONSISTENT_ROUNDS   = 2
         BENIGN_WINDOW              = 3
         recent_history    = state["compliant_history"][-BENIGN_WINDOW:]
