@@ -702,8 +702,12 @@ class Engine:
 
             logging.warning(f"🔄 MODEL RESET received from {source} (Origin: {source_honeypot}, Round: {round_num})")
 
-            # Ejecutar el reset local
-            await self.reinitialize_model()
+            # RCA 22:11 (Fase 6): Using inner try-except to ensure propagation continues even if local reset fails
+            try:
+                # Ejecutar el reset local
+                await self.reinitialize_model()
+            except Exception as e:
+                logging.error(f"❌ Error during local model reinitialization: {e}. Continuing propagation to save neighbors.")
 
             # Propagar a los vecinos
             neighbors = set(self.cm.connections.keys())
@@ -751,7 +755,7 @@ class Engine:
 
             # 🔥 NEW: Emit GlobalModelResetEvent so aggregation buffers (DFLUpdateHandler) are purged
             logging.warning("🔔 Emitting GlobalModelResetEvent to purge aggregation buffers.")
-            await EventManager.get_instance().emit_node_event(GlobalModelResetEvent(source_honeypot="origin", round=self.round))
+            await EventManager.get_instance().publish_node_event(GlobalModelResetEvent(source_honeypot="origin", round=self.round))
 
             logging.warning("✨ Model reset complete. Federation training starts fresh from this round.")
 
