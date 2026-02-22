@@ -226,8 +226,12 @@ class HoneyPotManager:
         if state["status"] == "MALICIOUS":
             return "MALICIOUS"
 
-        # Analyze model for backdoor presence (returns bool + compliant_rate + is_suspicious + dominant_target)
-        has_backdoor, compliant_rate, is_suspicious, dominant_target = self._check_neighbor_has_backdoor(neighbor_model)
+        # Analyze model for backdoor presence (returns is_valid + has_backdoor + compliant_rate + is_suspicious + dominant_target)
+        is_valid, has_backdoor, compliant_rate, is_suspicious, dominant_target = self._check_neighbor_has_backdoor(neighbor_model)
+
+        if not is_valid:
+            # Phase 6.3: Skip this round for this neighbor to avoid False Positives from lag artifacts
+            return "TESTING"
 
         # Update history
         state["rounds_tested"] += 1
@@ -513,14 +517,22 @@ class HoneyPotManager:
         Check if neighbor model contains the honeypot backdoor.
 
         Returns:
-            tuple: (has_backdoor: bool, compliant_rate: float, is_suspicious: bool, dominant_target: int)
+            tuple: (is_valid: bool, has_backdoor: bool, compliant_rate: float, is_suspicious: bool, dominant_target: int)
+                - is_valid: True if model is structurally sound (not an empty lag artifact)
                 - has_backdoor: True if compliant rate >= 2%
                 - compliant_rate: Measure of backdoor presence (0.0 to 1.0)
                 - is_suspicious: True if detector flagged SUSPICIOUS patterns
                 - dominant_target: The label most targeted by suspicious predictions
         """
         if not self.detector or not neighbor_model:
-            return False, 0.0, False, None
+            return False, False, 0.0, False, None
+
+        # Phase 6.3 (STABILITY): Model Sanity Check (Lag Protection)
+        # Empty or malformed models (e.g., 3.4 KB artifacts) from system lag are ignored
+        # to prevent False Positives during investigation.
+        if len(neighbor_model) < 5:
+             logging.warning(f"[Manager] Skipping model from neighbor (Sanity check failed: only {len(neighbor_model)} params). Likely lag.")
+             return False, False, 0.0, False, None
 
         try:
             # Get validation data
@@ -551,12 +563,12 @@ class HoneyPotManager:
                     compliant_rate = det_compliant_rate
                     has_backdoor = compliant_rate >= 0.02  # 2% threshold
 
-                    return has_backdoor, compliant_rate, is_suspicious, dominant_target
+                    return True, has_backdoor, compliant_rate, is_suspicious, dominant_target
 
         except Exception as e:
             logging.debug(f"[Manager] Error checking backdoor presence: {e}")
 
-        return False, 0.0, False, None
+        return False, False, 0.0, False, None
 
     def should_send_backdoor(self, neighbor_id):
         """
