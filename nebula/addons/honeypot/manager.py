@@ -297,11 +297,20 @@ class HoneyPotManager:
                     )
                     # We let it fall through to accumulate suspicion_count
 
-            self.recent_detections[neighbor_id] = self.recent_detections.get(neighbor_id, 0) + 1
-            logging.warning(
-                f"[Manager] ⚠️ Neighbor {neighbor_id} flagged SUSPICIOUS (count: {state['suspicious_count']}) "
-                f"- recent detections: {self.recent_detections[neighbor_id]}"
-            )
+            # Update suspect history
+            # NEW: Don't flag as suspicious if we didn't send bait (Bait Safety for trusted nodes)
+            reputation_module = getattr(self.engine, "_reputation", None)
+            is_extra_trusted = reputation_module and reputation_module.get_score(neighbor_id) > 1.5
+
+            if is_extra_trusted:
+                logging.debug(f"[Manager] 🛡️ Node {neighbor_id} lacks bait but is Extra Trusted. Skipping suspicion.")
+            else:
+                state["suspicious_count"] += 1
+                self.recent_detections[neighbor_id] = self.recent_detections.get(neighbor_id, 0) + 1
+                logging.warning(
+                    f"[Manager] ⚠️ Neighbor {neighbor_id} flagged SUSPICIOUS (count: {state['suspicious_count']}) "
+                    f"- recent detections: {self.recent_detections[neighbor_id]}"
+                )
         else:
             # DECAY suspicion (don't reset to 0 immediately) to allow for some noise but punish persistence
             if state["suspicious_count"] > 0:

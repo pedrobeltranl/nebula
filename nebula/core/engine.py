@@ -1358,12 +1358,24 @@ class Engine:
 
                     if hasattr(self.cm, 'connections'):
                         connections = list(self.cm.connections.values())
-                        active_neighbors = [c for c in connections if c.active]
+
+                        # NEW: Exclude permanently blocked nodes from the synchronization barrier
+                        # This prevents the engine from hanging while waiting for a node we just kicked.
+                        permanent_blacklist = set()
+                        if hasattr(self, '_reputation') and hasattr(self._reputation, 'permanently_blocked'):
+                            permanent_blacklist = self._reputation.permanently_blocked
+
+                        active_neighbors = []
+                        for c in connections:
+                            if not c.active: continue
+                            c_id = getattr(c, 'peer_id', getattr(c, 'node_id', None))
+                            if c_id not in permanent_blacklist:
+                                active_neighbors.append(c)
                     else:
                         active_neighbors = []
 
                     if not active_neighbors:
-                        logging.warning("⚠️ No neighbors visible. Proceeding forcefully.")
+                        logging.warning("⚠️ No neighbors visible or all blocked. Proceeding forcefully.")
                         break
 
                     # Verificar rondas usando getattr para evitar crashes si falta el atributo
