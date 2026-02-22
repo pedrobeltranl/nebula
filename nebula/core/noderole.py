@@ -1032,7 +1032,6 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         # Esperar que lleguen los updates de vecinos
         try:
-            import asyncio
             await asyncio.sleep(2)
             if not testing_remain:
                 logging.info("[Honeypot] 🔄 Performing aggregation with verified neighbor models...")
