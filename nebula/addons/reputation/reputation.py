@@ -2014,11 +2014,17 @@ class Reputation:
                  score_dict[nei] = data["reputation"]
         return score_dict
 
+    def get_score(self, node_id):
+        if node_id in self.reputation:
+             return self.reputation[node_id].get("reputation", 1.0)
+        return 1.0
+
     def manual_update(self, node_id, factor):
         if node_id in self.reputation and "reputation" in self.reputation[node_id]:
             old = self.reputation[node_id]["reputation"]
             new = old * factor
-            new = max(0.0, min(1.0, new))
+            # Allow reputation to go above 1.0 for "Extra Trusted" status
+            new = max(0.0, min(2.0, new))
             self.reputation[node_id]["reputation"] = new
             logging.info(f"[Reputation] Manual update for {node_id}: {old:.2f} -> {new:.2f}")
 
