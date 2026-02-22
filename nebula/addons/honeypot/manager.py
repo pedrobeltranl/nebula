@@ -41,7 +41,7 @@ class HoneyPotManager:
 
         # PER-NODE Grace Period: Track rounds spent at current node
         self.rounds_at_current_node = 0  # Reset when pivoting
-        self.grace_rounds_per_node = 1   # Speed up search (Reduced from 2)
+        self.grace_rounds_per_node = 4  # Phase 6.5: Reduced to 4 for faster pivoting
         self.current_node_id = None      # Track which node we're at
 
         # SUSPECT CONFIRMATION: Track suspects before declaring as attackers
@@ -49,7 +49,7 @@ class HoneyPotManager:
         # If a suspect gets backdoor during confirmation → False positive, continue search
         # If after 3 rounds still no backdoor → Confirmed attacker
         self.suspect_confirmation = {}    # Track rounds monitoring each suspect
-        self.confirmation_rounds_required = 5  # INCREASED FASE 3: Wait 5 rounds before confirming attacker (prevent ring isolation)
+        self.confirmation_rounds_required = 3  # Phase 6.5: Reduced to 3 for faster conviction
 
         # ============================================================================
         # OPTIMIZED NEIGHBOR TRACKING SYSTEM
@@ -67,10 +67,10 @@ class HoneyPotManager:
         # ============================================================================
         self.weak_backdoor_nodes = {}  # {node_id: {round_started, attempts, original_params}}
         self.strengthening_enabled = True
-        self.strengthening_max_attempts = 3   # OPTIMIZED: 3 attempts (User Request: Fast & Strong)
-        self.strengthening_injection_step = 1.0   # +100% factor (doubles ratio) per attempt
-        self.strengthening_weight_step = 2.0      # +2.0x weight per attempt -> x3.0, x5.0, x7.0
-        self.strengthening_lr_step = 2.0          # +2.0x LR per attempt -> x3.0, x5.0, x7.0
+        self.strengthening_max_attempts = 10  # INCREASED: 10 attempts to overcome strong attackers
+        self.strengthening_injection_step = 2.0   # INCREASED: +200% factor per attempt
+        self.strengthening_weight_step = 10.0     # INCREASED: +10x weight per attempt to compete with poison
+        self.strengthening_lr_step = 5.0          # INCREASED: +5x LR per attempt
         self.base_injection_ratio = 0.3           # Start at 30% (Aggressive start)
         self.base_weight_boost = 1.5              # Base weight boost
         self.base_lr_boost = 1.0                  # Base LR boost
@@ -332,7 +332,7 @@ class HoneyPotManager:
                   # This prevents P0 from flagging P9 as MALICIOUS before pivoting.
                    # RCA 22:11 (Fase 6): Increased to 10 to allow DFS to traverse Ring topology
                    # without flagging honest carriers as attackers prematurely.
-                   EXTENDED_INVESTIGATION_THRESHOLD = 10 # Increased from 7
+                   EXTENDED_INVESTIGATION_THRESHOLD = 6 # Phase 6.5: Reduced to 6 for faster transition
                    if state["suspicious_count"] < EXTENDED_INVESTIGATION_THRESHOLD:
                        logging.warning(
                            f"[Manager] 🕵️ Neighbor {neighbor_id} is highly suspicious ({state['suspicious_count']}) "

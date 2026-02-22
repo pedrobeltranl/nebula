@@ -950,10 +950,20 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             is_handover = getattr(self._engine, '_waiting_honeypot_handover', False)
 
             # Classify neighbors
-            if is_handover or self.threat_confirmed_locally:
-                clean_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) != "TESTING"]
+            grace_active = self.manager.is_grace_period_active()
+
+            if (is_handover or self.threat_confirmed_locally) and not grace_active:
+                # If we confirmed threat and grace is over, only send CLEAN to verified benign
+                # To prevent alerting attackers further.
+                clean_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) == "BENIGN"]
                 testing_neighbors = []
+            elif grace_active:
+                # During grace period: Send BAIT to everyone except those explicitly confirmed as MALICIOUS
+                # This ensures we 'test' everyone as much as possible before convicting.
+                clean_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) == "BENIGN"]
+                testing_neighbors = [n for n in neighbors if self.manager.get_neighbor_status(n) != "BENIGN"]
             else:
+                # Normal mode: BENIGN get clean, TESTING get bait
                 clean_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) == "BENIGN"]
                 testing_neighbors = [n for n in neighbors if self.manager.get_neighbor_status(n) == "TESTING"]
 
