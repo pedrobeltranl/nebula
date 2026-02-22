@@ -497,3 +497,22 @@ class RoleTransferEvent(NodeEvent):
 
     async def is_concurrent(self):
         return True
+
+
+class GlobalModelResetEvent(NodeEvent):
+    """
+    Event triggered when the entire federation must reset their models
+    to recover from a confirmed poisoning attack.
+    """
+    def __init__(self, source_honeypot, round):
+        self.source_honeypot = source_honeypot
+        self.round = round
+
+    def __str__(self):
+        return f"Global Model Reset triggered by {self.source_honeypot} at round {self.round}"
+
+    async def get_event_data(self):
+        return (self.source_honeypot, self.round)
+
+    async def is_concurrent(self):
+        return False

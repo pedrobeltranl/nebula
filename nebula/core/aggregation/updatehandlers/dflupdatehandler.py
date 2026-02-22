@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 from nebula.core.aggregation.updatehandlers.updatehandler import UpdateHandler
 from nebula.core.eventmanager import EventManager
-from nebula.core.nebulaevents import UpdateNeighborEvent, UpdateReceivedEvent
+from nebula.core.nebulaevents import UpdateNeighborEvent, UpdateReceivedEvent, GlobalModelResetEvent
 from nebula.core.utils.locker import Locker
 
 if TYPE_CHECKING:
@@ -87,6 +87,7 @@ class DFLUpdateHandler(UpdateHandler):
         """
         await EventManager.get_instance().subscribe_node_event(UpdateNeighborEvent, self.notify_federation_update)
         await EventManager.get_instance().subscribe_node_event(UpdateReceivedEvent, self.storage_update)
+        await EventManager.get_instance().subscribe_node_event(GlobalModelResetEvent, self.reset_storage)
 
     async def round_expected_updates(self, federation_nodes: set):
         """
@@ -141,6 +142,20 @@ class DFLUpdateHandler(UpdateHandler):
                     logging.exception(
                         f"ERROR: source expected: {se} | last_update None: {(True if not last_updt else False)}, last update storaged None: {(True if not node_storage[-1] else False)}"
                     )
+
+    async def reset_storage(self, event=None):
+        """
+        Hard reset of all stored updates.
+        This is critical to avoid "ghost poison" where models from a previous
+        malicious era are used after a global reset.
+        """
+        async with self._updates_storage_lock:
+            async with self._update_federation_lock:
+                logging.warning(f"[{self._addr}] 🧹 Hard Reset: Purging all stored model updates (Ghost Poison protection).")
+                self._updates_storage.clear()
+                self._sources_received.clear()
+                self._sources_expected.clear()
+                self._notification = False
 
     async def storage_update(self, updt_received_event: UpdateReceivedEvent):
         """

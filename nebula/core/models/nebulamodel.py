@@ -253,6 +253,16 @@ class NebulaModel(pl.LightningModule, ABC):
             "Test (Global)": round,
         }
 
+    def reset_optimizer_state(self):
+        """
+        Hard reset of the optimizer and its state.
+        This clears the momentum and other internal metadata.
+        """
+        if self._optimizer:
+            logging.info(f"[{self.communication_manager.addr if self.communication_manager else 'Model'}] 🧹 Resetting optimizer state to clear malicious momentum.")
+            # We re-run configure_optimizers to get a fresh start
+            self._optimizer = self.configure_optimizers()
+
     def training_step(self, batch, batch_idx):
         """
         Training step for the model.

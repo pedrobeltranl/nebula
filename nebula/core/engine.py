@@ -25,6 +25,7 @@ from nebula.core.nebulaevents import (
     UpdateReceivedEvent,
     ExperimentFinishEvent,
     ModelPropagationEvent,
+    GlobalModelResetEvent,
 )
 from nebula.core.network.communications import CommunicationsManager
 from nebula.core.role import Role, factory_node_role
@@ -739,15 +740,19 @@ class Engine:
                     m.reset_parameters()
 
             self.trainer.model.apply(weights_init)
+            self.trainer.model.set_updated_round(self.round)
 
-            # NEW: Clear optimizer state (momentum, Adam buffers)
-            # This prevents the trainer from being "pushed" by previous poisoning trends
-            if hasattr(self.trainer, 'model') and hasattr(self.trainer.model, '_optimizer') and self.trainer.model._optimizer:
-                logging.warning("🧹 Clearing optimizer state (momentum buffers)...")
+            # NEW: Clear optimizer state (momentum, Adam buffers) via the new thorough method
+            if hasattr(self.trainer.model, 'reset_optimizer_state'):
+                self.trainer.model.reset_optimizer_state()
+            elif hasattr(self.trainer.model, '_optimizer') and self.trainer.model._optimizer:
+                logging.warning("🧹 Falling back to manual optimizer state clear...")
                 self.trainer.model._optimizer.state.clear()
 
-            # Reset round counter in trainer/model if necessary
-            # (In DFL, starting from current round but with clean weights is usually enough)
+            # 🔥 NEW: Emit GlobalModelResetEvent so aggregation buffers (DFLUpdateHandler) are purged
+            logging.warning("🔔 Emitting GlobalModelResetEvent to purge aggregation buffers.")
+            await EventManager.get_instance().emit_node_event(GlobalModelResetEvent(source_honeypot="origin", round=self.round))
+
             logging.warning("✨ Model reset complete. Federation training starts fresh from this round.")
 
 
