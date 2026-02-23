@@ -839,7 +839,8 @@ class ScenarioManagement:
                     # El Honeypot actuará desde el principio (Ronda 1) según su propia lógica.
 
                     "seed": node_config.get("honeypot_seed", hp_conf.get("seed", 0.5)),
-                    "count": hp_conf.get("count", 1)
+                    "count": hp_conf.get("count", 1),
+                    "global_reset": hp_conf.get("global_reset", True)
                 }
 
             else:

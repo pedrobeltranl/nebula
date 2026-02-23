@@ -760,8 +760,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         # Detecta cuando el atacante pivota a otro nodo
         self._attacker_pivoting_enabled = False
         self._pivot_round = 10
-        if hasattr(config, "participant") and "device_args" in config.participant:
-             hp_config = config.participant["device_args"].get("honeypot", {})
+        if hasattr(config, "participant"):
+             hp_config = config.participant.get("honeypot_args", {})
+             if not hp_config:
+                 hp_config = config.participant.get("defense_args", {}).get("honeypot", {})
              if isinstance(hp_config, dict):
                  self._attacker_pivoting_enabled = hp_config.get("attacker_pivoting", False)
                  self._pivot_round = hp_config.get("pivot_round", 10)
