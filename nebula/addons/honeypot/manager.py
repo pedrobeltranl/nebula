@@ -335,19 +335,28 @@ class HoneyPotManager:
                    # RCA 23:40 (Fase 6.13): REINFORCED INQUIRY.
                    # We NEVER pivot to a node with 0% bait. We wait for differentiation.
                    # If we see 0% bait + poison, we trigger STRENGTHENING and wait 10 rounds.
-                   # RCA 10:22 (Fase 6.14): CLASH SAFETY. If the node has shown a CLASH,
-                   # it's a confirmed victim carrier. We allow pivoting and skip conviction.
-                   if state["clash_count"] > 0:
-                        logging.warning(f"[Manager] 🛡️ {neighbor_id} is suspicious but has CLASHES ({state['clash_count']}). Treating as VICTIM CARRIER.")
-                        return "TESTING"
+                    # RCA 10:22 (Fase 6.14): CLASH SAFETY. If the node has shown a CLASH,
+                    # it's a confirmed victim carrier. We allow pivoting and skip conviction.
+                    # RCA 11:45 (Fase 8): ANALYTICAL IDENTITY (No protocol cheating).
+                    # If we see CLASHES but NO bait after a short reinforcement (3 rounds),
+                    # we know it's the attacker origin, not a victim.
+                    CLASH_GRACE_ROUNDS = 3
+                    if state["clash_count"] > 0:
+                         if state["suspicious_count"] >= CLASH_GRACE_ROUNDS and state["max_compliant_seen"] < BENIGN_COMPLIANT_THRESHOLD:
+                             logging.error(f"[Manager] ‼️ ANALYTICAL IDENTITY CONFIRMED for {neighbor_id}. Persistent Clashes + 0% Bait. CONVICTING.")
+                             state["status"] = "MALICIOUS"
+                             return "MALICIOUS"
 
-                   REINFORCEMENT_WAIT_ROUNDS = 10
-                   if state["suspicious_count"] < REINFORCEMENT_WAIT_ROUNDS:
-                       logging.warning(
-                           f"[Manager] 🕵️ Neighbor {neighbor_id} is highly suspicious ({state['suspicious_count']}) "
-                           f"with NO bait seen. REINFORCED INQUIRY: Holding pos and strengthening bait."
-                       )
-                       return "TESTING"
+                         logging.warning(f"[Manager] 🛡️ {neighbor_id} is suspicious but has CLASHES ({state['clash_count']}). Treating as VICTIM CARRIER (Grace: {state['suspicious_count']}/{CLASH_GRACE_ROUNDS}).")
+                         return "TESTING"
+
+                    REINFORCEMENT_WAIT_ROUNDS = 10
+                    if state["suspicious_count"] < REINFORCEMENT_WAIT_ROUNDS:
+                         logging.warning(
+                             f"[Manager] 🕵️ Neighbor {neighbor_id} is highly suspicious ({state['suspicious_count']}) "
+                             f"with NO bait seen. REINFORCED INQUIRY: Holding pos and strengthening bait."
+                         )
+                         return "TESTING"
 
         # Count how many recent rounds exceeded the threshold (uses global BENIGN_COMPLIANT_THRESHOLD defined above)
         recent_history = state["compliant_history"][-BENIGN_WINDOW:]
