@@ -23,7 +23,13 @@ class HoneyPotManager:
             real_seed = config
 
         if DefenseStrategyGenerator:
-            self.strategy = DefenseStrategyGenerator(real_seed)
+            # Detect number of classes from datamodule if possible, else default to 10
+            num_classes = 10
+            if engine and hasattr(engine, 'trainer') and hasattr(engine.trainer, 'datamodule'):
+                num_classes = getattr(engine.trainer.datamodule, 'num_classes', 10)
+                logging.info(f"🔍 [HoneyManager] Detected num_classes: {num_classes}")
+
+            self.strategy = DefenseStrategyGenerator(real_seed, num_classes=num_classes)
             self.detector = HoneyDetector()
         else:
             self.strategy = None
