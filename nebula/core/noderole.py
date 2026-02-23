@@ -1454,6 +1454,20 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             logging.warning(f"[Honeypot] 📤 Flooding KILL ORDER (blocking {attacker_id}) to {neighbor}")
             asyncio.create_task(self._engine.cm.send_message(neighbor, msg))
 
+        # --- RECOVERY BRIDGE STRATEGY ---
+        # Si tenemos víctimas identificadas, creamos conexiones directas para compartir modelos limpios
+        # y evitar que el aislamiento topológico hunda la precisión de esos nodos tras el reset.
+        if targets:
+            logging.info(f"[Honeypot] 🌉 Establishing RECOVERY BRIDGES with {len(targets)} victims...")
+            for victim in targets:
+                if victim == self._engine.addr: continue
+                if victim == attacker_id: continue
+                if victim not in neighbors:
+                    logging.info(f"[Honeypot] 🚀 Creating direct link to victim {victim} (Recovery Bridge)")
+                    # Creamos la conexión de forma asíncrona para no bloquear el protocolo
+                    asyncio.create_task(self._engine.cm.connect(victim, direct=True, priority="high"))
+        # -------------------------------
+
         # 4. Trigger GLOBAL MODEL RESET to recover from poisoning
         if getattr(self, "_global_reset_enabled", True):
             logging.warning("[Honeypot] 🔄 Initiating GLOBAL MODEL RESET to recover federation accuracy.")
