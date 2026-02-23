@@ -525,6 +525,7 @@ class Engine:
                        logging.info(f"[Malicious] Received REJECT ACK from {source}.")
                   else:
                        self.rb._pivot_success = True
+                       self.rb._last_pivot_target = source
                        logging.info(f"[Malicious] Received SUCCESS ACK from {source}.")
 
                   self.rb._pivot_ack_event.set()
@@ -1408,9 +1409,17 @@ class Engine:
                         active_neighbors = []
                         for c in connections:
                             if not c.active: continue
+
+                            # CRITICAL FIX: The permanent_blacklist might contain the peer_id or the network address (IP:PORT)
+                            # Reputation system usually stores IP:PORT, while engine sees both.
                             c_id = getattr(c, 'peer_id', getattr(c, 'node_id', None))
-                            if c_id not in permanent_blacklist:
-                                active_neighbors.append(c)
+                            c_addr = getattr(c, 'addr', None)
+
+                            if (c_id is not None and c_id in permanent_blacklist) or \
+                               (c_addr is not None and c_addr in permanent_blacklist):
+                                continue # Skip blocked nodes
+
+                            active_neighbors.append(c)
                     else:
                         active_neighbors = []
 

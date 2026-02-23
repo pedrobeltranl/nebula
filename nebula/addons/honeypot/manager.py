@@ -346,7 +346,8 @@ class HoneyPotManager:
                     # RCA 11:45 (Fase 8): ANALYTICAL IDENTITY (No protocol cheating).
                     # If we see CLASHES but NO bait after a short reinforcement (3 rounds),
                     # we know it's the attacker origin, not a victim.
-                    CLASH_GRACE_ROUNDS = 3
+                    # FIX: Increased to 10 rounds to allow for adaptive strengthening to take effect.
+                    CLASH_GRACE_ROUNDS = 10
                     if state["clash_count"] > 0:
                          if state["suspicious_count"] >= CLASH_GRACE_ROUNDS and state["max_compliant_seen"] < BENIGN_COMPLIANT_THRESHOLD:
                              logging.error(f"[Manager] ‼️ ANALYTICAL IDENTITY CONFIRMED for {neighbor_id}. Persistent Clashes + 0% Bait. CONVICTING.")

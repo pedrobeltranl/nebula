@@ -1072,6 +1072,12 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         if transfer_source:
             logging.info(f"[Honeypot] 🛡️ Excluding transfer source {transfer_source} from threat analysis (has our bait)")
 
+        # Exclude the node we just transferred the honeypot role to
+        # (it is the new Honeypot, we should not convict it based on clashes)
+        last_pivot_target = getattr(self, '_last_pivot_target', None)
+        if last_pivot_target:
+            logging.info(f"[Honeypot] 🛡️ Excluding new Honeypot {last_pivot_target} from threat analysis (handover in progress)")
+
         try:
             self._engine.trainer.datamodule.setup("fit")
             val_loader = self._engine.trainer.datamodule.val_dataloader()
@@ -1089,6 +1095,11 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 # Skip the node that transferred the honeypot role to us
                 if transfer_source and node_id == transfer_source:
                     logging.debug(f"[Honeypot] Skipping analysis of transfer source {node_id}")
+                    continue
+
+                # Skip the node we just transferred the honeypot role to
+                if last_pivot_target and node_id == last_pivot_target:
+                    logging.debug(f"[Honeypot] Skipping analysis of incoming Honeypot {node_id}")
                     continue
 
                 # --- FIX CRÍTICO: Chequeos de seguridad ---
