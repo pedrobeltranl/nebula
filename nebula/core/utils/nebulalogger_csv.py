@@ -93,7 +93,7 @@ class NebulaCSVLogger(CSVLogger):
                     phase = "test_global"
                     break
 
-            filename = f"metrics_{phase}.csv"
+            filename = f"metrics_{phase}_round_{self.current_round}.csv"
             self._append_to_csv(filename, model_metrics, step, timestamp)
 
     def _append_to_csv(self, filename, metrics_dict, step, timestamp):
