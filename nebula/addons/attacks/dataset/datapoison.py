@@ -304,36 +304,40 @@ class TargetedSamplePoisoningStrategy(DataPoisoningStrategy):
     ) -> "Dataset":
         """
         Applies X-pattern poisoning to targeted samples.
-
-        Args:
-            dataset: The dataset to modify
-            indices: List of indices to consider for poisoning
-            poisoned_percent: Not used in targeted poisoning
-            poisoned_noise_percent: Not used in targeted poisoning
-
-        Returns:
-            Modified dataset with poisoned data
+        It takes a percentage (poisoned_percent) of ALL samples, adds the X pattern,
+        and forces their label to target_label.
         """
-        logging.info(f"[{self.__class__.__name__}] Poisoning data with X pattern for target label: {self.target_label}")
+        logging.info(f"[{self.__class__.__name__}] Poisoning {poisoned_percent}% of data with X pattern for target label: {self.target_label}")
         new_dataset = copy.deepcopy(dataset)
         if not isinstance(new_dataset.targets, np.ndarray):
             new_dataset.targets = np.array(new_dataset.targets)
         else:
             new_dataset.targets = new_dataset.targets.copy()
 
-        for i in indices:
-            if int(new_dataset.targets[i]) == int(self.target_label):
-                t = new_dataset.data[i]
-                logging.info(f"[{self.__class__.__name__}] Adding X pattern to image")
-                poisoned = self.add_x_to_image(t)
+        num_indices = len(indices)
+        num_poisoned = int(poisoned_percent * num_indices / 100.0)
 
-                if isinstance(poisoned, torch.Tensor):
-                    poisoned = poisoned.detach().cpu().numpy()
+        if num_indices == 0 or num_poisoned == 0:
+            return new_dataset
 
-                if isinstance(t, tuple):
-                    poisoned = (poisoned, t[1])
+        # Select random indices to poison from the provided pool
+        poisoned_indices = random.sample(indices, num_poisoned)
+        logging.info(f"[{self.__class__.__name__}] Number of samples poisoned (pattern + label flip): {num_poisoned}")
 
-                new_dataset.data[i] = poisoned
+        for i in poisoned_indices:
+            t = new_dataset.data[i]
+            # Add the trigger pattern
+            poisoned = self.add_x_to_image(t)
+
+            if isinstance(poisoned, torch.Tensor):
+                poisoned = poisoned.detach().cpu().numpy()
+
+            if isinstance(t, tuple):
+                poisoned = (poisoned, t[1])
+
+            # Force the label to the malicious target
+            new_dataset.data[i] = poisoned
+            new_dataset.targets[i] = self.target_label
 
         return new_dataset
 

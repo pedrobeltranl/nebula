@@ -122,21 +122,26 @@ class HoneyDetector:
 
         # Decision Logic
         # A node that learns the honeypot backdoor but STILL poisons is a "Smart Attacker".
-        # NEW: If bait is present, we are EXTREMELY conservative about suspicion.
-        # This prevents false positives on honest aggregators who merge poison.
-        smart_attacker = has_honeypot_backdoor and extreme_suspicion and target_concentration > 0.55
+        # If bait is present, we were conservative, but now we lower thresholds for better detection.
+        # Lowered concentration from 0.55 to 0.35 to catch dispersed poisoners.
+        smart_attacker = has_honeypot_backdoor and (suspicious_rate > 0.60) and target_concentration > 0.35
+
+        # Pattern 4: Absolute Suspicion Threshold
+        # If a node has more than 70% suspicion, it's almost certainly malicious,
+        # even if it has a small amount of bait (which could be the attacker's own mimicry).
+        very_high_suspicion = (suspicious_rate > 0.70)
 
         if has_honeypot_backdoor:
-            # We ONLY flag if it's a blatant smart attacker
-            is_suspicious = smart_attacker
-            if smart_attacker:
+            # Flag if it's a smart attacker OR if suspicion is overwhelmingly high
+            is_suspicious = smart_attacker or very_high_suspicion
+            if is_suspicious:
                 logging.warning(
-                    f"[HoneyDetector] 🚨 Smart Attacker Detected! Learned bait ({compliant_rate:.2%}) "
-                    f"but still has high suspicion ({suspicious_rate:.2%})."
+                    f"[HoneyDetector] 🚨 Potential Attacker with Bait! Compliant={compliant_rate:.2%}, "
+                    f"Suspicion={suspicious_rate:.2%}. Flagging for investigation."
                 )
         else:
             # Standard detection for nodes without evidence of our bait
-            is_suspicious = (direct_attack or resistance_attack)
+            is_suspicious = (direct_attack or resistance_attack or very_high_suspicion)
 
         # Return the MAX severity for decision making
         severity = max(suspicious_rate, honest_rate if resistance_attack else 0.0)
