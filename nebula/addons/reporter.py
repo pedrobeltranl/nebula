@@ -236,7 +236,7 @@ class Reporter:
 
         while not self.data_queue.empty():
             name, value = await self.data_queue.get()
-            await self.trainer.logger.log_data({name: value})  # Assuming log_data can be made async
+            await self.trainer.log_data({name: value})  # Using Lightning proxy method
             self.data_queue.task_done()
 
     async def __report_status_to_controller(self):
@@ -372,7 +372,7 @@ class Reporter:
             "X-Network/Network (packets received)": self.acc_packets_recv,
             "X-Network/Connections": len(current_connections),
         }
-        self.trainer.logger.log_data(resources)
+        self.trainer.log_data(resources)
 
         if importlib.util.find_spec("pynvml") is not None:
             try:
@@ -405,6 +405,6 @@ class Reporter:
                         f"W-GPU/GPU{i} memory clocks": gpu_memory_clocks,
                         f"W-GPU/GPU{i} fan speed": gpu_fan_speed,
                     }
-                    self.trainer.logger.log_data(gpu_info)
+                    self.trainer.log_data(gpu_info)
             except Exception:  # noqa: S110
                 pass

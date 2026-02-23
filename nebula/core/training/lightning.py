@@ -432,6 +432,31 @@ class Lightning:
             logger.log_data({"A-Round": self.round})
         # self.reporter.enqueue_data("Round", self.round)
 
+    def log_data(self, data, step=None):
+        """Proxy method to log data to all active loggers."""
+        for logger in self._loggers():
+            try:
+                logger.log_data(data, step=step)
+            except Exception as e:
+                logging.error(f"Error calling log_data on {logger.__class__.__name__}: {e}")
+
+    def log_metrics(self, metrics, step=None):
+        """Proxy method to log metrics to all active loggers."""
+        for logger in self._loggers():
+            try:
+                logger.log_metrics(metrics, step=step)
+            except Exception as e:
+                logging.error(f"Error calling log_metrics on {logger.__class__.__name__}: {e}")
+
+    def log_figure(self, figure, step=None, name=None):
+        """Proxy method to log figures to all active loggers."""
+        for logger in self._loggers():
+            try:
+                if hasattr(logger, "log_figure"):
+                    logger.log_figure(figure, step=step, name=name)
+            except Exception as e:
+                logging.error(f"Error calling log_figure on {logger.__class__.__name__}: {e}")
+
     def update_model_learning_rate(self, new_lr):
         self.model.modify_learning_rate(new_lr)
 

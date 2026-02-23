@@ -905,23 +905,23 @@ class Reputation:
         if current_round is None or current_round >= total_rounds:
             return
 
-        self.engine.trainer._logger.log_data(
+        self.engine.trainer.log_data(
             {f"R-Model_arrival_latency_reputation/{addr}": {nei: model_arrival_latency}},
             step=current_round
         )
-        self.engine.trainer._logger.log_data(
+        self.engine.trainer.log_data(
             {f"R-Count_messages_number_message_reputation/{addr}": {nei: number_message_count}},
             step=current_round
         )
-        self.engine.trainer._logger.log_data(
+        self.engine.trainer.log_data(
             {f"R-number_message_reputation/{addr}": {nei: number_message_norm}},
             step=current_round
         )
-        self.engine.trainer._logger.log_data(
+        self.engine.trainer.log_data(
             {f"R-Similarity_reputation/{addr}": {nei: similarity}},
             step=current_round
         )
-        self.engine.trainer._logger.log_data(
+        self.engine.trainer.log_data(
             {f"R-Fraction_reputation/{addr}": {nei: fraction}},
             step=current_round
         )
@@ -1575,7 +1575,7 @@ class Reputation:
 
             if valid_reputations:
                 reputation_data = {f"Reputation/{addr}": valid_reputations}
-                self._engine.trainer._logger.log_data(reputation_data, step=round_num)
+                self.engine.trainer.log_data(reputation_data, step=round_num)
 
         except Exception:
             logging.exception("Error creating reputation graphic")
