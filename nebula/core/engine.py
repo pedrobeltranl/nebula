@@ -734,6 +734,11 @@ class Engine:
         Reinicia los pesos del modelo a su estado original y resetea contadores.
         Esto se usa para recuperarse de ataques de envenenamiento.
         """
+        # Stop training IMMEDIATELY to prevent further corruption
+        if self.trainer and hasattr(self.trainer, '_trainer') and getattr(self.trainer, '_trainer', None):
+            logging.warning("🛑 Stopping current PyTorch Lightning training loop to allow clean reset.")
+            self.trainer._trainer.should_stop = True
+
         async with self.trainning_in_progress_lock:
             logging.warning("🧹 Re-initializing model weights to recover from poisoning...")
 

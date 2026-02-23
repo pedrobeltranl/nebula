@@ -505,7 +505,15 @@ class TrainerRoleBehavior(RoleBehavior):
         logging.info("Waiting global update | Assign _waiting_global_update = True")
 
         await self._engine.trainer.test()
-        await self._engine.trainer.train()
+
+        await self._engine.trainning_in_progress_lock.acquire_async()
+        try:
+            await self._engine.trainer.train()
+        finally:
+            try:
+                await self._engine.trainning_in_progress_lock.release_async()
+            except Exception:
+                pass
 
         mpe = ModelPropagationEvent(await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False), "stable")
         await EventManager.get_instance().publish_node_event(mpe)

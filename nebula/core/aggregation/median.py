@@ -1,78 +1,69 @@
-import numpy as np
+import gc
+import logging
 import torch
 
 from nebula.core.aggregation.aggregator import Aggregator
 
-
 class Median(Aggregator):
     """
-    Aggregator: Median
-    Authors: Dong Yin et al et al.
-    Year: 2021
-    Note: https://arxiv.org/pdf/1803.01498.pdf
+    Aggregator: Coordinate-wise Median
+    Calculates the median of each parameter across all provided models.
+    This is highly robust against data poisoning attacks and extreme outliers.
     """
 
     def __init__(self, config=None, **kwargs):
         super().__init__(config, **kwargs)
 
-    def get_median(self, weights):
-        # check if the weight tensor has enough space
-        weight_len = len(weights)
-
-        median = 0
-        if weight_len % 2 == 1:
-            # odd number, return the median
-            median, _ = torch.median(weights, 0)
-        else:
-            # even number, return the mean of median two numbers
-            # sort the tensor
-            arr_weights = np.asarray(weights)
-            nobs = arr_weights.shape[0]
-            start = int(nobs / 2) - 1
-            end = int(nobs / 2) + 1
-            atmp = np.partition(arr_weights, (start, end - 1), 0)
-            sl = [slice(None)] * atmp.ndim
-            sl[0] = slice(start, end)
-            arr_median = np.mean(atmp[tuple(sl)], axis=0)
-            median = torch.tensor(arr_median)
-        return median
-
     def run_aggregation(self, models):
+        if not models:
+            return None
         super().run_aggregation(models)
 
-        models = list(models.values())
-        models_params = [m for m, _ in models]
+        models_list = []
+        for node_id, (params, weight) in models.items():
+            models_list.append((params, weight))
 
-        total_models = len(models)
+        models = models_list
+        num_models = len(models)
 
-        accum = {layer: torch.zeros_like(param).float() for layer, param in models[-1][0].items()}
+        # Log aggregation details
+        weights_list = [weight for _, weight in models]
+        total_samples = float(sum(weights_list))
 
-        # Calculate the trimmedmean for each parameter
-        for layer in accum:
-            weight_layer = accum[layer]
-            # get the shape of layer tensor
-            l_shape = list(weight_layer.shape)
+        if total_samples > 0:
+            weight_distribution = {f"Model_{i}": f"{weight}/{total_samples} ({weight/total_samples*100:.1f}%)"
+                                  for i, (_, weight) in enumerate(models)}
+        else:
+            weight_distribution = {f"Model_{i}": f"{weight}/{total_samples} (0.0%)"
+                                  for i, (_, weight) in enumerate(models)}
 
-            # get the number of elements of layer tensor
-            number_layer_weights = torch.numel(weight_layer)
-            # if its 0-d tensor
-            if l_shape == []:
-                weights = torch.tensor([models_params[j][layer] for j in range(0, total_models)])
-                weights = weights.double()
-                w = self.get_median(weights)
-                accum[layer] = w
+        logging.info(f"[Median] 📊 Aggregating {num_models} models with median. Weights (ignored for median calculation): {weight_distribution}")
 
-            else:
-                # flatten the tensor
-                weight_layer_flatten = weight_layer.view(number_layer_weights)
+        if num_models == 0:
+            logging.warning("Median: No models provided. Returning None.")
+            return None
 
-                # flatten the tensor of each model
-                models_layer_weight_flatten = torch.stack(
-                    [models_params[j][layer].view(number_layer_weights) for j in range(0, total_models)],
-                    0,
-                )
+        if num_models == 1:
+            logging.warning("Median: Only 1 model provided. Returning its parameters.")
+            return models[0][0]
 
-                # get the weight list [w1j,w2j,··· ,wmj], where wij is the jth parameter of the ith local model
-                median = self.get_median(models_layer_weight_flatten)
-                accum[layer] = median.view(l_shape)
+        # Use the first model's shape as a template
+        template_params = models[0][0]
+        accum = {layer: torch.zeros_like(param, dtype=torch.float32) for layer, param in template_params.items()}
+
+        with torch.no_grad():
+            for layer in accum:
+                # Stack all models' tensors for this specific layer
+                # model_parameters is the first item in the tuple (params, weight)
+                stacked_layer = torch.stack([m[0][layer].to(accum[layer].dtype) for m in models])
+
+                # Compute median across the 0th dimension (models dimension)
+                median_values, _ = torch.median(stacked_layer, dim=0)
+
+                # Store it in accum
+                accum[layer].copy_(median_values)
+
+        del models
+        gc.collect()
+
         return accum
