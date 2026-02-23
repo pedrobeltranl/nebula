@@ -951,6 +951,13 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             # Classify neighbors
             grace_active = self.manager.is_grace_period_active()
 
+            # 🔥 NEW: PROTECTOR MODE (Mission Complete)
+            # If threat is confirmed and isolated, stop sending bait to prevent friendly fire.
+            # We treat everyone as BENIGN or TESTING (but send Clean model regardless).
+            protector_mode = self.threat_confirmed_locally and not grace_active
+            if protector_mode:
+                logging.info("[Honeypot] 🛡️ Protector Mode ACTIVE (Threat isolated). Sending CLEAN model to ALL neighbors.")
+
             # NEW: Persistent trust based on high reputation
             # Any node with reputation > 1.5 is considered BENIGN and should NEVER receive bait.
             # This protects the ring from "Friendly Fire" after global resets.
@@ -961,7 +968,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 score = reputation_module.get_score(node)
                 return score > 1.5
 
-            if (is_handover or self.threat_confirmed_locally) and not grace_active:
+            if protector_mode:
+                clean_recipients = neighbors
+                testing_neighbors = []
+            elif (is_handover or self.threat_confirmed_locally) and not grace_active:
                 # If we confirmed threat and grace is over, only send CLEAN to verified benign
                 # To prevent alerting attackers further.
                 clean_recipients = [n for n in neighbors if self.manager.get_neighbor_status(n) == "BENIGN" or is_extra_trusted(n)]

@@ -83,7 +83,14 @@ class NebulaModel(pl.LightningModule, ABC):
             f"{phase}/{key.replace('Multiclass', '').split('/')[-1]}": value.detach() for key, value in output.items()
         }
 
-        self.logger.log_data(output, step=self.global_number[phase])
+        # Handle multiple loggers natively by iterating over self.loggers if available
+        loggers = self.loggers if isinstance(getattr(self, "loggers", None), list) else [self.logger]
+        for logger in loggers:
+            if hasattr(logger, "log_data"):
+                try:
+                    logger.log_data(output, step=self.global_number[phase])
+                except Exception as e:
+                    logging.error(f"Error logging data to {logger.__class__.__name__}: {e}")
 
         metrics_str = ""
         for key, value in output.items():
@@ -135,7 +142,15 @@ class NebulaModel(pl.LightningModule, ABC):
             plt.xticks(rotation=90, fontsize=6)
             plt.yticks(rotation=0, fontsize=6)
             plt.tight_layout()
-            self.logger.log_figure(fig, step=self.round, name=f"{phase}/CM")
+
+            loggers = self.loggers if isinstance(getattr(self, "loggers", None), list) else [self.logger]
+            for logger in loggers:
+                if hasattr(logger, "log_figure"):
+                    try:
+                        logger.log_figure(fig, step=self.round, name=f"{phase}/CM")
+                    except Exception as e:
+                        logging.error(f"Error logging figure to {logger.__class__.__name__}: {e}")
+
             plt.close()
 
             del cm_numpy, classes, fig, ax

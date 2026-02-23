@@ -155,6 +155,7 @@ class Engine:
         # Deduplication dictionary for block_neighbor_flood messages (to prevent re-forwarding duplicates)
         self._processed_block_neighbor_floods = {}
         self._processed_model_reset_floods = {}
+        self._warmup_rounds = 0 # Rounds remaining for learning rate boost
 
         self.config.reload_config_file()
 
@@ -758,6 +759,10 @@ class Engine:
             self.trainer.model.apply(weights_init)
             self.trainer.model.set_updated_round(self.round)
 
+            # NEW: Set warmup phase to accelerate recovery
+            self._warmup_rounds = 5
+            logging.warning(f"🚀 Warmup Phase ACTIVATED: Boosting learning rate for the next {self._warmup_rounds} rounds.")
+
             # NEW: Clear optimizer state (momentum, Adam buffers) via the new thorough method
             if hasattr(self.trainer.model, 'reset_optimizer_state'):
                 self.trainer.model.reset_optimizer_state()
@@ -1298,6 +1303,18 @@ class Engine:
                 logging.info(f"Direct connections: {direct_connections} | Undirected connections: {undirected_connections}")
                 logging.info(f"[Role {self.rb.get_role_name()}] Starting learning cycle...")
 
+                # NEW: Apply Warmup LR Boost if active
+                if self._warmup_rounds > 0:
+                    base_lr = self.config.participant.get("training_args", {}).get("learning_rate", 0.01)
+                    warmup_lr = base_lr * 3.0
+                    logging.warning(f"🚀 Warmup Round ({self._warmup_rounds} left). Boosting LR: {base_lr} -> {warmup_lr}")
+                    self.trainer.update_model_learning_rate(warmup_lr)
+                elif self._warmup_rounds == 0:
+                     # Ensure we revert to normal LR after warmup
+                     normal_lr = self.config.participant.get("training_args", {}).get("learning_rate", 0.01)
+                     self.trainer.update_model_learning_rate(normal_lr)
+                     self._warmup_rounds = -1 # Mark as finished
+
                 # --- FIX: Retry logic to prevent TimeoutError crash ---
                 max_retries = 5
                 for attempt in range(max_retries):
@@ -1352,6 +1369,12 @@ class Engine:
                 )
 
                 self.trainer.on_round_end()
+
+                # NEW: Decrement warmup rounds
+                if self._warmup_rounds > 0:
+                    self._warmup_rounds -= 1
+                    if self._warmup_rounds == 0:
+                        logging.warning("✨ Warmup Phase COMPLETE. Reverting to normal learning rate next round.")
 
                 # --- 🛑 BARRERA DE SINCRONIZACIÓN ROBUSTA 🛑 ---
                 logging.info(f"🚧 Waiting for neighbors to finish round {self.round}...")
@@ -1635,6 +1658,7 @@ class Engine:
 
                 # FIX: Use network_block=True to completely silence the attacker.
                 # Previously False to avoid deadlocks, but Soft-Block allowed persistent poisoning.
+                # Now mandatory as requested by USER.
                 can_block_network = True
 
                 if hasattr(self, "_reputation") and hasattr(self._reputation, "force_block"):
