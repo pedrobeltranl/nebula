@@ -282,19 +282,11 @@ class HoneyPotManager:
                 if clash_detected:
                     # RCA 23:10:38 - IMPROVEMENT: If we detect a DIRECT CONTRADICTION CLASH,
                     # it means the node is intentionally ignoring our bait to favor its own target.
-                    #
-                    # CRITICAL FIX: Only treat as "Smart Attacker" (immediate MALICIOUS)
-                    # if the node HAS GENUINE BAIT. If it doesn't have bait yet, a clash
-                    # is likely just a poisoned victim (Carrier). We let it stay in TESTING
-                    # so we can pivot through it later.
-                    # RCA 12:12:27 - FIX: Even if they have bait, a clash might be an Aggregator
-                    # merging both poison and bait. We treat them as CARRIERS (TESTING)
-                    # to allow investigation. We ONLY confirm MALICIOUS once we verify
-                    # they are the source of the attack (path end).
+                    state["clash_count"] += 1
                     logging.warning(
                         f"[Manager] ⚠️ CONTRADICTION CLASH on {neighbor_id} (targets {dominant_target}). "
                         f"Bait presence: {max(compliant_rate, state['max_compliant_seen']):.2%}. "
-                        f"Verdict: CARRIER SUSPECT (Investigation required)."
+                        f"Verdict: CARRIER SUSPECT (Clash count: {state['clash_count']})."
                     )
                     # We let it fall through to accumulate suspicion_count
 
@@ -343,7 +335,12 @@ class HoneyPotManager:
                    # RCA 23:40 (Fase 6.13): REINFORCED INQUIRY.
                    # We NEVER pivot to a node with 0% bait. We wait for differentiation.
                    # If we see 0% bait + poison, we trigger STRENGTHENING and wait 10 rounds.
-                   # This prevents false positives on victims while protecting the HP role.
+                   # RCA 10:22 (Fase 6.14): CLASH SAFETY. If the node has shown a CLASH,
+                   # it's a confirmed victim carrier. We allow pivoting and skip conviction.
+                   if state["clash_count"] > 0:
+                        logging.warning(f"[Manager] 🛡️ {neighbor_id} is suspicious but has CLASHES ({state['clash_count']}). Treating as VICTIM CARRIER.")
+                        return "TESTING"
+
                    REINFORCEMENT_WAIT_ROUNDS = 10
                    if state["suspicious_count"] < REINFORCEMENT_WAIT_ROUNDS:
                        logging.warning(
@@ -351,14 +348,6 @@ class HoneyPotManager:
                            f"with NO bait seen. REINFORCED INQUIRY: Holding pos and strengthening bait."
                        )
                        return "TESTING"
-
-                   logging.critical(
-                       f"[Manager] 🚨 Neighbor {neighbor_id} CONTRADICTION: Persistent suspicion ({state['suspicious_count']}) "
-                       f"despite reinforcement. Verdict: MALICIOUS"
-                   )
-                   state["status"] = "MALICIOUS"
-                   state["verified_round"] = current_round
-                   return "MALICIOUS"
 
         # Count how many recent rounds exceeded the threshold (uses global BENIGN_COMPLIANT_THRESHOLD defined above)
         recent_history = state["compliant_history"][-BENIGN_WINDOW:]
@@ -887,6 +876,7 @@ class HoneyPotManager:
             "compliant_history": [],
             "first_backdoor_round": None,
             "carrier_suspect": False,  # True when suspicious but upstream attacker suspected
+            "clash_count": 0,           # Counter for Honeymap contradictions (Honey target predictions)
         }
         for key, val in defaults.items():
             if key not in state:
@@ -1035,14 +1025,15 @@ class HoneyPotManager:
                 # ─────────────────────────────────────────────
                 node_state = self.neighbor_tracking.get(node_id, {})
                 rounds_with_suspicion = node_state.get("suspicious_count", 0)
-                rounds_tested = node_state.get("rounds_tested", 0)
+                clash_count = node_state.get("clash_count", 0)
 
                 # RCA 23:40 (Fase 6.13): SAFETY FIRST - ZERO BAIT NO PIVOT.
-                # If a node has 0% bait, we NEVER pivot (it could be the attacker).
-                # We put it in suspicious_neighbors which forces a HOLD in DFS.
-                # We only pivot if state["max_compliant_seen"] > 0 (Confirmed Carrier).
-                if rounds_with_suspicion >= 1:
-                    logging.warning(f"[DFS] 🛡️ {node_id} has 0% bait. HOLDING position to differentiate via reinforcement.")
+                # RCA 10:22 (Fase 6.14): BRAVE PIVOT - If we have a CLASH, we pivot immediately.
+                if clash_count > 0:
+                    logging.info(f"[DFS] 🧩 {node_id} has 0% bait but {clash_count} CLASHES. Confirmed victim carrier. Pivoting!")
+                    investigation_neighbors.append((node_id, 2.0))
+                elif rounds_with_suspicion >= 1:
+                    logging.warning(f"[DFS] 🛡️ {node_id} has 0% bait/clashes. HOLDING position to differentiate via reinforcement.")
                     suspicious_neighbors.append((node_id, 2.0))
                 else:
                     # Not enough evidence yet → pure monitoring
