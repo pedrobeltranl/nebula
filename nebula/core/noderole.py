@@ -1159,17 +1159,15 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 except Exception as e:
                     logging.warning(f"[Honeypot] Check failed for {node_id}: {e}")
 
-            # --- FIX: Reset Local Threat State if all suspects are cleared ---
-            # If we don't have any confirmed attackers (detected_attackers) and the manager
-            # doesn't see suspicious nodes, we can clear the local flag to resume pivoting.
+            # --- FIX: Early Departure Bug (Phase 23) ---
+            # If we confirmed a threat (threat_confirmed_locally == True),
+            # we MUST NOT reset it just because detected_attackers is empty this round.
+            # (An isolated attacker cannot send models, so it won't appear in detected_attackers).
+            # The threat flag is ONLY cleared by the 3-consecutive-clean-rounds mechanism below.
             if not detected_attackers and not threat_detected_this_round:
                 if self.threat_confirmed_locally:
-                    logging.info("[Honeypot] 🔄 All suspect neighbors cleared as BENIGN. Resetting local threat flag.")
-                    self.threat_confirmed_locally = False
-                    self._current_target_attacker = None
-
-
-
+                    logging.info("[Honeypot] 🛡️ No new threats detected this round, but holding Protector Mode for previously confirmed threat.")
+                    # REMOVED: self.threat_confirmed_locally = False -> This caused the Honeypot to pivot away.
         if detected_attackers:
             self.consecutive_clean_rounds = 0  # Reset counter if threat detected
             for attacker_id in detected_attackers:
