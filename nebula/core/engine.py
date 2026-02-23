@@ -737,8 +737,20 @@ class Engine:
             logging.warning("🧹 Re-initializing model weights to recover from poisoning...")
 
             # Reset PyTorch model weights
-            # Most standard modules have a reset_parameters method
+            # RCA 01:15 - SYNCED RESET: Ensure all nodes restart from the same point.
+            # Without a common seed, each node starts with different random weights,
+            # making aggregation purely noisy and sabotaging recovery (16% F1 bug).
             import torch
+            import numpy as np
+            import random
+
+            SYNC_SEED = 42
+            torch.manual_seed(SYNC_SEED)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(SYNC_SEED)
+            np.random.seed(SYNC_SEED)
+            random.seed(SYNC_SEED)
+
             def weights_init(m):
                 if hasattr(m, 'reset_parameters'):
                     m.reset_parameters()
