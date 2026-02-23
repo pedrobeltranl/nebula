@@ -765,6 +765,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
              if isinstance(hp_config, dict):
                  self._attacker_pivoting_enabled = hp_config.get("attacker_pivoting", False)
                  self._pivot_round = hp_config.get("pivot_round", 10)
+                 self._global_reset_enabled = hp_config.get("global_reset", True)
 
         # Track the reputation of the known threat before and after to detect pivoting
         self._known_threat_node = None
@@ -1454,23 +1455,26 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             asyncio.create_task(self._engine.cm.send_message(neighbor, msg))
 
         # 4. Trigger GLOBAL MODEL RESET to recover from poisoning
-        logging.warning("[Honeypot] 🔄 Initiating GLOBAL MODEL RESET to recover federation accuracy.")
-        reset_data = {
-            "type": "model_reset_flood",
-            "round": block_data["round"],
-            "source_honeypot": self._engine.addr
-        }
-        reset_payload = json.dumps(reset_data)
-        reset_msg = self._engine.cm.create_message(
-            "control",
-            "model_reset_flood",
-            log=reset_payload
-        )
+        if getattr(self, "_global_reset_enabled", True):
+            logging.warning("[Honeypot] 🔄 Initiating GLOBAL MODEL RESET to recover federation accuracy.")
+            reset_data = {
+                "type": "model_reset_flood",
+                "round": block_data["round"],
+                "source_honeypot": self._engine.addr
+            }
+            reset_payload = json.dumps(reset_data)
+            reset_msg = self._engine.cm.create_message(
+                "control",
+                "model_reset_flood",
+                log=reset_payload
+            )
 
-        for neighbor in neighbors:
-            if neighbor == self._engine.addr: continue
-            if neighbor == attacker_id: continue
-            asyncio.create_task(self._engine.cm.send_message(neighbor, reset_msg))
+            for neighbor in neighbors:
+                if neighbor == self._engine.addr: continue
+                if neighbor == attacker_id: continue
+                asyncio.create_task(self._engine.cm.send_message(neighbor, reset_msg))
+        else:
+            logging.info("[Honeypot] 🛡️ Global model reset skipped due to configuration (Reset-less Containment enabled).")
 
     async def _check_and_react_to_pivot(self):
         """
