@@ -1100,7 +1100,8 @@ class ScenarioManagement:
                 participant_config["mobility_args"]["latitude"] = self.scenario.latitude
                 participant_config["mobility_args"]["longitude"] = self.scenario.longitude
             # If not, use the given coordinates in the frontend
-            participant_config["tracking_args"]["local_tracking"] = "advanced" if self.advanced_analytics else "basic"
+            # Enable both CSV and TensorBoard logs by default to ensure real-time analytics in both systems
+            participant_config["tracking_args"]["local_tracking"] = "both"
             participant_config["tracking_args"]["log_dir"] = self.log_dir
             participant_config["tracking_args"]["config_dir"] = self.config_dir
 
