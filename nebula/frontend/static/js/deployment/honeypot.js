@@ -19,14 +19,16 @@ const HoneypotManager = (function () {
             return null;
         }
 
+        const globalResetEl = document.getElementById("honeypot-global-reset");
+
         return {
             enabled: true,
             mode: "fixed",
             count: 1, // Enforced constraint: Only 1 Honeypot
             seed: parseFloat(document.getElementById("honeypot-seed").value),
-            attacker_pivoting: document.getElementById("attacker-pivoting")?.checked || false,
-            pivot_round: parseInt(document.getElementById("pivot-round")?.value) || 10,
-            global_reset: document.getElementById("honeypot-global-reset")?.checked ?? true
+            attacker_pivoting: document.getElementById("attacker-pivoting") ? document.getElementById("attacker-pivoting").checked : false,
+            pivot_round: parseInt(document.getElementById("pivot-round") ? document.getElementById("pivot-round").value : 10) || 10,
+            global_reset: document.getElementById("honeypot-global-reset") ? document.getElementById("honeypot-global-reset").checked : true
         };
     }
 
@@ -44,16 +46,16 @@ const HoneypotManager = (function () {
             hpOptions.style.display = "block";
         }
 
-        if (config.seed) {
+        if (config.seed !== undefined) {
             document.getElementById("honeypot-seed").value = config.seed;
         }
 
         if (document.getElementById("attacker-pivoting")) {
-            document.getElementById("attacker-pivoting").checked = config.attacker_pivoting || false;
+            document.getElementById("attacker-pivoting").checked = config.attacker_pivoting ? true : false;
         }
 
         if (document.getElementById("honeypot-global-reset")) {
-            document.getElementById("honeypot-global-reset").checked = config.global_reset ?? true;
+            document.getElementById("honeypot-global-reset").checked = config.global_reset !== undefined ? config.global_reset : true;
         }
     }
 
