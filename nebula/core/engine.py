@@ -156,6 +156,7 @@ class Engine:
         self._processed_block_neighbor_floods = {}
         self._processed_model_reset_floods = {}
         self._warmup_rounds = 0 # Rounds remaining for learning rate boost
+        self._recovery_rounds = 0 # Rounds remaining for post-poisoning recovery boost
 
         self.config.reload_config_file()
 
@@ -1319,14 +1320,24 @@ class Engine:
                     warmup_lr = base_lr * 1.0
                     logging.info(f"🚀 Warmup Round ({self._warmup_rounds} left). Using standard LR: {warmup_lr}")
                     self.trainer.update_model_learning_rate(warmup_lr)
-                elif self._warmup_rounds == 0:
-                     # Ensure we revert to normal LR after warmup
+                elif self._recovery_rounds > 0:
+                    # SHOCK TRAINING: Boost LR by 5.0x during recovery rounds
+                    base_lr = self.config.participant.get("training_args", {}).get("learning_rate")
+                    if base_lr is None:
+                        base_lr = getattr(self.trainer.model, "learning_rate", 0.01)
+                    boosted_lr = base_lr * 5.0
+                    logging.warning(f"🔥 [Shock Training] Recovery Round ({self._recovery_rounds} left). Boosting LR to {boosted_lr} (5.0x)")
+                    self.trainer.update_model_learning_rate(boosted_lr)
+                elif self._warmup_rounds == 0 or self._recovery_rounds == 0:
+                     # Ensure we revert to normal LR after warmup or recovery
                      normal_lr = self.config.participant.get("training_args", {}).get("learning_rate")
                      if normal_lr is not None:
                          self.trainer.update_model_learning_rate(normal_lr)
                      elif hasattr(self.trainer.model, "learning_rate"):
                          self.trainer.update_model_learning_rate(self.trainer.model.learning_rate)
-                     self._warmup_rounds = -1 # Mark as finished
+
+                     if self._warmup_rounds == 0: self._warmup_rounds = -1
+                     if self._recovery_rounds == 0: self._recovery_rounds = -1
 
                 # --- FIX: Retry logic to prevent TimeoutError crash ---
                 max_retries = 5
@@ -1388,6 +1399,12 @@ class Engine:
                     self._warmup_rounds -= 1
                     if self._warmup_rounds == 0:
                         logging.warning("✨ Warmup Phase COMPLETE. Reverting to normal learning rate next round.")
+
+                # NEW: Decrement recovery rounds
+                if self._recovery_rounds > 0:
+                    self._recovery_rounds -= 1
+                    if self._recovery_rounds == 0:
+                        logging.warning("✨ Recovery Phase (Shock Training) COMPLETE. Reverting to normal learning rate next round.")
 
                 # --- 🛑 BARRERA DE SINCRONIZACIÓN ROBUSTA 🛑 ---
                 logging.info(f"🚧 Waiting for neighbors to finish round {self.round}...")
@@ -1689,6 +1706,17 @@ class Engine:
                     if not hasattr(self, 'blacklist'):
                         self.blacklist = set()
                     self.blacklist.add(attacker_id)
+
+                # --- SHOCK TRAINING INITIATION ---
+                # If Global Reset is DISABLED, we trigger a Recovery Phase with boosted LR
+                # to accelerate poison purging from benign nodes.
+                hp_config = self.config.participant.get("defense_args", {}).get("honeypot", {})
+                global_reset_enabled = hp_config.get("global_reset", True)
+
+                if not global_reset_enabled:
+                    logging.warning(f"🚀 [Recovery] Global Reset is DISABLED. Initiating SHOCK TRAINING (LR Boost) for 10 rounds.")
+                    self._recovery_rounds = 10
+                # --------------------------------
 
             # 2. Propagar el mensaje a TODOS los vecinos (excepto la fuente y el atacante)
             neighbors = set(self.cm.connections.keys())
