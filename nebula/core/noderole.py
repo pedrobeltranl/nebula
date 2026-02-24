@@ -768,6 +768,8 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                  self._attacker_pivoting_enabled = hp_config.get("attacker_pivoting", False)
                  self._pivot_round = hp_config.get("pivot_round", 10)
                  self._global_reset_enabled = hp_config.get("global_reset", True)
+                 logging.info(f"[Honeypot] Initialized with global_reset={self._global_reset_enabled}")
+
 
         # Track the reputation of the known threat before and after to detect pivoting
         self._known_threat_node = None

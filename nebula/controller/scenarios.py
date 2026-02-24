@@ -843,6 +843,11 @@ class ScenarioManagement:
                     "global_reset": hp_conf.get("global_reset", True)
                 }
 
+                # Also save the entire raw honeypot configuration to defense_args
+                if "defense_args" not in participant_config:
+                    participant_config["defense_args"] = {}
+                participant_config["defense_args"]["honeypot"] = hp_conf.copy()
+
             else:
                 participant_config["adversarial_args"]["attack_params"] = {"attacks": "No Attack"}
                 participant_config["defense_args"]["reputation"] = reputation_config
