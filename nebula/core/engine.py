@@ -1311,7 +1311,9 @@ class Engine:
 
                 # NEW: Apply Warmup LR Boost if active
                 if self._warmup_rounds > 0:
-                    base_lr = self.config.participant.get("training_args", {}).get("learning_rate", 0.01)
+                    base_lr = self.config.participant.get("training_args", {}).get("learning_rate")
+                    if base_lr is None:
+                        base_lr = getattr(self.trainer.model, "learning_rate", 0.01)
                     # RCA 18:12 (Phase 18): Removing the 3.0x multiplier.
                     # Post-reset randomized models collapse with high LR. Matching Round 0 behavior.
                     warmup_lr = base_lr * 1.0
@@ -1319,8 +1321,11 @@ class Engine:
                     self.trainer.update_model_learning_rate(warmup_lr)
                 elif self._warmup_rounds == 0:
                      # Ensure we revert to normal LR after warmup
-                     normal_lr = self.config.participant.get("training_args", {}).get("learning_rate", 0.01)
-                     self.trainer.update_model_learning_rate(normal_lr)
+                     normal_lr = self.config.participant.get("training_args", {}).get("learning_rate")
+                     if normal_lr is not None:
+                         self.trainer.update_model_learning_rate(normal_lr)
+                     elif hasattr(self.trainer.model, "learning_rate"):
+                         self.trainer.update_model_learning_rate(self.trainer.model.learning_rate)
                      self._warmup_rounds = -1 # Mark as finished
 
                 # --- FIX: Retry logic to prevent TimeoutError crash ---

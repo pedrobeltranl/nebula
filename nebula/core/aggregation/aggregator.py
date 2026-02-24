@@ -124,11 +124,13 @@ class Aggregator(ABC):
             if skip_task in done:
                 logging.info("Skipping aggregation timeout, updates received before grace time")
                 self._aggregation_waiting_skip.clear()
-                if not lock_acquired:
-                    lock_task.cancel()
+
+            # Safely cancel pending tasks to prevent unretrieved exceptions (like TimeoutError)
+            for pending_task in pending:
+                pending_task.cancel()
                 try:
-                    await lock_task  # Clean cancel
-                except asyncio.CancelledError:
+                    await pending_task
+                except (asyncio.CancelledError, TimeoutError, Exception):
                     pass
 
         except TimeoutError:
@@ -138,6 +140,20 @@ class Aggregator(ABC):
         except Exception as e:
             logging.exception(f"🔄  get_aggregation | Error acquiring lock: {e}")
         finally:
+            if not lock_acquired and not lock_task.done():
+                lock_task.cancel()
+                try:
+                    await lock_task
+                except Exception:
+                    pass
+
+            if skip_task not in done and not skip_task.done():
+                skip_task.cancel()
+                try:
+                    await skip_task
+                except asyncio.CancelledError:
+                    pass
+
             if lock_acquired or self._aggregation_done_lock.locked():
                 await self._aggregation_done_lock.release_async()
 
