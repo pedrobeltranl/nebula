@@ -795,12 +795,60 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
     async def on_global_model_reset(self, event):
         """Handle global reset by cleaning memory and decommissioning honeypot functions."""
         logging.warning("🧹 [Honeypot] Global Model Reset detected. Decommissioning Honeypot functions (acting as Benign).")
+
+        # Clear local threat state and switch to decommissioned (benign) mode
         self.threat_confirmed_locally = False
         self._current_target_attacker = None
         self.consecutive_clean_rounds = 0
-        self._honeypot_decommissioned = True # Retirement flag
+        self._honeypot_decommissioned = True  # Retirement flag
+
+        # Reset honeypot-specific tracking memory
         if self.manager:
             self.manager.reset_tracking()
+
+        # Re-apply / export local blocked list to the reputation system so that
+        # the decommissioned node keeps the same containment policy as before.
+        try:
+            # Event may optionally carry blocked_list: (source_honeypot, round, blocked_list)
+            data = None
+            try:
+                data = await event.get_event_data()
+            except Exception:
+                data = None
+
+            blocked_list = None
+            if isinstance(data, (list, tuple)) and len(data) >= 3:
+                # Third element may be the blocked list (optional/backwards-compatible)
+                blocked_list = data[2]
+
+            # If no blocked_list in event, try to use local reputation snapshot
+            if blocked_list is None:
+                if hasattr(self._engine, "_reputation") and hasattr(self._engine._reputation, "permanently_blocked"):
+                    blocked_list = list(self._engine._reputation.permanently_blocked)
+                else:
+                    blocked_list = []
+
+            # Apply blocks using the reputation API (ensures network-level blacklist scheduling)
+            if blocked_list:
+                logging.warning(f"[Honeypot] Applying blocked list during decommission: {blocked_list}")
+                if hasattr(self._engine, "_reputation") and hasattr(self._engine._reputation, "force_block"):
+                    for node_id in blocked_list:
+                        try:
+                            # Use network_block=True to ensure peers also enforce network blacklist
+                            self._engine._reputation.force_block(node_id, network_block=True)
+                        except Exception as e:
+                            logging.error(f"[Honeypot] Failed to force_block {node_id} during decommission: {e}")
+                else:
+                    # Fallback: attempt to add to engine-level blacklist if present
+                    if hasattr(self._engine, "blacklist"):
+                        for node_id in blocked_list:
+                            try:
+                                self._engine.blacklist.add(node_id)
+                            except Exception:
+                                pass
+
+        except Exception as e:
+            logging.error(f"[Honeypot] Error while applying blocked list on decommission: {e}")
 
     def set_transfer_source(self, source):
         """

@@ -44,6 +44,7 @@ import sys
 
 from nebula.config.config import Config
 from nebula.core.training.lightning import Lightning
+import copy
 
 
 def handle_exception(exc_type, exc_value, exc_traceback):
@@ -119,6 +120,12 @@ class Engine:
 
         self._trainer = trainer(model, datamodule, config=self.config)
         self._aggregator = create_aggregator(config=self.config, engine=self)
+
+        # Snapshot initial model state so we can fully restore on global reset
+        try:
+            self._initial_model_state = copy.deepcopy(self.trainer.model.state_dict())
+        except Exception:
+            self._initial_model_state = None
 
         self._secure_neighbors = []
         self._is_malicious = self.config.participant["adversarial_args"]["attack_params"]["attacks"] != "No Attack"
@@ -201,6 +208,44 @@ class Engine:
         # [FIX] Flag to wait for Handover confirmation
         self._waiting_honeypot_handover = False
         self.blacklist = set()
+
+        # Subscribe to GlobalModelResetEvent to restore model and rotate metrics locally
+        try:
+            asyncio.create_task(EventManager.get_instance().subscribe_node_event(GlobalModelResetEvent, self._handle_global_model_reset))
+        except Exception:
+            pass
+
+    async def _handle_global_model_reset(self, event):
+        """Engine-level handler for GlobalModelResetEvent: restore initial model."""
+        logging.warning("[Engine] GlobalModelResetEvent received: restoring initial model.")
+
+        # 1) Restore model snapshot if available
+        try:
+            if getattr(self, '_initial_model_state', None) is not None:
+                try:
+                    self.trainer.model.load_state_dict(self._initial_model_state)
+                    logging.info("[Engine] Initial model state restored.")
+                except Exception as e:
+                    logging.error(f"[Engine] Failed to restore initial model state: {e}")
+
+                # Reset optimizer state if model exposes helper
+                try:
+                    if hasattr(self.trainer.model, 'reset_optimizer_state'):
+                        self.trainer.model.reset_optimizer_state()
+                    elif hasattr(self.trainer.model, '_optimizer') and self.trainer.model._optimizer:
+                        self.trainer.model._optimizer.state.clear()
+                        logging.info("[Engine] Optimizer state cleared.")
+                except Exception:
+                    pass
+
+        except Exception as e:
+            logging.error(f"[Engine] Error during model restore: {e}")
+
+        # Small grace to allow reputation/network blacklists to apply
+        try:
+            await asyncio.sleep(1)
+        except Exception:
+            pass
 
     @property
     def cm(self):
@@ -794,7 +839,15 @@ class Engine:
 
             # Emit GlobalModelResetEvent to purge stale aggregation buffers
             logging.warning("🔔 Emitting GlobalModelResetEvent to purge aggregation buffers.")
-            await EventManager.get_instance().publish_node_event(GlobalModelResetEvent(source_honeypot="origin", round=self.round))
+            # Attach snapshot of permanently blocked nodes (if reputation addon present)
+            blocked_snapshot = None
+            try:
+                if hasattr(self, '_reputation') and hasattr(self._reputation, 'permanently_blocked'):
+                    blocked_snapshot = list(self._reputation.permanently_blocked)
+            except Exception:
+                blocked_snapshot = None
+
+            await EventManager.get_instance().publish_node_event(GlobalModelResetEvent(source_honeypot="origin", round=self.round, blocked_list=blocked_snapshot))
 
             # REMOVED: Redundant initialization flood (redundant with SYNC_SEED and noisy mid-run).
             # Everyone already knows the SYNC_SEED, so they are already in sync.

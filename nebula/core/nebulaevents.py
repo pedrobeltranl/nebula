@@ -503,16 +503,18 @@ class GlobalModelResetEvent(NodeEvent):
     """
     Event triggered when the entire federation must reset their models
     to recover from a confirmed poisoning attack.
+    Carries an optional snapshot of the blocked list to synchronize containment.
     """
-    def __init__(self, source_honeypot, round):
+    def __init__(self, source_honeypot, round, blocked_list=None):
         self.source_honeypot = source_honeypot
         self.round = round
+        self.blocked_list = blocked_list
 
     def __str__(self):
         return f"Global Model Reset triggered by {self.source_honeypot} at round {self.round}"
 
     async def get_event_data(self):
-        return (self.source_honeypot, self.round)
+        return (self.source_honeypot, self.round, self.blocked_list)
 
     async def is_concurrent(self):
         return False
