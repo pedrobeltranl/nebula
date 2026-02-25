@@ -734,7 +734,11 @@ class Engine:
     async def reinitialize_model(self):
         """
         Reinicia los pesos del modelo a su estado original y resetea contadores.
-        Esto se usa para recuperarse de ataques de envenenamiento.
+        Replica el comportamiento de un inicio de federación baseline limpio:
+        - Cada nodo usa su propia semilla aleatoria (pesos diversos, no idénticos)
+        - A continuación propaga su modelo con la estrategia "initialization"
+          para que los vecinos intercambien y agreguen los pesos frescos,
+          exactamente igual que en la Ronda 0 de una federación baseline.
         """
         # Stop training IMMEDIATELY to prevent further corruption
         if self.trainer and hasattr(self.trainer, '_trainer') and getattr(self.trainer, '_trainer', None):
@@ -744,20 +748,13 @@ class Engine:
         async with self.trainning_in_progress_lock:
             logging.warning("🧹 Re-initializing model weights to recover from poisoning...")
 
-            # Reset PyTorch model weights
-            # RCA 01:15 - SYNCED RESET: Ensure all nodes restart from the same point.
-            # Without a common seed, each node starts with different random weights,
-            # making aggregation purely noisy and sabotaging recovery (16% F1 bug).
+            # BASELINE-STYLE RESET: Each node reinitializes with its OWN random seed,
+            # producing diverse weights — just like the natural baseline startup.
+            # ❌ OLD APPROACH: SYNC_SEED=42 forced IDENTICAL weights → all nodes start
+            # from the same point → aggregation produces no mixing benefit in the first
+            # post-reset rounds → slow convergence, same as training a single node.
+            # ✅ NEW APPROACH: diverse init + initialization exchange = mirrors Round 0.
             import torch
-            import numpy as np
-            import random
-
-            SYNC_SEED = 42
-            torch.manual_seed(SYNC_SEED)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(SYNC_SEED)
-            np.random.seed(SYNC_SEED)
-            random.seed(SYNC_SEED)
 
             def weights_init(m):
                 if hasattr(m, 'reset_parameters'):
@@ -765,23 +762,41 @@ class Engine:
 
             self.trainer.model.apply(weights_init)
             self.trainer.model.set_updated_round(self.round)
+            logging.warning("🧹 Model weights re-initialized with diverse random state (baseline-style).")
 
-            # NEW: Set warmup phase to accelerate recovery
+            # NEW: Set warmup phase (no LR boost — same LR as baseline Round 0)
             self._warmup_rounds = 5
-            logging.warning(f"🚀 Warmup Phase ACTIVATED: Boosting learning rate for the next {self._warmup_rounds} rounds.")
+            logging.warning(f"🚀 Warmup Phase ACTIVATED for the next {self._warmup_rounds} rounds.")
 
-            # NEW: Clear optimizer state (momentum, Adam buffers) via the new thorough method
+            # Clear optimizer state (momentum, Adam buffers)
             if hasattr(self.trainer.model, 'reset_optimizer_state'):
                 self.trainer.model.reset_optimizer_state()
             elif hasattr(self.trainer.model, '_optimizer') and self.trainer.model._optimizer:
                 logging.warning("🧹 Falling back to manual optimizer state clear...")
                 self.trainer.model._optimizer.state.clear()
 
-            # 🔥 NEW: Emit GlobalModelResetEvent so aggregation buffers (DFLUpdateHandler) are purged
+            # Emit GlobalModelResetEvent to purge stale aggregation buffers
             logging.warning("🔔 Emitting GlobalModelResetEvent to purge aggregation buffers.")
             await EventManager.get_instance().publish_node_event(GlobalModelResetEvent(source_honeypot="origin", round=self.round))
 
-            logging.warning("✨ Model reset complete. Federation training starts fresh from this round.")
+            # 🌟 BASELINE REPLICATION: Trigger "initialization" model propagation.
+            # In a clean baseline, after each node loads its initial random weights,
+            # the start node propagates its model using strategy "initialization" so all
+            # neighbors receive and aggregate fresh diverse models before Round 0 training.
+            # We replicate this here so the post-reset round starts from a properly
+            # mixed checkpoint instead of purely independent random weights.
+            try:
+                direct_neighbors = await self.cm.get_addrs_current_connections(only_direct=True, myself=False)
+                if direct_neighbors:
+                    logging.warning(f"🔄 Propagating fresh model to {len(direct_neighbors)} neighbor(s) using 'initialization' strategy (baseline replication).")
+                    mpe = ModelPropagationEvent(direct_neighbors, "initialization")
+                    await EventManager.get_instance().publish_node_event(mpe)
+                else:
+                    logging.warning("⚠️ No direct neighbors found — skipping initialization propagation after reset.")
+            except Exception as e:
+                logging.error(f"❌ Error during post-reset initialization propagation: {e}")
+
+            logging.warning("✨ Model reset complete. Federation will restart from baseline-equivalent state.")
 
 
     async def register_events_callbacks(self):
@@ -1710,8 +1725,7 @@ class Engine:
                 # --- SHOCK TRAINING INITIATION ---
                 # If Global Reset is DISABLED, we trigger a Recovery Phase with boosted LR
                 # to accelerate poison purging from benign nodes.
-                hp_config = self.config.participant.get("defense_args", {}).get("honeypot", {})
-                global_reset_enabled = hp_config.get("global_reset", True)
+                global_reset_enabled = payload.get("global_reset", True)
 
                 if not global_reset_enabled:
                     logging.warning(f"🚀 [Recovery] Global Reset is DISABLED. Initiating SHOCK TRAINING (LR Boost) for 10 rounds.")

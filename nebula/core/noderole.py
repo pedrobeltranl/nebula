@@ -1423,7 +1423,8 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             "attacker_id": attacker_id,
             "targets": list(targets),
             "round": getattr(self._engine, 'round', 0),
-            "source_honeypot": self._engine.addr
+            "source_honeypot": self._engine.addr,
+            "global_reset": getattr(self, "_global_reset_enabled", True)
         }
 
         flood_payload = json.dumps(block_data)
