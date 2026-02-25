@@ -157,6 +157,7 @@ class Engine:
         self._processed_model_reset_floods = {}
         self._warmup_rounds = 0 # Rounds remaining for learning rate boost
         self._recovery_rounds = 0 # Rounds remaining for post-poisoning recovery boost
+        self._pending_reset_round = None # Round scheduled for global model reset
 
         self.config.reload_config_file()
 
@@ -703,14 +704,18 @@ class Engine:
 
             self._processed_model_reset_floods[hash_val] = True
 
-            logging.warning(f"🔄 MODEL RESET received from {source} (Origin: {source_honeypot}, Round: {round_num})")
+            target_reset_round = payload.get("target_round")
 
-            # RCA 22:11 (Fase 6): Using inner try-except to ensure propagation continues even if local reset fails
-            try:
-                # Ejecutar el reset local
-                await self.reinitialize_model()
-            except Exception as e:
-                logging.error(f"❌ Error during local model reinitialization: {e}. Continuing propagation to save neighbors.")
+            if target_reset_round is not None:
+                logging.warning(f"📅 MODEL RESET SCHEDULED for Round {target_reset_round} (Current: {self.round})")
+                self._pending_reset_round = target_reset_round
+            else:
+                # Fallback for old/legacy reset messages
+                logging.warning("⚠️ Received model reset without target_round. Executing IMMEDIATELY (Legacy mode).")
+                try:
+                    await self.reinitialize_model()
+                except Exception as e:
+                    logging.error(f"❌ Error during legacy model reinitialization: {e}. Continuing propagation.")
 
             # Propagar a los vecinos
             neighbors = set(self.cm.connections.keys())
@@ -1309,6 +1314,13 @@ class Engine:
                     indent=2,
                     title="Round information",
                 )
+
+                # --- COORDINATED RESET CHECK ---
+                if self._pending_reset_round is not None and self.round >= self._pending_reset_round:
+                    logging.warning(f"🔄 Executing COORDINATED RESET at Round {self.round} (Target reached).")
+                    await self.reinitialize_model()
+                    self._pending_reset_round = None
+                # ------------------------------
 
                 # FIX: Ensure any pending role changes (e.g. from Honeypot Transfer while locked) are applied
                 await self.update_self_role()

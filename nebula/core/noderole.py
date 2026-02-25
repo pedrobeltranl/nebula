@@ -1473,10 +1473,13 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         # 4. Trigger GLOBAL MODEL RESET to recover from poisoning
         if getattr(self, "_global_reset_enabled", True):
-            logging.warning("[Honeypot] 🔄 Initiating GLOBAL MODEL RESET to recover federation accuracy.")
+            current_round = getattr(self._engine, 'round', 0)
+            target_round = current_round + 2
+            logging.warning(f"[Honeypot] 🔄 Initiating COORDINATED GLOBAL MODEL RESET for Round {target_round}.")
             reset_data = {
                 "type": "model_reset_flood",
                 "round": block_data["round"],
+                "target_round": target_round,
                 "source_honeypot": self._engine.addr
             }
             reset_payload = json.dumps(reset_data)
