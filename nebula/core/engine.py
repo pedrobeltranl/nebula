@@ -1343,13 +1343,26 @@ class Engine:
                     boosted_lr = base_lr * 5.0
                     logging.warning(f"🔥 [Shock Training] Recovery Round ({self._recovery_rounds} left). Boosting LR to {boosted_lr} (5.0x)")
                     self.trainer.update_model_learning_rate(boosted_lr)
+
+                    # EPOCH BOOST: Also run more local epochs so clean data overwrites poison faster.
+                    # With 1 epoch/round, a Ring of 9 benign nodes needs ~20 rounds to dilute
+                    # the poisoned weights. With 3 epochs, clean gradients dominate 3x sooner.
+                    _base_epochs = self.config.participant.get("training_args", {}).get("epochs", 1)
+                    _recovery_epochs = max(_base_epochs * 3, 3)
+                    logging.warning(f"🔥 [Shock Training] Boosting LOCAL EPOCHS to {_recovery_epochs} (3x) for this recovery round.")
+                    self.trainer.set_epochs(_recovery_epochs)
                 elif self._warmup_rounds == 0 or self._recovery_rounds == 0:
-                     # Ensure we revert to normal LR after warmup or recovery
+                     # Ensure we revert to normal LR and epochs after warmup or recovery
                      normal_lr = self.config.participant.get("training_args", {}).get("learning_rate")
                      if normal_lr is not None:
                          self.trainer.update_model_learning_rate(normal_lr)
                      elif hasattr(self.trainer.model, "learning_rate"):
                          self.trainer.update_model_learning_rate(self.trainer.model.learning_rate)
+
+                     # Revert epochs to scenario default
+                     _base_epochs = self.config.participant.get("training_args", {}).get("epochs", 1)
+                     self.trainer.set_epochs(_base_epochs)
+                     logging.info(f"✅ Recovery/Warmup complete. Reverting to {_base_epochs} epoch(s) and normal LR.")
 
                      if self._warmup_rounds == 0: self._warmup_rounds = -1
                      if self._recovery_rounds == 0: self._recovery_rounds = -1
