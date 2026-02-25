@@ -253,6 +253,23 @@ class Engine:
                     elif hasattr(self.trainer.model, '_optimizer') and self.trainer.model._optimizer:
                         self.trainer.model._optimizer.state.clear()
                         logging.info("[Engine] Optimizer state cleared.")
+                        # Ensure learning rate is restored to baseline after clearing optimizer state
+                        try:
+                            baseline_lr = self.config.participant.get("training_args", {}).get("learning_rate", None)
+                            opt = self.trainer.model._optimizer
+                            if baseline_lr is not None and opt is not None:
+                                for g in getattr(opt, 'param_groups', []):
+                                    if 'lr' in g:
+                                        g['lr'] = baseline_lr
+                                logging.info(f"[Engine] Optimizer LRs set to baseline {baseline_lr} after reset.")
+                                # If trainer exposes helper to update lr, call it as well
+                                try:
+                                    if hasattr(self.trainer, 'update_model_learning_rate'):
+                                        self.trainer.update_model_learning_rate(baseline_lr)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
