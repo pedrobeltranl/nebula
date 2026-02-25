@@ -748,13 +748,22 @@ class Engine:
         async with self.trainning_in_progress_lock:
             logging.warning("🧹 Re-initializing model weights to recover from poisoning...")
 
-            # BASELINE-STYLE RESET: Each node reinitializes with its OWN random seed,
-            # producing diverse weights — just like the natural baseline startup.
-            # ❌ OLD APPROACH: SYNC_SEED=42 forced IDENTICAL weights → all nodes start
-            # from the same point → aggregation produces no mixing benefit in the first
-            # post-reset rounds → slow convergence, same as training a single node.
-            # ✅ NEW APPROACH: diverse init + initialization exchange = mirrors Round 0.
+            # SYNCED RESET: All nodes reinitialize with the same random seed.
+            # This ensures they start from the SAME point in the loss landscape,
+            # just like the natural baseline startup (Round 0).
+            # RCA 15:30: Without a common seed, each node starts with different
+            # random weights, making the first aggregation purely noisy and
+            # sabotaging recovery (stagnation at random level).
             import torch
+            import random
+            import numpy as np
+
+            # Use the random seed from scenario_args if available, fallback to 42
+            sync_seed = self.config.scenario_args.get("random_seed", 42)
+            torch.manual_seed(sync_seed)
+            torch.cuda.manual_seed_all(sync_seed)
+            np.random.seed(sync_seed)
+            random.seed(sync_seed)
 
             def weights_init(m):
                 if hasattr(m, 'reset_parameters'):
@@ -762,11 +771,11 @@ class Engine:
 
             self.trainer.model.apply(weights_init)
             self.trainer.model.set_updated_round(self.round)
-            logging.warning("🧹 Model weights re-initialized with diverse random state (baseline-style).")
+            logging.warning(f"🧹 Model weights re-initialized with SYNC_SEED={sync_seed} (Baseline startup replication).")
 
-            # NEW: Set warmup phase (no LR boost — same LR as baseline Round 0)
-            self._warmup_rounds = 5
-            logging.warning(f"🚀 Warmup Phase ACTIVATED for the next {self._warmup_rounds} rounds.")
+            # NEW: Set recovery phase (Shock Training) or warmup
+            self._warmup_rounds = 3 # Reducido a 3 para estabilizar rápido
+            logging.warning(f"🚀 Post-reset sync complete. Warmup (LR protection) active for {self._warmup_rounds} rounds.")
 
             # Clear optimizer state (momentum, Adam buffers)
             if hasattr(self.trainer.model, 'reset_optimizer_state'):
@@ -779,22 +788,9 @@ class Engine:
             logging.warning("🔔 Emitting GlobalModelResetEvent to purge aggregation buffers.")
             await EventManager.get_instance().publish_node_event(GlobalModelResetEvent(source_honeypot="origin", round=self.round))
 
-            # 🌟 BASELINE REPLICATION: Trigger "initialization" model propagation.
-            # In a clean baseline, after each node loads its initial random weights,
-            # the start node propagates its model using strategy "initialization" so all
-            # neighbors receive and aggregate fresh diverse models before Round 0 training.
-            # We replicate this here so the post-reset round starts from a properly
-            # mixed checkpoint instead of purely independent random weights.
-            try:
-                direct_neighbors = await self.cm.get_addrs_current_connections(only_direct=True, myself=False)
-                if direct_neighbors:
-                    logging.warning(f"🔄 Propagating fresh model to {len(direct_neighbors)} neighbor(s) using 'initialization' strategy (baseline replication).")
-                    mpe = ModelPropagationEvent(direct_neighbors, "initialization")
-                    await EventManager.get_instance().publish_node_event(mpe)
-                else:
-                    logging.warning("⚠️ No direct neighbors found — skipping initialization propagation after reset.")
-            except Exception as e:
-                logging.error(f"❌ Error during post-reset initialization propagation: {e}")
+            # REMOVED: Redundant initialization flood (redundant with SYNC_SEED and noisy mid-run).
+            # Everyone already knows the SYNC_SEED, so they are already in sync.
+            logging.warning("✨ Model reset complete. Federation correctly synced via SYNC_SEED.")
 
             logging.warning("✨ Model reset complete. Federation will restart from baseline-equivalent state.")
 
@@ -1295,9 +1291,17 @@ class Engine:
         """
         while self.round is not None and self.round < self.total_rounds:
             async with self._round_in_process_lock:
-                # Clean up old deduplication entries for block_neighbor_flood
-                self._processed_block_neighbor_floods.clear()
-                self._processed_model_reset_floods.clear()
+                # CRITICAL: DO NOT clear deduplication entries every round!
+                # If a flood message is slower than the round switch, it gets re-processed
+                # as a "new" message, creating a broadcast storm (Reset Storm).
+                # These sets should grow or use a TTL, but clearing every round is WRONG.
+                # self._processed_block_neighbor_floods.clear()
+                # self._processed_model_reset_floods.clear()
+
+                # Cleanup older entries periodically if needed (not every single round)
+                if self.round % 50 == 0:
+                    self._processed_block_neighbor_floods.clear()
+                    self._processed_model_reset_floods.clear()
 
                 current_time = time.time()
                 print_msg_box(
