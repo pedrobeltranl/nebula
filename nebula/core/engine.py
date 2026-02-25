@@ -764,7 +764,8 @@ class Engine:
             import numpy as np
 
             # Use the random seed from scenario_args if available, fallback to 42
-            sync_seed = self.config.scenario_args.get("random_seed", 42)
+            scenario_args = self.config.participant.get("scenario_args", {})
+            sync_seed = scenario_args.get("random_seed", 42)
             torch.manual_seed(sync_seed)
             torch.cuda.manual_seed_all(sync_seed)
             np.random.seed(sync_seed)
