@@ -842,6 +842,11 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
              pass
 
     async def extended_learning_cycle(self):
+        # NEW: If decommissioned (post-reset), act as a normal benign aggregator
+        if getattr(self, '_honeypot_decommissioned', False):
+            logging.info("[Honeypot] 💤 Decommissioned mode: Acting as a normal Benign Aggregator.")
+            return await super().extended_learning_cycle()
+
         # --- DUAL MODEL ARCHITECTURE ---
         # Two models: clean_model (retrained every round) + baited_model (trained ONCE, frozen)
         # Clean → sent to BENIGN neighbors | Baited → sent to TESTING/unknown neighbors
