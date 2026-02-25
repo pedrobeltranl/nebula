@@ -780,8 +780,9 @@ class Engine:
             logging.warning(f"🧹 Model weights re-initialized with SYNC_SEED={sync_seed} (Baseline startup replication).")
 
             # NEW: Set recovery phase (Shock Training) or warmup
-            self._warmup_rounds = 3 # Reducido a 3 para estabilizar rápido
-            logging.warning(f"🚀 Post-reset sync complete. Warmup (LR protection) active for {self._warmup_rounds} rounds.")
+            self._warmup_rounds = 0
+            self._recovery_rounds = 0
+            logging.warning(f"🚀 Post-reset: Warmup/Recovery disabled for baseline replication.")
 
             # Clear optimizer state (momentum, Adam buffers)
             if hasattr(self.trainer.model, 'reset_optimizer_state'):

@@ -1457,19 +1457,19 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             logging.warning(f"[Honeypot] 📤 Flooding KILL ORDER (blocking {attacker_id}) to {neighbor}")
             asyncio.create_task(self._engine.cm.send_message(neighbor, msg))
 
-        # --- RECOVERY BRIDGE STRATEGY ---
-        # Si tenemos víctimas identificadas, creamos conexiones directas para compartir modelos limpios
-        # y evitar que el aislamiento topológico hunda la precisión de esos nodos tras el reset.
-        if targets:
-            logging.info(f"[Honeypot] 🌉 Establishing RECOVERY BRIDGES with {len(targets)} victims...")
-            for victim in targets:
-                if victim == self._engine.addr: continue
-                if victim == attacker_id: continue
-                if victim not in neighbors:
-                    logging.info(f"[Honeypot] 🚀 Creating direct link to victim {victim} (Recovery Bridge)")
-                    # Creamos la conexión de forma asíncrona para no bloquear el protocolo
-                    asyncio.create_task(self._engine.cm.connect(victim, direct=True, priority="high"))
-        # -------------------------------
+        # --- RING HEALING (TOPOLOGICAL RECOVERY) ---
+        # Si estamos en un anillo y bloqueamos a un nodo, la red se convierte en una Cadena.
+        # El Honeypot cierra el anillo conectándose al "otro" vecino del atacante.
+        attacker_neighbors = topology.get(attacker_id, []) if topology else []
+        orphaned_neighbors = [n for n in attacker_neighbors if n != self._engine.addr]
+
+        if orphaned_neighbors:
+            logging.warning(f"[Honeypot] 🌉 RING HEALING: Closing network gap left by {attacker_id}.")
+            for target_node in orphaned_neighbors:
+                if target_node not in neighbors:
+                    logging.info(f"[Honeypot] 🚀 Connecting to orphaned neighbor {target_node} to restore Ring diameter.")
+                    asyncio.create_task(self._engine.cm.connect(target_node, direct=True, priority="high"))
+        # ------------------------------------------
 
         # 4. Trigger GLOBAL MODEL RESET to recover from poisoning
         if getattr(self, "_global_reset_enabled", True):
