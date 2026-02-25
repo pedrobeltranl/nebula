@@ -45,6 +45,11 @@ import sys
 from nebula.config.config import Config
 from nebula.core.training.lightning import Lightning
 import copy
+import numpy as np
+try:
+    import torch
+except Exception:
+    torch = None
 
 
 def handle_exception(exc_type, exc_value, exc_traceback):
@@ -120,6 +125,19 @@ class Engine:
 
         self._trainer = trainer(model, datamodule, config=self.config)
         self._aggregator = create_aggregator(config=self.config, engine=self)
+
+        # Ensure log directory exists for snapshot outputs
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+        except Exception:
+            pass
+
+        # Write an initial system snapshot for comparison (startup)
+        try:
+            snapshot = self._collect_snapshot_sync("startup")
+            self._write_snapshot(snapshot)
+        except Exception:
+            logging.warning("[Engine] Failed to write startup snapshot.")
 
         # Snapshot initial model state so we can fully restore on global reset
         try:
@@ -246,6 +264,158 @@ class Engine:
             await asyncio.sleep(1)
         except Exception:
             pass
+
+        # Write a post-reset snapshot for debugging/comparison
+        try:
+            snapshot = await self._collect_snapshot_async("post_reset")
+            self._write_snapshot(snapshot)
+        except Exception:
+            logging.warning("[Engine] Failed to write post-reset snapshot.")
+
+    def _state_checksum(self, state_dict):
+        """Compute a stable SHA1 checksum for a model state_dict."""
+        m = hashlib.sha1()
+        try:
+            for k in sorted(state_dict.keys()):
+                v = state_dict[k]
+                m.update(k.encode())
+                try:
+                    arr = v.detach().cpu().numpy()
+                    m.update(arr.tobytes())
+                except Exception:
+                    # Fallback: include dtype/shape information
+                    try:
+                        m.update(str(type(v)).encode())
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return m.hexdigest()
+
+    def _write_snapshot(self, snapshot: dict):
+        """Append a JSON line with snapshot to a node-specific file in `log_dir`."""
+        try:
+            path = os.path.join(self.log_dir, f"{self.name}_snapshots.jsonl")
+            with open(path, "a") as fh:
+                fh.write(json.dumps(snapshot) + "\n")
+        except Exception as e:
+            logging.warning(f"[Engine] Could not write snapshot file: {e}")
+
+    def _collect_snapshot_sync(self, snapshot_point: str) -> dict:
+        """Collect a synchronous snapshot (used at startup).
+
+        Async items (like federation nodes) will be set to None here.
+        """
+        import random as _random
+
+        snapshot = {
+            "snapshot_point": snapshot_point,
+            "timestamp": int(time.time()),
+            "node_name": getattr(self, "name", None),
+            "addr": getattr(self, "addr", None),
+            "idx": getattr(self, "idx", None),
+            "experiment": getattr(self, "experiment_name", None),
+            "round": getattr(self, "round", None),
+            "total_rounds": getattr(self, "total_rounds", None),
+            "py_random_hash": None,
+            "numpy_state_hash": None,
+            "torch_seed": None,
+            "model_checksum": None,
+            "model_param_mean": None,
+            "model_param_std": None,
+            "optimizer_state_count": None,
+            "optimizer_lrs": None,
+            "first_batch_sample_ids": None,
+            "federation_nodes_count": None,
+            "connections": list(self.cm.connections.keys()) if hasattr(self, "cm") else None,
+            "reputation_blocked_count": len(self._reputation.permanently_blocked) if hasattr(self, "_reputation") and self._reputation else None,
+        }
+
+        # Seeds
+        try:
+            rnd = _random.getstate()[1]
+            snapshot["py_random_hash"] = hash(tuple(rnd[:10]))
+        except Exception:
+            pass
+        try:
+            s = np.random.get_state()[1]
+            snapshot["numpy_state_hash"] = hash(tuple(s[:10]))
+        except Exception:
+            pass
+        try:
+            if torch:
+                snapshot["torch_seed"] = torch.initial_seed()
+        except Exception:
+            pass
+
+        # Model checksum and stats
+        try:
+            mdl = getattr(self.trainer, "model", None)
+            if mdl:
+                sd = mdl.state_dict()
+                snapshot["model_checksum"] = self._state_checksum(sd)
+                try:
+                    params = [p.detach().cpu().numpy().astype("float64") for p in mdl.parameters() if p is not None]
+                    if params:
+                        all_vals = np.concatenate([p.ravel() for p in params])
+                        snapshot["model_param_mean"] = float(np.mean(all_vals))
+                        snapshot["model_param_std"] = float(np.std(all_vals))
+                except Exception:
+                    pass
+                # Optimizer
+                try:
+                    opt = getattr(mdl, "_optimizer", None)
+                    if opt is None and hasattr(self.trainer, "optimizer"):
+                        opt = getattr(self.trainer, "optimizer", None)
+                    if opt:
+                        try:
+                            od = opt.state_dict()
+                            snapshot["optimizer_state_count"] = len(od.get("state", {}))
+                            snapshot["optimizer_lrs"] = [g.get("lr") for g in od.get("param_groups", [])]
+                        except Exception:
+                            snapshot["optimizer_state_count"] = None
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
+
+        # First batch ids (best-effort)
+        try:
+            dm = getattr(self.trainer, "datamodule", None)
+            if dm:
+                dl = dm.train_dataloader()
+                batch = next(iter(dl))
+                fb = None
+                if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                    y = batch[1]
+                    try:
+                        fb = y.tolist() if hasattr(y, "tolist") else None
+                    except Exception:
+                        fb = None
+                snapshot["first_batch_sample_ids"] = fb
+        except Exception:
+            pass
+
+        return snapshot
+
+    async def _collect_snapshot_async(self, snapshot_point: str) -> dict:
+        """Collect an async-capable snapshot (can await federation nodes)."""
+        snapshot = self._collect_snapshot_sync(snapshot_point)
+        # federation nodes count may be async
+        try:
+            fn = await self.get_federation_nodes()
+            snapshot["federation_nodes_count"] = len(fn) if fn is not None else None
+        except Exception:
+            snapshot["federation_nodes_count"] = None
+
+        # connections are synchronous
+        try:
+            snapshot["connections"] = list(self.cm.connections.keys()) if hasattr(self, "cm") else None
+        except Exception:
+            snapshot["connections"] = None
+
+        return snapshot
 
     @property
     def cm(self):
