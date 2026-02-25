@@ -508,6 +508,55 @@ class Engine:
         logging.info(f"🤖  Update round count | from: {self.round} | to round: {new_round}")
         self.round = new_round
         self.trainer.set_current_round(new_round)
+        # If there is no pending global reset, enforce baseline learning rate
+        try:
+            if getattr(self, '_pending_reset_round', None) is None:
+                try:
+                    self._enforce_baseline_learning_rate()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _enforce_baseline_learning_rate(self):
+        """Force optimizer learning rate to baseline configured value.
+
+        Intended to be called when re-starting training without performing a full global reset
+        (the 'shock' flow), so LR matches the initial federation LR.
+        """
+        try:
+            baseline_lr = self.config.participant.get("training_args", {}).get("learning_rate", None)
+            if baseline_lr is None:
+                return
+
+            opt = None
+            # Prefer model-attached optimizer, fall back to trainer optimizer
+            mdl = getattr(self.trainer, 'model', None)
+            if mdl is not None and hasattr(mdl, '_optimizer') and getattr(mdl, '_optimizer'):
+                opt = getattr(mdl, '_optimizer')
+            elif hasattr(self.trainer, 'optimizer') and getattr(self.trainer, 'optimizer'):
+                opt = getattr(self.trainer, 'optimizer')
+            elif hasattr(self.trainer, '_optimizer') and getattr(self.trainer, '_optimizer'):
+                opt = getattr(self.trainer, '_optimizer')
+
+            if opt is None:
+                return
+
+            for g in getattr(opt, 'param_groups', []):
+                if 'lr' in g:
+                    g['lr'] = baseline_lr
+
+            logging.info(f"[Engine] Enforced baseline LR {baseline_lr} to optimizer param_groups.")
+
+            # If trainer exposes helper to update LR, call it as well
+            try:
+                if hasattr(self.trainer, 'update_model_learning_rate'):
+                    self.trainer.update_model_learning_rate(baseline_lr)
+            except Exception:
+                pass
+
+        except Exception as e:
+            logging.warning(f"[Engine] Failed to enforce baseline LR: {e}")
 
     """                                                     ##############################
                                                             #       MODEL CALLBACKS      #
