@@ -126,6 +126,10 @@ class Engine:
         self._trainer = trainer(model, datamodule, config=self.config)
         self._aggregator = create_aggregator(config=self.config, engine=self)
 
+        # Optional enforced LR: if set, this LR will be applied automatically after reset
+        # and when resuming without reset (shock flow).
+        self._enforced_lr = None
+
         # Ensure log directory exists for snapshot outputs
         try:
             os.makedirs(self.log_dir, exist_ok=True)
@@ -233,6 +237,12 @@ class Engine:
         except Exception:
             pass
 
+        # Subscribe to control message to enforce baseline LR on demand
+        try:
+            asyncio.create_task(EventManager.get_instance().subscribe(("control", "enforce_baseline_lr"), self._control_enforce_lr_callback))
+        except Exception:
+            pass
+
     async def _handle_global_model_reset(self, event):
         """Engine-level handler for GlobalModelResetEvent: restore initial model."""
         logging.warning("[Engine] GlobalModelResetEvent received: restoring initial model.")
@@ -255,14 +265,15 @@ class Engine:
                         logging.info("[Engine] Optimizer state cleared.")
                         # Ensure learning rate is restored to baseline after clearing optimizer state
                         try:
-                            baseline_lr = self.config.participant.get("training_args", {}).get("learning_rate", None)
+                            # prefer enforced LR if present, else configured baseline
+                            enforced = getattr(self, '_enforced_lr', None)
+                            baseline_lr = enforced if enforced is not None else self.config.participant.get("training_args", {}).get("learning_rate", None)
                             opt = self.trainer.model._optimizer
                             if baseline_lr is not None and opt is not None:
                                 for g in getattr(opt, 'param_groups', []):
                                     if 'lr' in g:
                                         g['lr'] = baseline_lr
                                 logging.info(f"[Engine] Optimizer LRs set to baseline {baseline_lr} after reset.")
-                                # If trainer exposes helper to update lr, call it as well
                                 try:
                                     if hasattr(self.trainer, 'update_model_learning_rate'):
                                         self.trainer.update_model_learning_rate(baseline_lr)
@@ -288,6 +299,103 @@ class Engine:
             self._write_snapshot(snapshot)
         except Exception:
             logging.warning("[Engine] Failed to write post-reset snapshot.")
+
+    async def _control_enforce_lr_callback(self, source, message):
+        """Handle incoming control message to enforce baseline LR.
+
+        If the message contains a JSON `log` with key `lr`, that LR will be applied;
+        otherwise the configured baseline in `training_args.learning_rate` is used.
+        """
+        try:
+            logging.info(f"[Engine] Received enforce_baseline_lr command from {source}")
+            lr = None
+            try:
+                raw = getattr(message, 'log', None)
+                if isinstance(raw, bytes):
+                    raw = raw.decode('utf-8', errors='ignore')
+                if raw:
+                    try:
+                        payload = json.loads(raw)
+                        lr = payload.get('lr', None)
+                    except Exception:
+                        # not JSON — ignore
+                        lr = None
+            except Exception:
+                lr = None
+
+            try:
+                if lr is not None:
+                    # persist enforced LR so future resets/shocks use it
+                    try:
+                        self._enforced_lr = float(lr)
+                    except Exception:
+                        self._enforced_lr = lr
+                    self._enforce_baseline_learning_rate_override(lr)
+                    logging.info(f"[Engine] Enforced LR={lr} via control message and persisted setting.")
+                else:
+                    self._enforce_baseline_learning_rate()
+                    logging.info("[Engine] Enforced configured baseline LR via control message.")
+            except Exception as e:
+                logging.warning(f"[Engine] Failed to enforce baseline LR on control command: {e}")
+        except Exception:
+            pass
+
+    def broadcast_enforce_baseline_lr(self, lr: float = None):
+        """Send a control message to all connected neighbors requesting they enforce baseline LR.
+
+        If `lr` is provided, that value will be applied by receivers. Otherwise receivers
+        apply the configured baseline in `training_args.learning_rate`.
+        """
+        try:
+            payload = None
+            if lr is not None:
+                try:
+                    payload = json.dumps({"lr": float(lr)})
+                except Exception:
+                    payload = None
+
+            msg = self.cm.create_message("control", "enforce_baseline_lr", log=payload)
+            # persist locally as well so immediate future actions honor this lr
+            if lr is not None:
+                try:
+                    self._enforced_lr = float(lr)
+                except Exception:
+                    self._enforced_lr = lr
+            neighbors = list(self.cm.connections.keys()) if hasattr(self.cm, 'connections') else []
+            for n in neighbors:
+                try:
+                    asyncio.create_task(self.cm.send_message(n, msg))
+                except Exception:
+                    pass
+            logging.info(f"[Engine] Broadcasted enforce_baseline_lr to {len(neighbors)} neighbors (lr={lr}).")
+        except Exception as e:
+            logging.warning(f"[Engine] Failed to broadcast enforce_baseline_lr: {e}")
+
+    def _enforce_baseline_learning_rate_override(self, lr: float):
+        """Apply a specific LR value directly to the optimizer param_groups."""
+        try:
+            if lr is None:
+                return
+            opt = None
+            mdl = getattr(self.trainer, 'model', None)
+            if mdl is not None and hasattr(mdl, '_optimizer') and getattr(mdl, '_optimizer'):
+                opt = getattr(mdl, '_optimizer')
+            elif hasattr(self.trainer, 'optimizer') and getattr(self.trainer, 'optimizer'):
+                opt = getattr(self.trainer, 'optimizer')
+            elif hasattr(self.trainer, '_optimizer') and getattr(self.trainer, '_optimizer'):
+                opt = getattr(self.trainer, '_optimizer')
+            if opt is None:
+                return
+            for g in getattr(opt, 'param_groups', []):
+                if 'lr' in g:
+                    g['lr'] = float(lr)
+            try:
+                if hasattr(self.trainer, 'update_model_learning_rate'):
+                    self.trainer.update_model_learning_rate(float(lr))
+            except Exception:
+                pass
+        except Exception as e:
+            logging.warning(f"[Engine] Failed to apply override LR: {e}")
 
     def _state_checksum(self, state_dict):
         """Compute a stable SHA1 checksum for a model state_dict."""
