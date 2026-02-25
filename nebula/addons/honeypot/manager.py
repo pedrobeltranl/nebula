@@ -87,6 +87,15 @@ class HoneyPotManager:
             logging.info(f"🔄 [HoneyManager] INITIAL Honey Map Generated: {self.current_map}")
 
 
+    def reset_tracking(self):
+        """Reset all neighbor tracking memory and status (useful after global reset)."""
+        self.neighbor_tracking = {}
+        self.suspect_confirmation = {}
+        self.weak_backdoor_nodes = {}
+        self.recent_detections = {}
+        self.missing_rounds = {}
+        logging.warning("[HoneyManager] 🧠 Neighbor tracking memory RESET.")
+
     def new_round(self):
         # Honey_map PERMANENTEMENTE ESTABLE - nunca cambia
         # Esto permite convergencia total del backdoor y facilita la detección

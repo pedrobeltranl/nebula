@@ -158,6 +158,7 @@ class Engine:
         self._warmup_rounds = 0 # Rounds remaining for learning rate boost
         self._recovery_rounds = 0 # Rounds remaining for post-poisoning recovery boost
         self._pending_reset_round = None # Round scheduled for global model reset
+        self._original_batch_size = None # Stores scenario batch size for temporary recovery adjustments
 
         self.config.reload_config_file()
 
@@ -1354,17 +1355,41 @@ class Engine:
                     logging.info(f"🚀 Warmup Round ({self._warmup_rounds} left). Using standard LR: {warmup_lr}")
                     self.trainer.update_model_learning_rate(warmup_lr)
                 elif self._recovery_rounds > 0:
-                    # SHOCK TRAINING: Boost LR by 5.0x during recovery rounds
+                    # ENHANCED SHOCK TRAINING (Point 1 & 2):
+                    # Only active if No Global Reset was chosen.
                     base_lr = self.config.participant.get("training_args", {}).get("learning_rate")
                     if base_lr is None:
                         base_lr = getattr(self.trainer.model, "learning_rate", 0.01)
-                    boosted_lr = base_lr * 5.0
-                    logging.warning(f"🔥 [Shock Training] Recovery Round ({self._recovery_rounds} left). Boosting LR to {boosted_lr} (5.0x)")
+
+                    # 1. Decaying LR Boost Schedule
+                    if self._recovery_rounds > 7:
+                        multiplier = 5.0
+                    elif self._recovery_rounds > 3:
+                        multiplier = 3.0
+                    else:
+                        multiplier = 1.5
+
+                    boosted_lr = base_lr * multiplier
+                    logging.warning(f"🔥 [Enhanced Shock Training] Recovery Round ({self._recovery_rounds} left). Boosting LR to {boosted_lr} ({multiplier}x)")
                     self.trainer.update_model_learning_rate(boosted_lr)
 
-                    # EPOCH BOOST: Also run more local epochs so clean data overwrites poison faster.
-                    # With 1 epoch/round, a Ring of 9 benign nodes needs ~20 rounds to dilute
-                    # the poisoned weights. With 3 epochs, clean gradients dominate 3x sooner.
+                    # 2. Dynamic Batch Size Reduction (First 5 rounds of recovery)
+                    if self._recovery_rounds > 5:
+                        if self._original_batch_size is None:
+                            self._original_batch_size = self.trainer.datamodule.batch_size
+
+                        # Reduce BS to increase the number of weight updates per epoch
+                        recovery_batch_size = max(self._original_batch_size // 2, 4)
+                        if self.trainer.datamodule.batch_size != recovery_batch_size:
+                            logging.warning(f"🔥 [Enhanced Shock Training] Reducing BATCH SIZE to {recovery_batch_size} (Original: {self._original_batch_size}) for faster clean gradient injection.")
+                            self.trainer.datamodule.batch_size = recovery_batch_size
+                    else:
+                        # Revert Batch Size in the second half of recovery
+                        if self._original_batch_size is not None and self.trainer.datamodule.batch_size != self._original_batch_size:
+                            logging.info(f"✅ Reverting BATCH SIZE to original value ({self._original_batch_size}) for stabilization.")
+                            self.trainer.datamodule.batch_size = self._original_batch_size
+
+                    # 3. EPOCH BOOST (Standard)
                     _base_epochs = self.config.participant.get("training_args", {}).get("epochs", 1)
                     _recovery_epochs = max(_base_epochs * 3, 3)
                     logging.warning(f"🔥 [Shock Training] Boosting LOCAL EPOCHS to {_recovery_epochs} (3x) for this recovery round.")
@@ -1381,6 +1406,10 @@ class Engine:
                      _base_epochs = self.config.participant.get("training_args", {}).get("epochs", 1)
                      self.trainer.set_epochs(_base_epochs)
                      logging.info(f"✅ Recovery/Warmup complete. Reverting to {_base_epochs} epoch(s) and normal LR.")
+
+                     # Revert batch size fail-safe
+                     if self._original_batch_size is not None:
+                         self.trainer.datamodule.batch_size = self._original_batch_size
 
                      if self._warmup_rounds == 0: self._warmup_rounds = -1
                      if self._recovery_rounds == 0: self._recovery_rounds = -1

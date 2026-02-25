@@ -711,7 +711,13 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
              seed = config.participant["device_args"].get("honeypot_seed", 0.5)
 
         self.manager = HoneyPotManager(engine=engine, seed=seed, role_behavior=self)
+
+        # NEW: Register for global reset events
+        from nebula.core.nebulaevents import GlobalModelResetEvent
+        asyncio.create_task(EventManager.get_instance().subscribe_node_event(GlobalModelResetEvent, self.on_global_model_reset))
+
         self._defense_active = True
+        self._honeypot_decommissioned = False # Flag for post-reset benign mode
 
         # --- DUAL MODEL ARCHITECTURE ---
         # Frozen baited model state (trained ONCE, never modified after)
@@ -785,6 +791,16 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         self._decommission_requested = False
         self._recovery_rounds_counter = 0  # Contador de rondas donde la reputación se recupera
         self._max_recovery_rounds = 3  # Si se recupera 3 rondas seguidas, desaparecer
+
+    async def on_global_model_reset(self, event):
+        """Handle global reset by cleaning memory and decommissioning honeypot functions."""
+        logging.warning("🧹 [Honeypot] Global Model Reset detected. Decommissioning Honeypot functions (acting as Benign).")
+        self.threat_confirmed_locally = False
+        self._current_target_attacker = None
+        self.consecutive_clean_rounds = 0
+        self._honeypot_decommissioned = True # Retirement flag
+        if self.manager:
+            self.manager.reset_tracking()
 
     def set_transfer_source(self, source):
         """
@@ -1067,6 +1083,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         except Exception as e:
             logging.warning(f"[Honeypot] Error during wait: {e}")
         # ----------------------------------------------------
+
+        if self.threat_confirmed_locally:
+            logging.info(f"[Honeypot] 🛡️ Attacker {self._current_target_attacker} already confirmed and blocked. Skipping further neighbor analysis.")
+            return
 
         logging.info("[Honeypot] 🕵️ Analyzing neighbor updates...")
         updates_storage = self._engine.aggregator.us.us

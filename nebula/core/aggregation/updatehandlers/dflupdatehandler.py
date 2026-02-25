@@ -192,7 +192,7 @@ class DFLUpdateHandler(UpdateHandler):
             if source not in self._sources_received:
                 logging.info(f"Discard update | source: {source} not in expected updates for this Round")
 
-    async def get_round_updates(self):
+    async def get_round_updates(self, target_round: int = None):
         """
         Retrieve the most recent valid updates for this round, filling gaps if needed.
 
@@ -213,7 +213,18 @@ class DFLUpdateHandler(UpdateHandler):
             source_historic = self.us[sr][1]
             last_updt_received = self.us[sr][0]
             updt: Update = None
-            updt = source_historic[-1]  # Get last update received
+
+            # NEW: Filter by target round to prevent desynchronization
+            if target_round is not None:
+                # Find the update that exactly matches the target round
+                match = next((u for u in reversed(source_historic) if u.round == target_round), None)
+                if match:
+                    updt = match
+                else:
+                    logging.warning(f"No update found for target round {target_round} from source {sr}. Using last available.")
+                    updt = source_historic[-1]
+            else:
+                updt = source_historic[-1]  # Get last update received (default behavior)
             if last_updt_received and last_updt_received == updt:
                 logging.warning(f"Missing update from source: {sr}. DROPPING node from aggregation to avoid Stale Model poisoning.")
                 # FIX: Do NOT use historic/stale updates. They degrade performance.
