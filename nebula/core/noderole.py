@@ -996,7 +996,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                     # Restore clean state
                     model.load_state_dict(clean_state_backup)
 
-                    # Restore normal LR
+                    # Restore normal LR (use configured baseline)
                     original_lr = self._engine.config.participant.get("training_args", {}).get("learning_rate", 0.01)
                     if hasattr(self._engine.trainer, 'update_model_learning_rate'):
                         self._engine.trainer.update_model_learning_rate(original_lr)
@@ -1006,7 +1006,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             # ========================================================
             logging.info("[Honeypot] 🧹 PHASE 1: CLEAN TRAINING")
 
-            # Normal LR for clean training
+            # Normal LR for clean training (use configured baseline)
             original_lr = self._engine.config.participant.get("training_args", {}).get("learning_rate", 0.01)
             if hasattr(self._engine.trainer, 'update_model_learning_rate'):
                 self._engine.trainer.update_model_learning_rate(original_lr)

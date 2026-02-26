@@ -50,6 +50,7 @@ try:
     import torch
 except Exception:
     torch = None
+import types
 
 
 def handle_exception(exc_type, exc_value, exc_traceback):
@@ -126,9 +127,45 @@ class Engine:
         self._trainer = trainer(model, datamodule, config=self.config)
         self._aggregator = create_aggregator(config=self.config, engine=self)
 
-        # Optional enforced LR: if set, this LR will be applied automatically after reset
-        # and when resuming without reset (shock flow).
-        self._enforced_lr = None
+        # Optional enforced LR: set to 0.001 so resets will apply this LR across nodes
+        # and it will be honored by any trainer LR updates via the wrapper below.
+        self._enforced_lr = 0.001
+
+        # If trainer exposes `update_model_learning_rate`, wrap it so it honors enforced LR.
+        try:
+            if hasattr(self._trainer, 'update_model_learning_rate'):
+                # keep original
+                try:
+                    self._trainer._orig_update_model_learning_rate = self._trainer.update_model_learning_rate
+                except Exception:
+                    self._trainer._orig_update_model_learning_rate = None
+
+                def _wrapped_update_model_learning_rate(lr):
+                    try:
+                        enforced = getattr(self, '_enforced_lr', None)
+                        use_lr = enforced if enforced is not None else lr
+                        if hasattr(self._trainer, '_orig_update_model_learning_rate') and self._trainer._orig_update_model_learning_rate:
+                            return self._trainer._orig_update_model_learning_rate(use_lr)
+                        # fallback: try to set optimizer param_groups
+                        try:
+                            opt = getattr(self._trainer.model, '_optimizer', None) or getattr(self._trainer, 'optimizer', None)
+                            if opt:
+                                for g in getattr(opt, 'param_groups', []):
+                                    if 'lr' in g:
+                                        g['lr'] = use_lr
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+                # bind wrapper to trainer instance
+                try:
+                    self._trainer.update_model_learning_rate = types.MethodType(lambda self_tr, lr: _wrapped_update_model_learning_rate(lr), self._trainer)
+                except Exception:
+                    # last resort: assign function directly
+                    self._trainer.update_model_learning_rate = _wrapped_update_model_learning_rate
+        except Exception:
+            pass
 
         # Ensure log directory exists for snapshot outputs
         try:
@@ -616,11 +653,23 @@ class Engine:
         logging.info(f"🤖  Update round count | from: {self.round} | to round: {new_round}")
         self.round = new_round
         self.trainer.set_current_round(new_round)
-        # If there is no pending global reset, enforce baseline learning rate
+        # Enforce baseline/enforced LR during shock-style resume (set_round)
+        # so the learning rate remains at the persisted `_enforced_lr` (if any)
+        # or the configured baseline. This ensures non-reset flows also keep
+        # LR=0.001 consistently across nodes.
         try:
-            if getattr(self, '_pending_reset_round', None) is None:
+            enforced = getattr(self, '_enforced_lr', None)
+            if enforced is not None:
+                try:
+                    # apply override directly to optimizer param_groups and via trainer helper
+                    self._enforce_baseline_learning_rate_override(enforced)
+                    logging.info(f"[Engine] Applied enforced LR {enforced} on set_round.")
+                except Exception:
+                    pass
+            else:
                 try:
                     self._enforce_baseline_learning_rate()
+                    logging.info("[Engine] Applied configured baseline LR on set_round.")
                 except Exception:
                     pass
         except Exception:
