@@ -1449,8 +1449,16 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         if next_pivot:
             logging.info(f"[Honeypot] 🚀 SPAWNING SECONDARY HONEYPOT to {next_pivot} to chase the threat!")
+        else:
+            logging.warning("[Honeypot] ⚠️ Could not spawn secondary searcher. No valid unvisited neighbors.")
+            if self._last_pivot_source and self._last_pivot_source != exclude_target and self._last_pivot_source in self._engine.cm.connections:
+                logging.info(f"[Honeypot] 🔙 Backtracking secondary searcher to {self._last_pivot_source} to escape dead end.")
+                next_pivot = self._last_pivot_source
+            else:
+                logging.error("[Honeypot] 🛑 Secondary searcher completely stuck. Cannot spawn.")
+                return
 
-            # Register ourselves as visited so the new honeypot knows we are "one of us" and doesn't flag us
+        if next_pivot:
             self.manager.register_visit(self._engine.addr)
 
             # Create a clone state of the manager to pass on
@@ -1465,8 +1473,6 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 # We will only retire via the 3-clean-rounds mechanism.
             except Exception as e:
                 logging.error(f"[Honeypot] ❌ Failed to spawn secondary honeypot to {next_pivot}: {e}")
-        else:
-            logging.warning("[Honeypot] ⚠️ Could not spawn secondary searcher. No valid neighbors.")
 
     async def _execute_containment_protocol(self, attacker_id):
         """
@@ -1706,13 +1712,13 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 suspects = list(self.manager.suspect_confirmation.keys())
                 logging.info(f"[HONEYPOT DFS] 🔍 Monitoring suspects: {suspects}. Holding position for confirmation...")
             else:
-                logging.warning("[HONEYPOT DFS] ⚠️ No pivot direction available")
-            return
-
-        # Validación adicional: Permitir pivot a Carrier Nodes (sospechosos pero con cebo)
-        # Remove hardcoded block that cancels pivot for 0%-bait nodes.
-        # MANAGER is the source of truth for the investigation trail.
-        # If it returns a node with 0% bait, it's treating it as a CARRIER candidate
+                logging.warning("[HONEYPOT DFS] ⚠️ No pivot direction available. Checking for backtracking...")
+                if getattr(self, '_last_pivot_source', None) and self._last_pivot_source in neighbors:
+                    logging.info(f"[HONEYPOT DFS] 🔙 Backtracking to {self._last_pivot_source} to escape dead end (Leaf node).")
+                    next_pivot = self._last_pivot_source
+                else:
+                    logging.warning("[HONEYPOT DFS] 🛑 Completely stuck (no valid last_pivot_source in neighbors).")
+                    return
         # to find the upstream attacker. We MUST pivot there.
 
         if next_pivot:
