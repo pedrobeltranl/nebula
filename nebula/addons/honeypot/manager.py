@@ -280,7 +280,6 @@ class HoneyPotManager:
 
         # Track suspicious rounds
         if is_suspicious:
-            state["suspicious_count"] += 1
 
             # CONTRADICTION CHECK: Does the attacker's target clash with our HoneyMap?
             # If our map expected Y' for samples of class Y, and the attacker predicts T,
@@ -311,8 +310,9 @@ class HoneyPotManager:
             is_extra_trusted = reputation_module and reputation_module.get_score(neighbor_id) > 1.5
 
             if is_extra_trusted:
-                logging.debug(f"[Manager] 🛡️ Node {neighbor_id} lacks bait but is Extra Trusted. Skipping suspicion.")
+                logging.debug(f"[Manager] 🛡️ Node {neighbor_id} lacks bait but is Extra Trusted. Skipping suspicion increment.")
             else:
+                # IMPORTANT: increment once per analyzed round to avoid artificial escalation
                 state["suspicious_count"] += 1
                 self.recent_detections[neighbor_id] = self.recent_detections.get(neighbor_id, 0) + 1
                 logging.warning(
@@ -335,7 +335,11 @@ class HoneyPotManager:
         # FASE 3: Aumentado a 5 para evitar desconexiones prematuras en el anillo.
 
         # Absolute Suspicion Threshold (e.g. 80%) bypasses VICTIM CARRIER protection
-        is_overwhelmingly_suspicious = state["suspicious_count"] > 0 and (is_suspicious and getattr(self.detector, 'suspicious_rate', 0) > 0.80)
+        is_overwhelmingly_suspicious = (
+            state["rounds_tested"] >= 3
+            and state["suspicious_count"] > 0
+            and (is_suspicious and getattr(self.detector, 'suspicious_rate', 0) > 0.80)
+        )
 
         if state["suspicious_count"] >= 5 or is_overwhelmingly_suspicious:
              # If they have bait, we treat them as victims (CARRIERS).
@@ -365,10 +369,17 @@ class HoneyPotManager:
                   # RCA 11:45 (Fase 8): ANALYTICAL IDENTITY (No protocol cheating).
                   # If we see CLASHES but NO bait after a short reinforcement (3 rounds),
                   # we know it's the attacker origin, not a victim.
-                  # FIX: Reduced to 1 round (Phase 24) for immediate conviction of blatant clashes.
-                  CLASH_GRACE_ROUNDS = 1
+                  # SAFETY: require multi-round evidence before conviction to reduce false positives.
+                  CLASH_GRACE_ROUNDS = 3
+                  MIN_CLASHES_FOR_CONVICTION = 2
+                  MIN_ROUNDS_FOR_CONVICTION = 3
                   if state["clash_count"] > 0:
-                       if state["suspicious_count"] >= CLASH_GRACE_ROUNDS and state["max_compliant_seen"] < BENIGN_COMPLIANT_THRESHOLD:
+                       if (
+                           state["clash_count"] >= MIN_CLASHES_FOR_CONVICTION
+                           and state["rounds_tested"] >= MIN_ROUNDS_FOR_CONVICTION
+                           and state["suspicious_count"] >= CLASH_GRACE_ROUNDS
+                           and state["max_compliant_seen"] < BENIGN_COMPLIANT_THRESHOLD
+                       ):
                            logging.error(f"[Manager] ‼️ ANALYTICAL IDENTITY CONFIRMED for {neighbor_id}. Persistent Clashes + 0% Bait. CONVICTING.")
                            state["status"] = "MALICIOUS"
                            return "MALICIOUS"

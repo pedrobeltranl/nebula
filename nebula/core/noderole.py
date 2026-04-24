@@ -743,6 +743,8 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         self._pivot_history = set()
         self._last_pivot_round = -1
         self._pending_pivot_candidate = None  # Set before handover; cleared after ACK or timeout
+        self._failed_pivot_targets = {}  # {node_id: blocked_until_round}
+        self._pivot_retry_cooldown_rounds = 4
 
         # Track detection history for multi-round confirmation (avoid false positives)
         self._detection_history = {}  # {node_id: [round_numbers]}
@@ -1722,6 +1724,15 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         # to find the upstream attacker. We MUST pivot there.
 
         if next_pivot:
+            current_round = getattr(self._engine, 'round', 0)
+            blocked_until = self._failed_pivot_targets.get(next_pivot)
+            if blocked_until is not None and current_round < blocked_until:
+                logging.warning(
+                    f"[HONEYPOT DFS] ⛔ Candidate {next_pivot} is cooling down until round {blocked_until}. "
+                    "Holding this round to avoid transfer loops."
+                )
+                return
+
             # FIX: Check Global Reputation - Do NOT pivot to a Suspect!
             # If we pivot to a node with bad reputation, we might be giving the role to the Attacker.
             if hasattr(self._engine, '_reputation') and self._engine._reputation:
@@ -1766,6 +1777,18 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             self.manager.locked_target = None
 
     async def _pivot_to(self, candidate):
+        # COOL-DOWN SAFETY: Avoid retrying the same failing destination for a few rounds
+        current_round = getattr(self._engine, 'round', 0)
+        blocked_until = self._failed_pivot_targets.get(candidate)
+        if blocked_until is not None:
+            if current_round < blocked_until:
+                logging.warning(
+                    f"[Honeypot] ⛔ Pivot to {candidate} is in cooldown until round {blocked_until} "
+                    f"(current: {current_round}). Skipping."
+                )
+                return
+            self._failed_pivot_targets.pop(candidate, None)
+
         # CRITICAL SAFETY: Prevent double pivots in the same round/session
         if getattr(self._engine, 'has_served_as_honeypot', False):
             logging.warning(f"[Honeypot] 🚫 BLOCKED REDUNDANT PIVOT to {candidate} - Node has already initiated a transfer.")
@@ -1845,11 +1868,22 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             failed_target = getattr(self, '_pending_pivot_candidate', None)
             self._pending_pivot_candidate = None
 
+            if failed_target:
+                current_round = getattr(self._engine, 'round', 0)
+                blocked_until = current_round + self._pivot_retry_cooldown_rounds
+                self._failed_pivot_targets[failed_target] = blocked_until
+
             logging.warning(
                 f"[Honeypot] ⏱️ ACK timeout ({timeout_seconds}s) for pivot to "
                 f"{failed_target or 'unknown'}. Resuming DFS — bait analysis will "
                 f"reclassify the node correctly next round."
             )
+
+            if failed_target:
+                logging.warning(
+                    f"[Honeypot] 🔒 Applying pivot cooldown to {failed_target} until round "
+                    f"{self._failed_pivot_targets[failed_target]} to prevent ping-pong loops."
+                )
 
             # Reset flags so DFS re-runs next round
             self._engine._waiting_honeypot_handover = False
