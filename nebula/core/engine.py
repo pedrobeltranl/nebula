@@ -810,6 +810,7 @@ class Engine:
         if self._is_malicious and not is_pivot: return
 
         current_role = str(self.rb.get_role())
+
         # Allow HONEYPOT transfer OR MALICIOUS PIVOT to override a Honeypot
         if "HONEYPOT" in current_role:
             if is_pivot:

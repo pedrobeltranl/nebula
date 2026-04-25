@@ -373,16 +373,53 @@ class HoneyPotManager:
                   CLASH_GRACE_ROUNDS = 3
                   MIN_CLASHES_FOR_CONVICTION = 2
                   MIN_ROUNDS_FOR_CONVICTION = 3
+                  external_reporters = 0
+                  reporter_list = []
+                  reputation_module = getattr(self.engine, "_reputation", None)
+                  if reputation_module and hasattr(reputation_module, "get_reporters"):
+                       try:
+                           reporter_list = [
+                               r for r in reputation_module.get_reporters(neighbor_id)
+                               if r and r != getattr(self.engine, "addr", None)
+                           ]
+                           external_reporters = len(set(reporter_list))
+                       except Exception:
+                           external_reporters = 0
+
+                  has_cross_confirmation = external_reporters >= 2
+                  local_extreme_evidence = (
+                      state["clash_count"] >= 3
+                      and state["suspicious_count"] >= 8
+                      and state["rounds_tested"] >= 6
+                  )
+
                   if state["clash_count"] > 0:
                        if (
                            state["clash_count"] >= MIN_CLASHES_FOR_CONVICTION
                            and state["rounds_tested"] >= MIN_ROUNDS_FOR_CONVICTION
                            and state["suspicious_count"] >= CLASH_GRACE_ROUNDS
                            and state["max_compliant_seen"] < BENIGN_COMPLIANT_THRESHOLD
+                           and (has_cross_confirmation or local_extreme_evidence)
                        ):
-                           logging.error(f"[Manager] ‼️ ANALYTICAL IDENTITY CONFIRMED for {neighbor_id}. Persistent Clashes + 0% Bait. CONVICTING.")
+                           logging.error(
+                               f"[Manager] ‼️ ANALYTICAL IDENTITY CONFIRMED for {neighbor_id}. "
+                               f"Persistent Clashes + 0% Bait + "
+                               f"{'cross-confirmation' if has_cross_confirmation else 'extreme local evidence'}. CONVICTING."
+                           )
                            state["status"] = "MALICIOUS"
                            return "MALICIOUS"
+
+                       if (
+                           state["clash_count"] >= MIN_CLASHES_FOR_CONVICTION
+                           and state["rounds_tested"] >= MIN_ROUNDS_FOR_CONVICTION
+                           and state["suspicious_count"] >= CLASH_GRACE_ROUNDS
+                           and state["max_compliant_seen"] < BENIGN_COMPLIANT_THRESHOLD
+                       ):
+                           logging.warning(
+                               f"[Manager] 🔍 Holding conviction for {neighbor_id}: "
+                               f"missing cross-confirmation (external reporters={external_reporters}, "
+                               f"reporters={sorted(set(reporter_list)) if reporter_list else []})."
+                           )
 
                        logging.warning(f"[Manager] 🛡️ {neighbor_id} is suspicious but has CLASHES ({state['clash_count']}). Treating as VICTIM CARRIER (Grace: {state['suspicious_count']}/{CLASH_GRACE_ROUNDS}).")
                        return "TESTING"
