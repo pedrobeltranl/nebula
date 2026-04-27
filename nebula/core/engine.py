@@ -822,6 +822,7 @@ class Engine:
 
         target_role = Role.AGGREGATOR
         honeypot_state = None
+        honeypot_transfer_id = None
 
         if is_honey:
             logging.info(f"🍯 HONEYPOT TRANSFER from {source}")
@@ -829,6 +830,8 @@ class Engine:
             try:
                 payload = msg_log.replace("HONEYPOT_TRANSFER:", "", 1)
                 honeypot_state = json.loads(payload)
+                if isinstance(honeypot_state, dict):
+                    honeypot_transfer_id = honeypot_state.get("__handover_id")
             except: pass
         elif is_pivot:
              logging.info(f"💀 MALICIOUS INFECTION from {source}")
@@ -883,9 +886,13 @@ class Engine:
              # FIX: Send ACK IMMEDIATELY so the sender can decommission within the 30s timeout.
              # Previously, the ACK was deferred to update_self_role() (~32s later),
              # always arriving 2s after the sender's 30s timeout → duplicate honeypots.
-             ack_msg = self.cm.create_message("control", "leadership_transfer_ack")
+             ack_log = f"HONEYPOT_ACK:{honeypot_transfer_id}" if honeypot_transfer_id else "HONEYPOT_ACK"
+             ack_msg = self.cm.create_message("control", "leadership_transfer_ack", log=ack_log)
              asyncio.create_task(self.cm.send_message(source, ack_msg))
-             logging.info(f"🍯  Immediate ACK sent to {source} for HONEYPOT transfer")
+             logging.info(
+                 f"🍯  Immediate ACK sent to {source} for HONEYPOT transfer"
+                 f" (handover_id={honeypot_transfer_id if honeypot_transfer_id else 'none'})"
+             )
 
              # Override any scheduled AGGREGATOR role from ACKs
              # source_to_notificate=None because ACK was already sent above
@@ -975,9 +982,45 @@ class Engine:
 
         if "honeypot" in current_role_val.lower():
             if hasattr(self, '_waiting_honeypot_handover') and self._waiting_honeypot_handover:
+                raw_log = getattr(message, "log", "")
+                msg_log = raw_log.decode('utf-8', errors='ignore') if isinstance(raw_log, bytes) else (str(raw_log) if raw_log else "")
+                ack_handover_id = None
+                if "HONEYPOT_ACK:" in msg_log:
+                    try:
+                        ack_handover_id = msg_log.split("HONEYPOT_ACK:", 1)[1].strip() or None
+                    except Exception:
+                        ack_handover_id = None
+
+                expected_handover_id = getattr(self.rb, "_pending_handover_id", None)
+                expected_target = getattr(self.rb, "_pending_pivot_candidate", None)
+
+                if expected_target and source != expected_target:
+                    logging.warning(
+                        f"Ignoring ACK from {source}: expected pending handover target is {expected_target}."
+                    )
+                    return
+
+                if expected_handover_id:
+                    if not ack_handover_id:
+                        logging.warning(
+                            f"Ignoring ACK from {source}: missing handover correlation id "
+                            f"(expected {expected_handover_id})."
+                        )
+                        return
+                    if ack_handover_id != expected_handover_id:
+                        logging.warning(
+                            f"Ignoring ACK from {source}: handover id mismatch "
+                            f"(ack={ack_handover_id}, expected={expected_handover_id})."
+                        )
+                        return
+
                 logging.info(f"✅  Honeypot Handover Confirmed by {source}. I can now retire with honor.")
                 self.has_served_as_honeypot = True # FIX: Ensure we don't get re-promoted by factory
                 self._waiting_honeypot_handover = False
+                if hasattr(self.rb, "_pending_handover_id"):
+                    self.rb._pending_handover_id = None
+                if hasattr(self.rb, "_pending_pivot_candidate"):
+                    self.rb._pending_pivot_candidate = None
                 target_role = Role.AGGREGATOR
 
                 if await self._round_in_process_lock.locked_async():

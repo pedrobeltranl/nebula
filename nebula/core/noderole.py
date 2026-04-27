@@ -743,8 +743,12 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         self._pivot_history = set()
         self._last_pivot_round = -1
         self._pending_pivot_candidate = None  # Set before handover; cleared after ACK or timeout
+        self._pending_handover_id = None
         self._failed_pivot_targets = {}  # {node_id: blocked_until_round}
         self._pivot_retry_cooldown_rounds = 4
+        self._dead_end_edges = {}  # {(from_node, to_node): blocked_until_round}
+        self._dead_end_edge_cooldown_rounds = 6
+        self._consecutive_no_pivot = 0
 
         # Track detection history for multi-round confirmation (avoid false positives)
         self._detection_history = {}  # {node_id: [round_numbers]}
@@ -1714,8 +1718,26 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 suspects = list(self.manager.suspect_confirmation.keys())
                 logging.info(f"[HONEYPOT DFS] 🔍 Monitoring suspects: {suspects}. Holding position for confirmation...")
             else:
+                self._consecutive_no_pivot += 1
                 logging.warning("[HONEYPOT DFS] ⚠️ No pivot direction available. Checking for backtracking...")
                 if getattr(self, '_last_pivot_source', None) and self._last_pivot_source in neighbors:
+                    edge_key = (self._engine.addr, self._last_pivot_source)
+                    edge_blocked_until = self._dead_end_edges.get(edge_key)
+                    if edge_blocked_until is not None and current_round < edge_blocked_until:
+                        logging.warning(
+                            f"[HONEYPOT DFS] ⛔ Dead-end edge {edge_key} in cooldown until round {edge_blocked_until}. "
+                            "Holding position to avoid ping-pong loops."
+                        )
+                        return
+
+                    if self._consecutive_no_pivot >= 2:
+                        self._dead_end_edges[edge_key] = current_round + self._dead_end_edge_cooldown_rounds
+                        logging.warning(
+                            f"[HONEYPOT DFS] 🔒 Marking dead-end edge {edge_key} until round "
+                            f"{self._dead_end_edges[edge_key]} after repeated no-pivot cycles."
+                        )
+                        return
+
                     logging.info(f"[HONEYPOT DFS] 🔙 Backtracking to {self._last_pivot_source} to escape dead end (Leaf node).")
                     next_pivot = self._last_pivot_source
                 else:
@@ -1725,6 +1747,15 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         if next_pivot:
             current_round = getattr(self._engine, 'round', 0)
+            edge_key = (self._engine.addr, next_pivot)
+            edge_blocked_until = self._dead_end_edges.get(edge_key)
+            if edge_blocked_until is not None and current_round < edge_blocked_until:
+                logging.warning(
+                    f"[HONEYPOT DFS] ⛔ Edge {edge_key} blocked until round {edge_blocked_until}. "
+                    "Skipping pivot this round to avoid DFS oscillation."
+                )
+                return
+
             blocked_until = self._failed_pivot_targets.get(next_pivot)
             if blocked_until is not None and current_round < blocked_until:
                 logging.warning(
@@ -1764,6 +1795,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         if next_pivot:
             logging.info(f"[HONEYPOT DFS] 🚀 Pivoting to {next_pivot} (DFS deepening)")
+            self._consecutive_no_pivot = 0
             self._last_pivot_round = current_round
             self._last_pivot_source = self._engine.addr  # Recordar de dónde vinimos
 
@@ -1832,7 +1864,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         self._engine.has_served_as_honeypot = True
 
         target_state = self.manager.export_state()
+        handover_id = f"{self._engine.addr}|{candidate}|r{current_round}|{int(time.time()*1000)}"
+        target_state["__handover_id"] = handover_id
         payload = json.dumps(target_state)
+        self._pending_handover_id = handover_id
 
         log_message = f"HONEYPOT_TRANSFER:{payload}"
         try:
@@ -1843,12 +1878,14 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             # self._defense_active = False # Keep active until confirmed
             self._engine._waiting_honeypot_handover = True
             self._pending_pivot_candidate = candidate  # Remember who we tried (for timeout blacklisting)
+            logging.info(f"[Honeypot] 🧾 Handover correlation id: {handover_id}")
 
             # Schedule a timeout to force retirement if ACK doesn't arrive
             asyncio.create_task(self._honeypot_handover_timeout(30))  # 30-second timeout
             # await self.set_next_role(Role.AGGREGATOR) # Removed: Wait for ACK in engine.py
         except Exception as e:
             logging.error(f"[Honeypot] ❌ Failed to send transfer message to {candidate}: {e}")
+            self._pending_handover_id = None
             self._engine.has_served_as_honeypot = False
 
     async def _honeypot_handover_timeout(self, timeout_seconds):
@@ -1867,6 +1904,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         if hasattr(self._engine, '_waiting_honeypot_handover') and self._engine._waiting_honeypot_handover:
             failed_target = getattr(self, '_pending_pivot_candidate', None)
             self._pending_pivot_candidate = None
+            self._pending_handover_id = None
 
             if failed_target:
                 current_round = getattr(self._engine, 'round', 0)

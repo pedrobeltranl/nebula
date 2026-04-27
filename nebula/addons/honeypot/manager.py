@@ -297,6 +297,7 @@ class HoneyPotManager:
                     # RCA 23:10:38 - IMPROVEMENT: If we detect a DIRECT CONTRADICTION CLASH,
                     # it means the node is intentionally ignoring our bait to favor its own target.
                     state["clash_count"] += 1
+                    state.setdefault("clash_rounds", []).append(current_round)
                     logging.warning(
                         f"[Manager] ⚠️ CONTRADICTION CLASH on {neighbor_id} (targets {dominant_target}). "
                         f"Bait presence: {max(compliant_rate, state['max_compliant_seen']):.2%}. "
@@ -314,6 +315,7 @@ class HoneyPotManager:
             else:
                 # IMPORTANT: increment once per analyzed round to avoid artificial escalation
                 state["suspicious_count"] += 1
+                state.setdefault("suspicious_rounds", []).append(current_round)
                 self.recent_detections[neighbor_id] = self.recent_detections.get(neighbor_id, 0) + 1
                 logging.warning(
                     f"[Manager] ⚠️ Neighbor {neighbor_id} flagged SUSPICIOUS (count: {state['suspicious_count']}) "
@@ -375,6 +377,7 @@ class HoneyPotManager:
                   MIN_ROUNDS_FOR_CONVICTION = 3
                   external_reporters = 0
                   reporter_list = []
+                  qualified_reporters = []
                   reputation_module = getattr(self.engine, "_reputation", None)
                   if reputation_module and hasattr(reputation_module, "get_reporters"):
                        try:
@@ -382,15 +385,47 @@ class HoneyPotManager:
                                r for r in reputation_module.get_reporters(neighbor_id)
                                if r and r != getattr(self.engine, "addr", None)
                            ]
-                           external_reporters = len(set(reporter_list))
+                           for reporter_id in sorted(set(reporter_list)):
+                               reporter_score = 1.0
+                               if hasattr(reputation_module, "get_score"):
+                                   try:
+                                       reporter_score = float(reputation_module.get_score(reporter_id))
+                                   except Exception:
+                                       reporter_score = 1.0
+
+                               reporter_state = self.neighbor_tracking.get(reporter_id, {})
+                               reporter_suspicious = reporter_state.get("suspicious_count", 0)
+                               reporter_bait = reporter_state.get("max_compliant_seen", 0.0)
+                               reporter_benign = reporter_state.get("status") == "BENIGN"
+
+                               # Reporter quality gate:
+                               # - not currently suspicious,
+                               # - and either trusted by reputation or analytically benign/carrier.
+                               if reporter_suspicious <= 1 and (
+                                   reporter_score >= 0.75
+                                   or reporter_benign
+                                   or reporter_bait >= BENIGN_COMPLIANT_THRESHOLD
+                               ):
+                                   qualified_reporters.append(reporter_id)
+
+                           external_reporters = len(set(qualified_reporters))
                        except Exception:
                            external_reporters = 0
 
                   has_cross_confirmation = external_reporters >= 2
+                  suspicious_rounds = state.get("suspicious_rounds", [])
+                  clash_rounds = state.get("clash_rounds", [])
+                  has_recent_susp_streak = (
+                      len(suspicious_rounds) >= 2
+                      and (suspicious_rounds[-1] - suspicious_rounds[-2]) <= 1
+                  )
+                  has_recent_clash = any((current_round - r) <= 2 for r in clash_rounds)
                   local_extreme_evidence = (
                       state["clash_count"] >= 3
-                      and state["suspicious_count"] >= 8
-                      and state["rounds_tested"] >= 6
+                      and state["suspicious_count"] >= 10
+                      and state["rounds_tested"] >= 8
+                      and has_recent_susp_streak
+                      and has_recent_clash
                   )
 
                   if state["clash_count"] > 0:
@@ -399,6 +434,8 @@ class HoneyPotManager:
                            and state["rounds_tested"] >= MIN_ROUNDS_FOR_CONVICTION
                            and state["suspicious_count"] >= CLASH_GRACE_ROUNDS
                            and state["max_compliant_seen"] < BENIGN_COMPLIANT_THRESHOLD
+                           and has_recent_susp_streak
+                           and has_recent_clash
                            and (has_cross_confirmation or local_extreme_evidence)
                        ):
                            logging.error(
@@ -417,8 +454,10 @@ class HoneyPotManager:
                        ):
                            logging.warning(
                                f"[Manager] 🔍 Holding conviction for {neighbor_id}: "
-                               f"missing cross-confirmation (external reporters={external_reporters}, "
-                               f"reporters={sorted(set(reporter_list)) if reporter_list else []})."
+                               f"missing robust evidence (qualified_reporters={external_reporters}, "
+                               f"raw_reporters={sorted(set(reporter_list)) if reporter_list else []}, "
+                               f"qualified={sorted(set(qualified_reporters)) if qualified_reporters else []}, "
+                               f"recent_susp_streak={has_recent_susp_streak}, recent_clash={has_recent_clash})."
                            )
 
                        logging.warning(f"[Manager] 🛡️ {neighbor_id} is suspicious but has CLASHES ({state['clash_count']}). Treating as VICTIM CARRIER (Grace: {state['suspicious_count']}/{CLASH_GRACE_ROUNDS}).")
@@ -943,7 +982,9 @@ class HoneyPotManager:
                 "verified_round": None,
                 "max_compliant_seen": 0.0,
                 "compliant_history": [],
-                "first_backdoor_round": None
+                "first_backdoor_round": None,
+                "suspicious_rounds": [],
+                "clash_rounds": []
             }
             logging.info(f"[Manager] 🆕 Initializing tracking for neighbor: {neighbor_id}")
 
@@ -959,6 +1000,8 @@ class HoneyPotManager:
             "max_compliant_seen": 0.0,
             "compliant_history": [],
             "first_backdoor_round": None,
+            "suspicious_rounds": [],
+            "clash_rounds": [],
             "carrier_suspect": False,  # True when suspicious but upstream attacker suspected
             "clash_count": 0,           # Counter for Honeymap contradictions (Honey target predictions)
         }
