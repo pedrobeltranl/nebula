@@ -375,6 +375,7 @@ class HoneyPotManager:
                   CLASH_GRACE_ROUNDS = 3
                   MIN_CLASHES_FOR_CONVICTION = 2
                   MIN_ROUNDS_FOR_CONVICTION = 3
+                  MIN_CONSECUTIVE_SUSP_ROUNDS = 3
                   external_reporters = 0
                   reporter_list = []
                   qualified_reporters = []
@@ -397,15 +398,13 @@ class HoneyPotManager:
                                reporter_suspicious = reporter_state.get("suspicious_count", 0)
                                reporter_bait = reporter_state.get("max_compliant_seen", 0.0)
                                reporter_benign = reporter_state.get("status") == "BENIGN"
+                               reporter_history = reporter_state.get("compliant_history", [])[-3:]
+                               reporter_consistent = sum(1 for _, r in reporter_history if float(r) >= BENIGN_COMPLIANT_THRESHOLD) >= 2
 
                                # Reporter quality gate:
                                # - not currently suspicious,
-                               # - and either trusted by reputation or analytically benign/carrier.
-                               if reporter_suspicious <= 1 and (
-                                   reporter_score >= 0.75
-                                   or reporter_benign
-                                   or reporter_bait >= BENIGN_COMPLIANT_THRESHOLD
-                               ):
+                               # - and analytically BENIGN with consistent bait signal.
+                               if reporter_suspicious <= 1 and reporter_benign and reporter_consistent and reporter_score >= 0.75:
                                    qualified_reporters.append(reporter_id)
 
                            external_reporters = len(set(qualified_reporters))
@@ -415,10 +414,14 @@ class HoneyPotManager:
                   has_cross_confirmation = external_reporters >= 2
                   suspicious_rounds = state.get("suspicious_rounds", [])
                   clash_rounds = state.get("clash_rounds", [])
-                  has_recent_susp_streak = (
-                      len(suspicious_rounds) >= 2
-                      and (suspicious_rounds[-1] - suspicious_rounds[-2]) <= 1
-                  )
+                  # Compute consecutive suspicion streak length from the end
+                  streak_len = 1
+                  for i in range(len(suspicious_rounds) - 1, 0, -1):
+                      if suspicious_rounds[i] - suspicious_rounds[i - 1] <= 1:
+                          streak_len += 1
+                      else:
+                          break
+                  has_recent_susp_streak = streak_len >= MIN_CONSECUTIVE_SUSP_ROUNDS
                   has_recent_clash = any((current_round - r) <= 2 for r in clash_rounds)
                   local_extreme_evidence = (
                       state["clash_count"] >= 3
@@ -438,6 +441,17 @@ class HoneyPotManager:
                            and has_recent_clash
                            and (has_cross_confirmation or local_extreme_evidence)
                        ):
+                           if not state.get("conviction_pending_round"):
+                               state["conviction_pending_round"] = current_round
+                               logging.warning(
+                                   f"[Manager] ⏳ Conviction pending for {neighbor_id}. "
+                                   f"Will re-check next round before blocking."
+                               )
+                               return "TESTING"
+
+                           if (current_round - state.get("conviction_pending_round", current_round)) < 1:
+                               return "TESTING"
+
                            logging.error(
                                f"[Manager] ‼️ ANALYTICAL IDENTITY CONFIRMED for {neighbor_id}. "
                                f"Persistent Clashes + 0% Bait + "
@@ -984,7 +998,8 @@ class HoneyPotManager:
                 "compliant_history": [],
                 "first_backdoor_round": None,
                 "suspicious_rounds": [],
-                "clash_rounds": []
+                "clash_rounds": [],
+                "conviction_pending_round": None
             }
             logging.info(f"[Manager] 🆕 Initializing tracking for neighbor: {neighbor_id}")
 
@@ -1002,6 +1017,7 @@ class HoneyPotManager:
             "first_backdoor_round": None,
             "suspicious_rounds": [],
             "clash_rounds": [],
+            "conviction_pending_round": None,
             "carrier_suspect": False,  # True when suspicious but upstream attacker suspected
             "clash_count": 0,           # Counter for Honeymap contradictions (Honey target predictions)
         }
@@ -1130,6 +1146,15 @@ class HoneyPotManager:
                     # High priority (score=2.0) — pivot through ASAP to find the real attacker
                     investigation_neighbors.append((node_id, 2.0))
                 else:
+                    # Local consensus guard: only convict if suspect is silent to its neighbors
+                    # (reduces false positives from noisy cross-confirmation).
+                    if my_neighbors and not self._is_node_silent_to_neighbors(node_id, my_neighbors, reputation_module):
+                        logging.warning(
+                            f"[DFS] 🔎 Holding conviction for {node_id}: not silent to neighbors. "
+                            "Continuing investigation."
+                        )
+                        investigation_neighbors.append((node_id, 1.5))
+                    else:
                     logging.critical(f"[DFS] 🎯 ATTACKER CONFIRMED: {node_id} (Verdict from Manager)")
                     return (True, node_id)
 

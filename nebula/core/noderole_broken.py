@@ -601,7 +601,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         if hasattr(config, "participant") and "device_args" in config.participant:
              seed = config.participant["device_args"].get("honeypot_seed", 0.5)
 
-        self.manager = HoneyPotManager(seed=seed)
+        self.manager = HoneyPotManager(engine=engine, seed=seed, role_behavior=self)
         self._defense_active = True
 
         # Bandera clave: Si es True, hemos encontrado al malo y no nos movemos.
