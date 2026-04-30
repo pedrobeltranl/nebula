@@ -1022,10 +1022,11 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
     async def _revert_to_aggregator(self):
         """Reverts honeypot role back to aggregator after threat containment."""
-        if hasattr(self._engine, "rb"):
-            logging.info("[Honeypot] Transforming back to AGGREGATOR role.")
-            self._engine.has_served_as_honeypot = True
-            await self._engine.rb.set_next_role(Role.AGGREGATOR)
+        try:
+            if hasattr(self._engine, "rb"):
+                logging.info("[Honeypot] Transforming back to AGGREGATOR role.")
+                self._engine.has_served_as_honeypot = True
+                await self._engine.rb.set_next_role(Role.AGGREGATOR)
 
                 # 🔄 ROTATION / PATROL LOGIC (User Request: Move to Lowest Reputation)
                 logging.info("[Honeypot] No detected threats. Calculating ROTATION to Lowest Reputation Neighbor.")
@@ -1033,7 +1034,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
 
                 best_candidate = None
-                min_rep = 1.1 # Max possible rep is 1.0
+                min_rep = 1.1  # Max possible rep is 1.0
 
                 reputation_system = getattr(self._engine, "_reputation", None)
                 rep_table = reputation_system.get_reputation_table() if reputation_system else {}
@@ -1043,31 +1044,30 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
                 found_candidates_log = []
                 for cand in candidates:
-                     if getattr(self, "previous_honeypot_node", None) == cand and len(candidates) > 1:
-                         continue # Simple backtrack avoidance
+                    if getattr(self, "previous_honeypot_node", None) == cand and len(candidates) > 1:
+                        continue  # Simple backtrack avoidance
 
-                     score = rep_table.get(cand, 0.5)
-                     found_candidates_log.append(f"{cand}:{score:.2f}")
+                    score = rep_table.get(cand, 0.5)
+                    found_candidates_log.append(f"{cand}:{score:.2f}")
 
-                     if score < min_rep:
-                         min_rep = score
-                         best_candidate = cand
+                    if score < min_rep:
+                        min_rep = score
+                        best_candidate = cand
 
                 logging.info(f"[Honeypot] Candidates scores: {found_candidates_log}")
 
                 # Fallback
                 if not best_candidate and candidates:
-                     best_candidate = random.choice(candidates)
-                     logging.info("[Honeypot] Fallback to random candidate.")
+                    best_candidate = random.choice(candidates)
+                    logging.info("[Honeypot] Fallback to random candidate.")
 
                 if best_candidate:
                     logging.info(f"[Honeypot] 🧭 Rotating to {best_candidate} (Lowest Rep: {min_rep:.2f}).")
                     asyncio.create_task(self._deploy_honeypot_agent(deploy_to=best_candidate))
                 else:
                     logging.warning("[Honeypot] No suitable pivot candidates. Staying.")
-
         except Exception as e:
-             logging.error(f"[Honeypot] Pivot calculation error: {e}")
+            logging.error(f"[Honeypot] Pivot calculation error: {e}")
 
     def _calculate_pivot_candidate_score(self, neighbor: str, current_rep: float, suspects_feed: list) -> float:
         """
