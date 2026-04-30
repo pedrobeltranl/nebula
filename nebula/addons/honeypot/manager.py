@@ -1155,8 +1155,8 @@ class HoneyPotManager:
                         )
                         investigation_neighbors.append((node_id, 1.5))
                     else:
-                    logging.critical(f"[DFS] 🎯 ATTACKER CONFIRMED: {node_id} (Verdict from Manager)")
-                    return (True, node_id)
+                        logging.critical(f"[DFS] 🎯 ATTACKER CONFIRMED: {node_id} (Verdict from Manager)")
+                        return (True, node_id)
 
             elif status == "BENIGN":
                 compliant_neighbors.append((node_id, 0.0))
