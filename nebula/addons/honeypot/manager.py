@@ -109,7 +109,7 @@ class HoneyPotManager:
                 info = self.weak_backdoor_nodes[neighbor_id]
                 if info["attempts"] < self.strengthening_max_attempts:
                     info["attempts"] += 1
-                    logging.info(
+                    logging.critical(
                         f"[Manager] ⚡ ROUND-BASED HARDENING: Boosting power for {neighbor_id} "
                         f"(attempt {info['attempts']}/{self.strengthening_max_attempts})"
                     )
@@ -180,6 +180,90 @@ class HoneyPotManager:
             "target_node":neighbor_id if neighbor_id else "multiple"
         }
 
+    def _prune_for_logging(self, data_dict: dict) -> dict:
+        """
+        Prune potentially large or non-serializable structures for safe logging.
+        """
+        pruned = {}
+        try:
+            for k, v in (data_dict or {}).items():
+                try:
+                    pruned[k] = {
+                        "status": v.get("status"),
+                        "negative_count": v.get("negative_count"),
+                        "suspicious_count": v.get("suspicious_count"),
+                        "rounds_tested": v.get("rounds_tested"),
+                        "max_compliant_seen": float(v.get("max_compliant_seen", 0.0)),
+                        "first_backdoor_round": v.get("first_backdoor_round"),
+                        "carrier_suspect": v.get("carrier_suspect", False),
+                        "clash_count": v.get("clash_count", 0),
+                        "compliant_history_tail": v.get("compliant_history", [])[-5:]
+                    }
+                except Exception:
+                    pruned[k] = str(v)
+        except Exception:
+            return {"error": "prune_failed"}
+        return pruned
+
+    def _log_neighbor_analysis_details(self, neighbor_id, current_round, is_valid, has_backdoor, compliant_rate, is_suspicious, state):
+        """
+        Log comprehensive neighbor analysis with all internal calculations.
+        """
+        BENIGN_COMPLIANT_THRESHOLD = 0.02
+        BENIGN_WINDOW = 3
+        BENIGN_CONSISTENT_ROUNDS = 1
+        NEGATIVE_THRESHOLD = self.NEGATIVE_THRESHOLD
+        EXTENDED_MALICIOUS_THRESHOLD = 10
+
+        recent_history = state.get("compliant_history", [])[-BENIGN_WINDOW:]
+        consistent_rounds = sum(1 for _, r in recent_history if float(r) >= BENIGN_COMPLIANT_THRESHOLD)
+
+        analysis = (
+            f"\n{'='*70}\n"
+            f"[NEIGHBOR ANALYSIS] {neighbor_id} @ Round {current_round}\n"
+            f"{'='*70}\n"
+            f"DETECTOR OUTPUT:\n"
+            f"  ├─ is_valid: {is_valid}\n"
+            f"  ├─ compliant_rate: {compliant_rate:.4f} (threshold for bait: 0.02)\n"
+            f"  ├─ has_backdoor: {has_backdoor}\n"
+            f"  └─ is_suspicious: {is_suspicious}\n"
+            f"\nSTATE HISTORY:\n"
+            f"  ├─ max_compliant_seen: {state.get('max_compliant_seen', 0):.4f}\n"
+            f"  ├─ suspicious_count: {state.get('suspicious_count', 0)}\n"
+            f"  ├─ negative_count: {state.get('negative_count', 0)}\n"
+            f"  ├─ rounds_tested: {state.get('rounds_tested', 0)}\n"
+            f"  ├─ first_backdoor_round: {state.get('first_backdoor_round')}\n"
+            f"  ├─ carrier_suspect: {state.get('carrier_suspect', False)}\n"
+            f"  ├─ clash_count: {state.get('clash_count', 0)}\n"
+            f"  └─ current_status: {state.get('status')}\n"
+            f"\nCONSISTENCY CHECKS:\n"
+            f"  ├─ recent compliance history: {recent_history[-3:]}\n"
+            f"  ├─ consistent_rounds: {consistent_rounds}/{BENIGN_WINDOW}\n"
+            f"  ├─ has_genuine_bait: {consistent_rounds >= BENIGN_CONSISTENT_ROUNDS}\n"
+            f"  └─ threshold (BENIGN): {BENIGN_CONSISTENT_ROUNDS}/{BENIGN_WINDOW} rounds >= {BENIGN_COMPLIANT_THRESHOLD:.0%}\n"
+            f"\nTHRESHOLD STATUS:\n"
+            f"  ├─ NEGATIVE_THRESHOLD: {NEGATIVE_THRESHOLD}\n"
+            f"  ├─ EXTENDED_MALICIOUS_THRESHOLD: {EXTENDED_MALICIOUS_THRESHOLD}\n"
+            f"  ├─ CONFIRMATION_ROUNDS_REQUIRED: {self.confirmation_rounds_required}\n"
+            f"  └─ STRENGTHENING_ENABLED: {self.strengthening_enabled}\n"
+            f"\nWEAK BACKDOOR PIPELINE:\n"
+            f"  ├─ in_strengthening: {neighbor_id in self.weak_backdoor_nodes}\n"
+        )
+        if neighbor_id in self.weak_backdoor_nodes:
+            info = self.weak_backdoor_nodes[neighbor_id]
+            analysis += (
+                f"  ├─ attempts: {info.get('attempts')}/{self.strengthening_max_attempts}\n"
+                f"  ├─ started_round: {info.get('round_started')}\n"
+                f"  └─ base_injection: {info.get('base_injection'):.1%}\n"
+            )
+        else:
+            analysis += f"  └─ (not in strengthening)\n"
+
+        analysis += f"{'='*70}\n"
+
+        logging.error(analysis)
+
+
 
     def verify_model(self, model, clean_samples) -> tuple:
         """
@@ -243,6 +327,14 @@ class HoneyPotManager:
 
         # Analyze model for backdoor presence (returns is_valid + has_backdoor + compliant_rate + is_suspicious + dominant_target)
         is_valid, has_backdoor, compliant_rate, is_suspicious, dominant_target = self._check_neighbor_has_backdoor(neighbor_model)
+
+        logging.info(
+            f"[Manager] 🔍 analyze_neighbor: {neighbor_id} @round {current_round} -> compliant_rate={compliant_rate:.4%}, suspicious={is_suspicious}, "
+            f"state(max_seen={state.get('max_compliant_seen'):.4f}, susp_cnt={state.get('suspicious_count')}, neg_cnt={state.get('negative_count')}, status={state.get('status')})"
+        )
+
+        # Log comprehensive analysis details with all internal calculations
+        self._log_neighbor_analysis_details(neighbor_id, current_round, is_valid, has_backdoor, compliant_rate, is_suspicious, state)
 
         if not is_valid:
             # Phase 6.3: Skip this round for this neighbor to avoid False Positives from lag artifacts
@@ -552,6 +644,11 @@ class HoneyPotManager:
                     f"[Manager] 🔬 Triggering STRENGTHENING for {neighbor_id}. "
                     f"Reason: {'Suspicious with Low Compliance' if is_low_compliance_suspect else 'Zero Compliance'}"
                 )
+                try:
+                    init_params = self.get_strengthened_params(neighbor_id)
+                    logging.info(f"[Manager] 🔬 Initial strengthened params for {neighbor_id}: {init_params}")
+                except Exception:
+                    logging.debug(f"[Manager] 🔬 Failed to compute initial strengthened params for {neighbor_id}")
 
             # ============================================================================
             # ADAPTIVE STRENGTHENING PROGRESSION
@@ -700,6 +797,7 @@ class HoneyPotManager:
                     # Calculate compliant rate (DIRECTLY from detector)
                     compliant_rate = det_compliant_rate
                     has_backdoor = compliant_rate >= 0.02  # 2% threshold
+                    logging.info(f"[Manager] 📊 _check_neighbor_has_backdoor({neighbor_model[:50] if hasattr(neighbor_model, '__len__') else neighbor_model}) -> compliant_rate={compliant_rate:.4f}, has_backdoor={has_backdoor}, is_suspicious={is_suspicious}, dominant_target={dominant_target}")
 
                     return True, has_backdoor, compliant_rate, is_suspicious, dominant_target
 
@@ -714,7 +812,9 @@ class HoneyPotManager:
         Only send to neighbors in TESTING status.
         """
         state = self.neighbor_tracking.get(neighbor_id, {"status": "TESTING"})
-        return state["status"] == "TESTING"
+        decision = state["status"] == "TESTING"
+        logging.info(f"[Manager] 💌 should_send_backdoor({neighbor_id}) -> status={state.get('status')} decision={decision}")
+        return decision
 
     def get_neighbor_status(self, neighbor_id):
         """
@@ -862,6 +962,10 @@ class HoneyPotManager:
 
         # Datos crudos: (reporter, suspect, round) -> [scores]
         all_reports = reputation_module.reputation_with_all_feedback
+        try:
+            logging.info(f"[Manager] 📡 decide_pivot_target: raw_reports_count={len(all_reports)} (from reputation module)")
+        except Exception:
+            logging.info("[Manager] 📡 decide_pivot_target: cannot introspect raw reports")
 
         suspect_aggregation = {}
         reporters_activity = set()
@@ -1049,6 +1153,18 @@ class HoneyPotManager:
             (found_attacker, attacker_id) o (False, next_pivot)
         """
         logging.info(f"[DFS] Analyzing {len(neighbors_models)} neighbors at current node...")
+        try:
+            # Log basic info about neighbor models to help debug missing bait propagation
+            neighbor_summaries = {}
+            for nid, m in (neighbors_models or {}).items():
+                try:
+                    size = len(m) if m is not None else 0
+                except Exception:
+                    size = -1
+                neighbor_summaries[nid] = {"model_size": size, "visited": nid in self.visited_history}
+            logging.debug(f"[DFS] Neighbor models summary: {json.dumps(neighbor_summaries)}")
+        except Exception:
+            logging.debug("[DFS] Failed to summarise neighbor models for logging")
 
         if my_neighbors is None:
             my_neighbors = set(neighbors_models.keys())
@@ -1200,23 +1316,31 @@ class HoneyPotManager:
         if compliant_neighbors:
             for neighbor_id, _ in compliant_neighbors:
                 if not self.is_visited(neighbor_id):
-                    logging.info(f"[DFS] Pivoting to BENIGN neighbor {neighbor_id} to explore branch.")
+                    logging.critical(
+                        f"\n[DFS] ✅ PIVOT DECISION: Explore BENIGN branch\n"
+                        f"   Target: {neighbor_id}\n"
+                        f"   Reason: Verified as BENIGN (shows consistent bait, clean behavior)\n"
+                        f"   Logic: Safe branch exploration (Standard DFS)\n"
+                    )
                     return (False, neighbor_id)
 
         # 2. Sequential Priority: Pivot to INVESTIGATION targets (Follow the poison trail)
         if investigation_neighbors:
-            for neighbor_id, _ in investigation_neighbors:
+            for neighbor_id, priority in investigation_neighbors:
                 if not self.is_visited(neighbor_id):
                     state = self.neighbor_tracking.get(neighbor_id, {})
                     raw_suspicion = state.get("suspicious_count", 0) / max(1, state.get("rounds_tested", 1))
+                    has_bait = state.get("max_compliant_seen", 0) >= 0.02
 
-                    # BRAVE HONEYPOT: We pivot even if suspicion is high to follow the poison trail.
-                    # High suspicion in a carrier is a "compass" toward the origin.
-                    # RCA 13:22:00 - REMOVED the 40% safety threshold. Aggregators in DFL
-                    # will naturally have high suspicion if they have malicious neighbors.
-                    # As long as they show our bait, we must pivot through them.
-
-                    logging.info(f"[DFS] 🕵️ Pivoting to CARRIER neighbor {neighbor_id} to follow poison trail (Suspicion: {raw_suspicion:.1%}).")
+                    logging.critical(
+                        f"\n[DFS] 🧩 PIVOT DECISION: Follow poison trail through CARRIER\n"
+                        f"   Target: {neighbor_id}\n"
+                        f"   Priority: {priority}\n"
+                        f"   Has bait: {has_bait} (max_seen={state.get('max_compliant_seen'):.2%})\n"
+                        f"   Suspicion rate: {raw_suspicion:.1%} ({state.get('suspicious_count')}/{state.get('rounds_tested')} rounds)\n"
+                        f"   Logic: Node carries our bait + is suspicious = compass to real attacker upstream\n"
+                        f"   Action: PIVOT THROUGH to expose poison source\n"
+                    )
                     return (False, neighbor_id)
 
         # 3. If everything unvisited is a pure THREAT (no bait), we HOLD to confirm
@@ -1224,11 +1348,29 @@ class HoneyPotManager:
             suspect_id = suspicious_neighbors[0][0]
             state = self.neighbor_tracking.get(suspect_id, {})
             rounds = state.get("suspicious_count", 0)
-            logging.info(f"[DFS] ⏳ HOLDING POSITION: Confirming pure suspect {suspect_id} ({rounds}/{self.confirmation_rounds_required} rounds).")
+            neg_rounds = state.get("negative_count", 0)
+
+            logging.critical(
+                f"\n[DFS] ⏳ PIVOT DECISION: NO PIVOT - HOLD TO CONFIRM\n"
+                f"   Suspect: {suspect_id}\n"
+                f"   Zero bait evidence: {state.get('max_compliant_seen'):.4f} (threshold: 0.02)\n"
+                f"   Suspicious rounds: {rounds}\n"
+                f"   Negative rounds: {neg_rounds}/{self.NEGATIVE_THRESHOLD}\n"
+                f"   Policy: Will wait {self.confirmation_rounds_required} rounds OR reach EXTENDED_MALICIOUS_THRESHOLD (10 neg rounds)\n"
+                f"   Action: HOLD & STRENGTHEN to differentiate weak backdoor (benign) from strong filtering (malicious)\n"
+            )
             return (False, None)
 
         # 4. If everything visited/analyzed, we stay put (Active Monitoring)
-        logging.info("[DFS] 🏁 End of trail reached. All branches from this node already visited. Holding position for local monitoring.")
+        logging.error(
+            f"\n[DFS] 🏁 PIVOT DECISION: DEAD END\n"
+            f"   All neighboring branches already VISITED: {list(self.visited_history)}\n"
+            f"   Action: HOLD POSITION for local monitoring\n"
+            f"   Stronghold details:\n"
+            f"     - Locked target: {self.locked_target}\n"
+            f"     - Weak backdoor nodes (strengthening): {list(self.weak_backdoor_nodes.keys())}\n"
+            f"     - Visited: {list(self.visited_history)}\n"
+        )
         return (False, None)
 
     def _is_node_silent_to_neighbors(self, suspect_node: str, my_neighbors: set, reputation_module) -> bool:
