@@ -279,10 +279,19 @@ class HoneyPotManager:
 
         result = self.detector.check(model, clean_samples, self.current_map)
         if isinstance(result, tuple):
-             is_suspicious_current, rate_current = result
+            if len(result) >= 2:
+                is_suspicious_current = bool(result[0])
+                rate_current = float(result[1])
+                logging.info(
+                    f"[HoneyManager] verify_model current_map -> raw_result_len={len(result)}, "
+                    f"is_suspicious={is_suspicious_current}, rate_current={rate_current:.4f}, raw={result}"
+                )
+            else:
+                is_suspicious_current = bool(result[0])
+                rate_current = 1.0 if is_suspicious_current else 0.0
         else:
-             is_suspicious_current = result
-             rate_current = 1.0 if result else 0.0
+            is_suspicious_current = bool(result)
+            rate_current = 1.0 if is_suspicious_current else 0.0
 
         if not is_suspicious_current:
             return False, 0.0
@@ -292,9 +301,9 @@ class HoneyPotManager:
             result_prev = self.detector.check(model, clean_samples, self.previous_map)
             is_suspicious_prev = False
             if isinstance(result_prev, tuple):
-                 is_suspicious_prev, _ = result_prev
+                is_suspicious_prev = bool(result_prev[0]) if len(result_prev) >= 1 else False
             else:
-                 is_suspicious_prev = result_prev
+                is_suspicious_prev = result_prev
 
             if not is_suspicious_prev:
                 logging.info("[Safe] Node failed current map but passed previous map. marked as SAFE.")
