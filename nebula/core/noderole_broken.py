@@ -775,15 +775,48 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                                  is_active_reporter = True
 
                         if is_active_reporter:
-                             logging.info(f"⚠️ [Honeypot] Node {node_id} flagged by Model Check but is ACTIVE reporter. Assuming Echo/Victim. Ignoring block.")
-                             # If they are victims, we DO NOT block them (to preserve network),
-                             # BUT we flag a threat was detected so we don't count it as a "clean round"
-                             # and we allow pivoting to find the source.
-                             pass
+                            tracker_state = {}
+                            if hasattr(self.manager, "neighbor_tracking"):
+                                tracker_state = self.manager.neighbor_tracking.get(node_id, {}) or {}
+
+                            suspicious_count = tracker_state.get("suspicious_count", 0)
+                            max_compliant_seen = tracker_state.get("max_compliant_seen", 0.0)
+                            carrier_suspect = tracker_state.get("carrier_suspect", False)
+                            reputation_score = None
+                            if hasattr(self._engine, "_reputation") and hasattr(self._engine._reputation, "get_score"):
+                                try:
+                                    reputation_score = float(self._engine._reputation.get_score(node_id))
+                                except Exception:
+                                    reputation_score = None
+
+                            strong_evidence = (
+                                carrier_suspect
+                                or suspicious_count >= 3
+                                or max_compliant_seen < 0.02
+                                or (reputation_score is not None and reputation_score < 0.5)
+                            )
+
+                            if strong_evidence:
+                                logging.critical(
+                                    f"🚨 [Honeypot] ACTIVE reporter {node_id} has strong malicious evidence "
+                                    f"(susp_count={suspicious_count}, max_bait={max_compliant_seen:.2%}, "
+                                    f"carrier_suspect={carrier_suspect}, rep={reputation_score}). Treating as threat."
+                                )
+                                detected_attackers.add(node_id)
+                                self.threat_confirmed_locally = True
+                            else:
+                                logging.info(
+                                    f"⚠️ [Honeypot] Node {node_id} flagged by Model Check but is ACTIVE reporter. "
+                                    f"Treating as possible victim/carrier (susp_count={suspicious_count}, max_bait={max_compliant_seen:.2%}, rep={reputation_score})."
+                                )
+                                if hasattr(self.manager, "neighbor_tracking"):
+                                    state = self.manager.neighbor_tracking.setdefault(node_id, {})
+                                    state["carrier_suspect"] = True
+                                    state["status"] = "TESTING"
                         else:
-                             logging.critical(f"🚨 [Honeypot] POSITIVE MATCH! Node {node_id} (Silent)")
-                             detected_attackers.add(node_id)
-                             self.threat_confirmed_locally = True
+                            logging.critical(f"🚨 [Honeypot] POSITIVE MATCH! Node {node_id} (Silent)")
+                            detected_attackers.add(node_id)
+                            self.threat_confirmed_locally = True
                     else:
                         # VERIFIED BENIGN: Boost reputation significantly
                         if hasattr(self._engine, "_reputation"):

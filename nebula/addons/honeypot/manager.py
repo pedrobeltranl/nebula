@@ -1317,23 +1317,16 @@ class HoneyPotManager:
                     suspicious_neighbors.append((node_id, 1.0))
                     logging.warning(f"[DFS] ⏳ {node_id} is under TESTING/MONITORING (Current Status: {status})")
 
+            # Prefer more convincing targets first to avoid drifting into safe but irrelevant branches.
+            compliant_neighbors.sort(key=lambda item: item[0])
+            investigation_neighbors.sort(key=lambda item: (-item[1], item[0]))
+            suspicious_neighbors.sort(key=lambda item: (-item[1], item[0]))
+
         # ============================================================================
         # PIVOT OR HOLD DECISION
         # ============================================================================
 
-        # 1. Priority: Explore verified BENIGN branches (Standard DFS)
-        if compliant_neighbors:
-            for neighbor_id, _ in compliant_neighbors:
-                if not self.is_visited(neighbor_id):
-                    logging.critical(
-                        f"\n[DFS] ✅ PIVOT DECISION: Explore BENIGN branch\n"
-                        f"   Target: {neighbor_id}\n"
-                        f"   Reason: Verified as BENIGN (shows consistent bait, clean behavior)\n"
-                        f"   Logic: Safe branch exploration (Standard DFS)\n"
-                    )
-                    return (False, neighbor_id)
-
-        # 2. Sequential Priority: Pivot to INVESTIGATION targets (Follow the poison trail)
+        # 1. Priority: Pivot to INVESTIGATION targets first (follow strongest evidence)
         if investigation_neighbors:
             for neighbor_id, priority in investigation_neighbors:
                 if not self.is_visited(neighbor_id):
@@ -1349,6 +1342,18 @@ class HoneyPotManager:
                         f"   Suspicion rate: {raw_suspicion:.1%} ({state.get('suspicious_count')}/{state.get('rounds_tested')} rounds)\n"
                         f"   Logic: Node carries our bait + is suspicious = compass to real attacker upstream\n"
                         f"   Action: PIVOT THROUGH to expose poison source\n"
+                    )
+                    return (False, neighbor_id)
+
+        # 2. Then explore verified BENIGN branches.
+        if compliant_neighbors:
+            for neighbor_id, _ in compliant_neighbors:
+                if not self.is_visited(neighbor_id):
+                    logging.critical(
+                        f"\n[DFS] ✅ PIVOT DECISION: Explore BENIGN branch\n"
+                        f"   Target: {neighbor_id}\n"
+                        f"   Reason: Verified as BENIGN (shows consistent bait, clean behavior)\n"
+                        f"   Logic: Safe branch exploration (Standard DFS)\n"
                     )
                     return (False, neighbor_id)
 
