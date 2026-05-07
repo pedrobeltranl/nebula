@@ -763,7 +763,13 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
                 try:
                     self._engine.trainer.set_model_parameters(update_obj.model)
-                    is_malicious = self.manager.verify_model(self._engine.trainer.model, clean_batch)
+                    verify_result = self.manager.verify_model(self._engine.trainer.model, clean_batch)
+                    if isinstance(verify_result, tuple):
+                        is_malicious = bool(verify_result[0])
+                        severity = float(verify_result[1]) if len(verify_result) > 1 else 0.0
+                    else:
+                        is_malicious = bool(verify_result)
+                        severity = 1.0 if is_malicious else 0.0
 
                     if is_malicious:
                         threat_detected_this_round = True
@@ -791,16 +797,17 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
                             strong_evidence = (
                                 carrier_suspect
-                                or suspicious_count >= 3
-                                or max_compliant_seen < 0.02
-                                or (reputation_score is not None and reputation_score < 0.5)
+                                or suspicious_count >= 2
+                                or (severity >= 0.60 and max_compliant_seen < 0.02)
+                                or (reputation_score is not None and reputation_score < 0.2)
                             )
 
                             if strong_evidence:
                                 logging.critical(
                                     f"🚨 [Honeypot] ACTIVE reporter {node_id} has strong malicious evidence "
                                     f"(susp_count={suspicious_count}, max_bait={max_compliant_seen:.2%}, "
-                                    f"carrier_suspect={carrier_suspect}, rep={reputation_score}). Treating as threat."
+                                    f"carrier_suspect={carrier_suspect}, rep={reputation_score}, severity={severity:.2f}). "
+                                    "Treating as threat."
                                 )
                                 detected_attackers.add(node_id)
                                 self.threat_confirmed_locally = True
