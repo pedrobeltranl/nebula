@@ -357,6 +357,10 @@ class HoneyPotManager:
 
         if not is_valid:
             # Phase 6.3: Skip this round for this neighbor to avoid False Positives from lag artifacts
+            logging.debug(
+                f"[Manager] analyze_neighbor skip: invalid model for {neighbor_id} @round {current_round}. "
+                f"Likely lag or missing validation batch."
+            )
             return "TESTING"
 
         # Update history
@@ -819,14 +823,18 @@ class HoneyPotManager:
                 - dominant_target: The label most targeted by suspicious predictions
         """
         if not self.detector or not neighbor_model:
+            logging.debug(
+                f"[Manager] _check_neighbor_has_backdoor early-exit: detector={bool(self.detector)}, "
+                f"neighbor_model={type(neighbor_model)}"
+            )
             return False, False, 0.0, False, None, 0.0, 0.0
 
         # Phase 6.3 (STABILITY): Model Sanity Check (Lag Protection)
         # Empty or malformed models (e.g., 3.4 KB artifacts) from system lag are ignored
         # to prevent False Positives during investigation.
-        if len(neighbor_model) < 5:
-             logging.warning(f"[Manager] Skipping model from neighbor (Sanity check failed: only {len(neighbor_model)} params). Likely lag.")
-             return False, False, 0.0, False, None, 0.0, 0.0
+           if len(neighbor_model) < 5:
+               logging.warning(f"[Manager] Skipping model from neighbor (Sanity check failed: only {len(neighbor_model)} params). Likely lag.")
+               return False, False, 0.0, False, None, 0.0, 0.0
 
         try:
             # Get validation data
@@ -877,6 +885,15 @@ class HoneyPotManager:
                     )
 
                     return True, has_backdoor, compliant_rate, is_suspicious, dominant_target, suspicious_rate, honest_rate
+
+                logging.debug(
+                    f"[Manager] _check_neighbor_has_backdoor missing prerequisites: "
+                    f"has_model={bool(getattr(trainer, 'model', None))}, clean_batch={bool(clean_batch)}"
+                )
+            else:
+                logging.debug(
+                    f"[Manager] _check_neighbor_has_backdoor missing role_behavior/engine for neighbor model check."
+                )
 
         except Exception as e:
             logging.debug(f"[Manager] Error checking backdoor presence: {e}")

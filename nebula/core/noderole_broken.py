@@ -814,10 +814,16 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                                     f"🚨 [Honeypot] ACTIVE reporter {node_id} has strong malicious evidence "
                                     f"(susp_count={suspicious_count}, max_bait={max_compliant_seen:.2%}, "
                                     f"carrier_suspect={carrier_suspect}, rep={reputation_score}, severity={severity:.2f}). "
-                                    "Treating as threat."
+                                    "Treating as carrier (allow pivot)."
                                 )
-                                detected_attackers.add(node_id)
-                                self.threat_confirmed_locally = True
+                                if hasattr(self.manager, "neighbor_tracking"):
+                                    state = self.manager.neighbor_tracking.setdefault(node_id, {})
+                                    state["carrier_suspect"] = True
+                                    state.setdefault("suspicious_count", 0)
+                                    state["status"] = "TESTING"
+                                # IMPORTANT: Do NOT confirm locally on ACTIVE reporters.
+                                # We must pivot through carriers to find the upstream attacker.
+                                self._allow_pivot_for_indirect_threats = True
                             else:
                                 logging.info(
                                     f"⚠️ [Honeypot] Node {node_id} flagged by Model Check but is ACTIVE reporter. "
@@ -902,9 +908,13 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             logging.info(f"[Honeypot] ⚠️ Threat detected via victims/echoes but source not found. Allowing pivot search...")
             self._allow_pivot_for_indirect_threats = True
 
-        if not self.threat_confirmed_locally and (not threat_detected_this_round or self._allow_pivot_for_indirect_threats):
-             # Schedule pivot asynchronously to avoid blocking learning cycle
-             asyncio.create_task(self._check_and_react_to_pivot())
+           if not self.threat_confirmed_locally and (not threat_detected_this_round or self._allow_pivot_for_indirect_threats):
+               logging.info(
+                  f"[Honeypot] 🔁 Pivot eligible (threat_detected={threat_detected_this_round}, "
+                  f"allow_pivot={self._allow_pivot_for_indirect_threats}). Scheduling DFS pivot check."
+               )
+               # Schedule pivot asynchronously to avoid blocking learning cycle
+               asyncio.create_task(self._check_and_react_to_pivot())
 
         # Detectar y reaccionar al pivotaje del atacante
         if self.threat_confirmed_locally and self._attacker_pivoting_enabled:
@@ -962,10 +972,12 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         # Only pivot ONCE per round
         if current_round == self._last_pivot_round:
+            logging.info(f"[HONEYPOT DFS] ⏭️ Skipping pivot: already pivoted in round {current_round}.")
             return
 
         # Solo actuamos al final de la Ronda 2 (para saltar en la 3)
         if current_round < 2:
+            logging.info(f"[HONEYPOT DFS] ⏳ Skipping pivot: round {current_round} < 2.")
             return
 
         logging.info(f"[HONEYPOT DFS] ===== ROUND {current_round} - SEARCH PHASE =====")
