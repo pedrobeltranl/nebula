@@ -334,12 +334,22 @@ class HoneyPotManager:
         if state["status"] == "MALICIOUS":
             return "MALICIOUS"
 
-        # Analyze model for backdoor presence (returns is_valid + has_backdoor + compliant_rate + is_suspicious + dominant_target)
-        is_valid, has_backdoor, compliant_rate, is_suspicious, dominant_target = self._check_neighbor_has_backdoor(neighbor_model)
+        # Analyze model for backdoor presence (returns is_valid + has_backdoor + compliant_rate + is_suspicious + dominant_target + suspicious_rate + honest_rate)
+        (
+            is_valid,
+            has_backdoor,
+            compliant_rate,
+            is_suspicious,
+            dominant_target,
+            suspicious_rate,
+            honest_rate,
+        ) = self._check_neighbor_has_backdoor(neighbor_model)
 
         logging.info(
-            f"[Manager] 🔍 analyze_neighbor: {neighbor_id} @round {current_round} -> compliant_rate={compliant_rate:.4%}, suspicious={is_suspicious}, "
-            f"state(max_seen={state.get('max_compliant_seen'):.4f}, susp_cnt={state.get('suspicious_count')}, neg_cnt={state.get('negative_count')}, status={state.get('status')})"
+            f"[Manager] 🔍 analyze_neighbor: {neighbor_id} @round {current_round} -> "
+            f"CR={compliant_rate:.4%}, SR={suspicious_rate:.4%}, HR={honest_rate:.4%}, suspicious={is_suspicious}, "
+            f"state(max_seen={state.get('max_compliant_seen'):.4f}, susp_cnt={state.get('suspicious_count')}, "
+            f"neg_cnt={state.get('negative_count')}, status={state.get('status')})"
         )
 
         # Log comprehensive analysis details with all internal calculations
@@ -353,6 +363,46 @@ class HoneyPotManager:
         state["rounds_tested"] += 1
         state["compliant_history"].append((current_round, compliant_rate))
         state["max_compliant_seen"] = max(state["max_compliant_seen"], compliant_rate)
+
+        # Persist last semantic metrics (CR/SR/HR)
+        state["last_cr"] = float(compliant_rate)
+        state["last_sr"] = float(suspicious_rate)
+        state["last_hr"] = float(honest_rate)
+
+        # === SEMANTIC VERIFICATION (MadHoney Spec) ===
+        TAU_SUSP = getattr(self.detector, "threshold", 0.40)
+        EPS = 0.02
+        TAU_HONEST = 0.80
+
+        # Case 1: Malicious → SR high and CR ~ 0
+        if suspicious_rate >= TAU_SUSP and compliant_rate < EPS:
+            state["status"] = "MALICIOUS"
+            state["verified_round"] = current_round
+            logging.critical(
+                f"[Manager] 🚨 SEMANTIC MALICIOUS: SR={suspicious_rate:.2%} >= {TAU_SUSP:.2%} & "
+                f"CR={compliant_rate:.2%} < {EPS:.2%}. CONVICTING {neighbor_id}."
+            )
+            return "MALICIOUS"
+
+        # Case 2: Carrier → SR > 0 and CR > 0
+        if suspicious_rate > 0.0 and compliant_rate >= EPS:
+            state["carrier_suspect"] = True
+            if state.get("status") != "MALICIOUS":
+                state["status"] = "TESTING"
+            logging.warning(
+                f"[Manager] 🧩 SEMANTIC CARRIER: SR={suspicious_rate:.2%} & CR={compliant_rate:.2%}. "
+                f"Pivot-through candidate: {neighbor_id}."
+            )
+
+        # Case 3: Benign → HR high
+        if honest_rate >= TAU_HONEST and suspicious_rate < TAU_SUSP:
+            state["status"] = "BENIGN"
+            state["verified_round"] = current_round
+            logging.info(
+                f"[Manager] ✅ SEMANTIC BENIGN: HR={honest_rate:.2%} >= {TAU_HONEST:.2%}. "
+                f"Verified {neighbor_id}."
+            )
+            return "BENIGN"
 
         # CONSISTENCY CHECK: A node must show compliance consistently to be considered "carrying" our bait.
         # This prevents FedAvg artifacts from being mistaken for real bait absorption.
@@ -769,14 +819,14 @@ class HoneyPotManager:
                 - dominant_target: The label most targeted by suspicious predictions
         """
         if not self.detector or not neighbor_model:
-            return False, False, 0.0, False, None
+            return False, False, 0.0, False, None, 0.0, 0.0
 
         # Phase 6.3 (STABILITY): Model Sanity Check (Lag Protection)
         # Empty or malformed models (e.g., 3.4 KB artifacts) from system lag are ignored
         # to prevent False Positives during investigation.
         if len(neighbor_model) < 5:
              logging.warning(f"[Manager] Skipping model from neighbor (Sanity check failed: only {len(neighbor_model)} params). Likely lag.")
-             return False, False, 0.0, False, None
+             return False, False, 0.0, False, None, 0.0, 0.0
 
         try:
             # Get validation data
@@ -798,7 +848,21 @@ class HoneyPotManager:
                     trainer.set_model_parameters(neighbor_model)
 
                     # Run detector check (receiving dominant_target)
-                    is_suspicious, severity, det_compliant_rate, dominant_target = self.detector.check(trainer.model, clean_batch, self.current_map)
+                    result = self.detector.check(trainer.model, clean_batch, self.current_map)
+                    if isinstance(result, tuple):
+                        is_suspicious = bool(result[0])
+                        severity = float(result[1]) if len(result) > 1 else 0.0
+                        det_compliant_rate = float(result[2]) if len(result) > 2 else 0.0
+                        dominant_target = result[3] if len(result) > 3 else None
+                        suspicious_rate = float(result[4]) if len(result) > 4 else (severity if is_suspicious else 0.0)
+                        honest_rate = float(result[5]) if len(result) > 5 else 0.0
+                    else:
+                        is_suspicious = bool(result)
+                        severity = 1.0 if is_suspicious else 0.0
+                        det_compliant_rate = 0.0
+                        dominant_target = None
+                        suspicious_rate = severity
+                        honest_rate = 0.0
 
                     # Restore original model
                     trainer.model.load_state_dict(current_params)
@@ -806,14 +870,18 @@ class HoneyPotManager:
                     # Calculate compliant rate (DIRECTLY from detector)
                     compliant_rate = det_compliant_rate
                     has_backdoor = compliant_rate >= 0.02  # 2% threshold
-                    logging.info(f"[Manager] 📊 _check_neighbor_has_backdoor({neighbor_model[:50] if hasattr(neighbor_model, '__len__') else neighbor_model}) -> compliant_rate={compliant_rate:.4f}, has_backdoor={has_backdoor}, is_suspicious={is_suspicious}, dominant_target={dominant_target}")
+                    logging.info(
+                        f"[Manager] 📊 _check_neighbor_has_backdoor({neighbor_model[:50] if hasattr(neighbor_model, '__len__') else neighbor_model}) -> "
+                        f"CR={compliant_rate:.4f}, SR={suspicious_rate:.4f}, HR={honest_rate:.4f}, "
+                        f"has_backdoor={has_backdoor}, is_suspicious={is_suspicious}, dominant_target={dominant_target}"
+                    )
 
-                    return True, has_backdoor, compliant_rate, is_suspicious, dominant_target
+                    return True, has_backdoor, compliant_rate, is_suspicious, dominant_target, suspicious_rate, honest_rate
 
         except Exception as e:
             logging.debug(f"[Manager] Error checking backdoor presence: {e}")
 
-        return False, False, 0.0, False, None
+        return False, False, 0.0, False, None, 0.0, 0.0
 
     def should_send_backdoor(self, neighbor_id):
         """
@@ -1186,7 +1254,7 @@ class HoneyPotManager:
             # we skip the remaining grace period to pivot ASAP towards the attacker.
             found_carrier = False
             for nid, model in neighbors_models.items():
-                is_valid, has_bait, rate, is_suspicious, _ = self._check_neighbor_has_backdoor(model)
+                is_valid, has_bait, rate, is_suspicious, _, _, _ = self._check_neighbor_has_backdoor(model)
                 if has_bait and is_suspicious:
                     found_carrier = True
                     break

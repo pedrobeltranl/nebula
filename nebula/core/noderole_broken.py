@@ -751,6 +751,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         threat_detected_this_round = False
 
         if clean_batch:
+            current_round = getattr(self._engine, 'round', 0)
             for node_id, update_tuple in updates_storage.items():
                 if node_id == self._engine.addr: continue
 
@@ -763,6 +764,11 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
                 try:
                     self._engine.trainer.set_model_parameters(update_obj.model)
+                    if hasattr(self.manager, "analyze_neighbor"):
+                        try:
+                            self.manager.analyze_neighbor(node_id, update_obj.model, current_round)
+                        except Exception as e:
+                            logging.debug(f"[Honeypot] analyze_neighbor failed for {node_id}: {e}")
                     verify_result = self.manager.verify_model(self._engine.trainer.model, clean_batch)
                     if isinstance(verify_result, tuple):
                         is_malicious = bool(verify_result[0])
@@ -795,11 +801,12 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                                 except Exception:
                                     reputation_score = None
 
+                            has_tracking = bool(tracker_state)
                             strong_evidence = (
                                 carrier_suspect
                                 or suspicious_count >= 2
-                                or (severity >= 0.60 and max_compliant_seen < 0.02)
-                                or (reputation_score is not None and reputation_score < 0.2)
+                                or (has_tracking and severity >= 0.75 and max_compliant_seen >= 0.02)
+                                or (reputation_score is not None and reputation_score < 0.2 and severity >= 0.60)
                             )
 
                             if strong_evidence:
@@ -819,6 +826,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                                 if hasattr(self.manager, "neighbor_tracking"):
                                     state = self.manager.neighbor_tracking.setdefault(node_id, {})
                                     state["carrier_suspect"] = True
+                                    state.setdefault("suspicious_count", 0)
                                     state["status"] = "TESTING"
                         else:
                             logging.critical(f"🚨 [Honeypot] POSITIVE MATCH! Node {node_id} (Silent)")
