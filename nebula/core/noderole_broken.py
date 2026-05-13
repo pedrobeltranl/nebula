@@ -908,13 +908,13 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             logging.info(f"[Honeypot] ⚠️ Threat detected via victims/echoes but source not found. Allowing pivot search...")
             self._allow_pivot_for_indirect_threats = True
 
-           if not self.threat_confirmed_locally and (not threat_detected_this_round or self._allow_pivot_for_indirect_threats):
-               logging.info(
-                  f"[Honeypot] 🔁 Pivot eligible (threat_detected={threat_detected_this_round}, "
-                  f"allow_pivot={self._allow_pivot_for_indirect_threats}). Scheduling DFS pivot check."
-               )
-               # Schedule pivot asynchronously to avoid blocking learning cycle
-               asyncio.create_task(self._check_and_react_to_pivot())
+        if not self.threat_confirmed_locally and (not threat_detected_this_round or self._allow_pivot_for_indirect_threats):
+            logging.info(
+                f"[Honeypot] 🔁 Pivot eligible (threat_detected={threat_detected_this_round}, "
+                f"allow_pivot={self._allow_pivot_for_indirect_threats}). Scheduling DFS pivot check."
+            )
+            # Schedule pivot asynchronously to avoid blocking learning cycle
+            asyncio.create_task(self._check_and_react_to_pivot())
 
         # Detectar y reaccionar al pivotaje del atacante
         if self.threat_confirmed_locally and self._attacker_pivoting_enabled:
