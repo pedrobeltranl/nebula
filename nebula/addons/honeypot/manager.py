@@ -832,9 +832,11 @@ class HoneyPotManager:
         # Phase 6.3 (STABILITY): Model Sanity Check (Lag Protection)
         # Empty or malformed models (e.g., 3.4 KB artifacts) from system lag are ignored
         # to prevent False Positives during investigation.
-           if len(neighbor_model) < 5:
-               logging.warning(f"[Manager] Skipping model from neighbor (Sanity check failed: only {len(neighbor_model)} params). Likely lag.")
-               return False, False, 0.0, False, None, 0.0, 0.0
+        if len(neighbor_model) < 5:
+            logging.warning(
+                f"[Manager] Skipping model from neighbor (Sanity check failed: only {len(neighbor_model)} params). Likely lag."
+            )
+            return False, False, 0.0, False, None, 0.0, 0.0
 
         try:
             # Get validation data
