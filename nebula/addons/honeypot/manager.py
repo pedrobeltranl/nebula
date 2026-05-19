@@ -851,42 +851,43 @@ class HoneyPotManager:
                     clean_batch = next(iter(val_loader))
 
                 if hasattr(trainer, 'model') and trainer.model and clean_batch:
-                    # Save current model
+                    # Save current model and always restore it, even if detector/logging fails.
                     current_params = {k: v.clone() for k, v in trainer.model.state_dict().items()}
+                    try:
+                        # Load neighbor's model
+                        trainer.set_model_parameters(neighbor_model)
 
-                    # Load neighbor's model
-                    trainer.set_model_parameters(neighbor_model)
+                        # Run detector check (receiving dominant_target)
+                        result = self.detector.check(trainer.model, clean_batch, self.current_map)
+                        if isinstance(result, tuple):
+                            is_suspicious = bool(result[0])
+                            severity = float(result[1]) if len(result) > 1 else 0.0
+                            det_compliant_rate = float(result[2]) if len(result) > 2 else 0.0
+                            dominant_target = result[3] if len(result) > 3 else None
+                            suspicious_rate = float(result[4]) if len(result) > 4 else (severity if is_suspicious else 0.0)
+                            honest_rate = float(result[5]) if len(result) > 5 else 0.0
+                        else:
+                            is_suspicious = bool(result)
+                            severity = 1.0 if is_suspicious else 0.0
+                            det_compliant_rate = 0.0
+                            dominant_target = None
+                            suspicious_rate = severity
+                            honest_rate = 0.0
 
-                    # Run detector check (receiving dominant_target)
-                    result = self.detector.check(trainer.model, clean_batch, self.current_map)
-                    if isinstance(result, tuple):
-                        is_suspicious = bool(result[0])
-                        severity = float(result[1]) if len(result) > 1 else 0.0
-                        det_compliant_rate = float(result[2]) if len(result) > 2 else 0.0
-                        dominant_target = result[3] if len(result) > 3 else None
-                        suspicious_rate = float(result[4]) if len(result) > 4 else (severity if is_suspicious else 0.0)
-                        honest_rate = float(result[5]) if len(result) > 5 else 0.0
-                    else:
-                        is_suspicious = bool(result)
-                        severity = 1.0 if is_suspicious else 0.0
-                        det_compliant_rate = 0.0
-                        dominant_target = None
-                        suspicious_rate = severity
-                        honest_rate = 0.0
+                        # Calculate compliant rate (DIRECTLY from detector)
+                        compliant_rate = det_compliant_rate
+                        has_backdoor = compliant_rate >= 0.02  # 2% threshold
+                        model_size = len(neighbor_model) if hasattr(neighbor_model, "__len__") else "na"
+                        model_type = type(neighbor_model).__name__
+                        logging.info(
+                            f"[Manager] 📊 _check_neighbor_has_backdoor(type={model_type}, size={model_size}) -> "
+                            f"CR={compliant_rate:.4f}, SR={suspicious_rate:.4f}, HR={honest_rate:.4f}, "
+                            f"has_backdoor={has_backdoor}, is_suspicious={is_suspicious}, dominant_target={dominant_target}"
+                        )
 
-                    # Restore original model
-                    trainer.model.load_state_dict(current_params)
-
-                    # Calculate compliant rate (DIRECTLY from detector)
-                    compliant_rate = det_compliant_rate
-                    has_backdoor = compliant_rate >= 0.02  # 2% threshold
-                    logging.info(
-                        f"[Manager] 📊 _check_neighbor_has_backdoor({neighbor_model[:50] if hasattr(neighbor_model, '__len__') else neighbor_model}) -> "
-                        f"CR={compliant_rate:.4f}, SR={suspicious_rate:.4f}, HR={honest_rate:.4f}, "
-                        f"has_backdoor={has_backdoor}, is_suspicious={is_suspicious}, dominant_target={dominant_target}"
-                    )
-
-                    return True, has_backdoor, compliant_rate, is_suspicious, dominant_target, suspicious_rate, honest_rate
+                        return True, has_backdoor, compliant_rate, is_suspicious, dominant_target, suspicious_rate, honest_rate
+                    finally:
+                        trainer.model.load_state_dict(current_params)
 
                 logging.debug(
                     f"[Manager] _check_neighbor_has_backdoor missing prerequisites: "
@@ -897,8 +898,8 @@ class HoneyPotManager:
                     f"[Manager] _check_neighbor_has_backdoor missing role_behavior/engine for neighbor model check."
                 )
 
-        except Exception as e:
-            logging.debug(f"[Manager] Error checking backdoor presence: {e}")
+        except Exception:
+            logging.exception("[Manager] Error checking backdoor presence")
 
         return False, False, 0.0, False, None, 0.0, 0.0
 

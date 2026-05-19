@@ -741,146 +741,120 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         logging.info("[Honeypot] 🕵️ Analyzing neighbor updates...")
         updates_storage = self._engine.aggregator.us.us
 
-        try:
-            self._engine.trainer.datamodule.setup("fit")
-            val_loader = self._engine.trainer.datamodule.val_dataloader()
-            clean_batch = next(iter(val_loader))
-        except: clean_batch = None
-
         detected_attackers = set()
         threat_detected_this_round = False
 
-        if clean_batch:
-            current_round = getattr(self._engine, 'round', 0)
-            for node_id, update_tuple in updates_storage.items():
-                if node_id == self._engine.addr: continue
+        current_round = getattr(self._engine, 'round', 0)
+        for node_id, update_tuple in updates_storage.items():
+            if node_id == self._engine.addr:
+                continue
 
-                # --- FIX CRÍTICO: Chequeos de seguridad ---
-                if not update_tuple or len(update_tuple) < 1: continue
-                update_obj = update_tuple[0]
-                if update_obj is None or not hasattr(update_obj, 'model') or update_obj.model is None:
+            if not update_tuple or len(update_tuple) < 1:
+                continue
+            update_obj = update_tuple[0]
+            if update_obj is None or not hasattr(update_obj, 'model') or update_obj.model is None:
+                continue
+
+            try:
+                status = "TESTING"
+                if hasattr(self.manager, "analyze_neighbor"):
+                    status = self.manager.analyze_neighbor(node_id, update_obj.model, current_round)
+
+                tracker_state = {}
+                if hasattr(self.manager, "neighbor_tracking"):
+                    tracker_state = self.manager.neighbor_tracking.get(node_id, {}) or {}
+
+                suspicious_count = int(tracker_state.get("suspicious_count", 0))
+                rounds_tested = int(tracker_state.get("rounds_tested", 0))
+                max_compliant_seen = float(tracker_state.get("max_compliant_seen", 0.0))
+                carrier_suspect = bool(tracker_state.get("carrier_suspect", False))
+
+                is_active_reporter = False
+                if hasattr(self._engine, "_reputation") and hasattr(self._engine._reputation, "is_active_reporter"):
+                    is_active_reporter = bool(self._engine._reputation.is_active_reporter(node_id))
+
+                # Single source of truth: manager/analyze_neighbor status.
+                if status == "BENIGN":
+                    if hasattr(self._engine, "_reputation"):
+                        logging.info(f"[Honeypot] ✅ Node {node_id} classified BENIGN. Boosting trust.")
+                        self._engine._reputation.manual_update(node_id, 2.0)
                     continue
-                # ------------------------------------------
 
-                try:
-                    self._engine.trainer.set_model_parameters(update_obj.model)
-                    if hasattr(self.manager, "analyze_neighbor"):
-                        try:
-                            self.manager.analyze_neighbor(node_id, update_obj.model, current_round)
-                        except Exception as e:
-                            logging.debug(f"[Honeypot] analyze_neighbor failed for {node_id}: {e}")
-                    verify_result = self.manager.verify_model(self._engine.trainer.model, clean_batch)
-                    if isinstance(verify_result, tuple):
-                        is_malicious = bool(verify_result[0])
-                        severity = float(verify_result[1]) if len(verify_result) > 1 else 0.0
+                # Testing but suspicious/carrying signal -> keep pivoting to find source.
+                if status == "TESTING" and (carrier_suspect or suspicious_count > 0):
+                    threat_detected_this_round = True
+                    self._allow_pivot_for_indirect_threats = True
+
+                if status == "MALICIOUS":
+                    threat_detected_this_round = True
+                    if is_active_reporter:
+                        # Active reporters are usually carriers/victims. Investigate through them.
+                        logging.warning(
+                            f"[Honeypot] 🚚 {node_id} classified MALICIOUS but ACTIVE reporter "
+                            f"(susp={suspicious_count}, rounds={rounds_tested}, bait={max_compliant_seen:.2%}). "
+                            "Treating as carrier and continuing pivot search."
+                        )
+                        if hasattr(self.manager, "neighbor_tracking"):
+                            state = self.manager.neighbor_tracking.setdefault(node_id, {})
+                            state["carrier_suspect"] = True
+                            state["status"] = "TESTING"
+                        self._allow_pivot_for_indirect_threats = True
                     else:
-                        is_malicious = bool(verify_result)
-                        severity = 1.0 if is_malicious else 0.0
-
-                    if is_malicious:
-                        threat_detected_this_round = True
-                        # WHITELIST LOGIC:
-                        # Check if node is an active reporter (Benign Echo vs Silent Attacker)
-                        is_active_reporter = False
-                        if hasattr(self._engine, "_reputation") and hasattr(self._engine._reputation, "is_active_reporter"):
-                             if self._engine._reputation.is_active_reporter(node_id):
-                                 is_active_reporter = True
-
-                        if is_active_reporter:
-                            tracker_state = {}
-                            if hasattr(self.manager, "neighbor_tracking"):
-                                tracker_state = self.manager.neighbor_tracking.get(node_id, {}) or {}
-
-                            suspicious_count = tracker_state.get("suspicious_count", 0)
-                            max_compliant_seen = tracker_state.get("max_compliant_seen", 0.0)
-                            carrier_suspect = tracker_state.get("carrier_suspect", False)
-                            reputation_score = None
-                            if hasattr(self._engine, "_reputation") and hasattr(self._engine._reputation, "get_score"):
-                                try:
-                                    reputation_score = float(self._engine._reputation.get_score(node_id))
-                                except Exception:
-                                    reputation_score = None
-
-                            has_tracking = bool(tracker_state)
-                            strong_evidence = (
-                                carrier_suspect
-                                or suspicious_count >= 2
-                                or (has_tracking and severity >= 0.75 and max_compliant_seen >= 0.02)
-                                or (reputation_score is not None and reputation_score < 0.2 and severity >= 0.60)
+                        # Silent + persistent malicious evidence => true attacker.
+                        enough_evidence = rounds_tested >= 3 and suspicious_count >= 2 and max_compliant_seen < 0.02
+                        if enough_evidence:
+                            logging.critical(
+                                f"🚨 [Honeypot] CONFIRMED ATTACKER {node_id} "
+                                f"(silent, rounds={rounds_tested}, susp={suspicious_count}, bait={max_compliant_seen:.2%})"
                             )
-
-                            if strong_evidence:
-                                logging.critical(
-                                    f"🚨 [Honeypot] ACTIVE reporter {node_id} has strong malicious evidence "
-                                    f"(susp_count={suspicious_count}, max_bait={max_compliant_seen:.2%}, "
-                                    f"carrier_suspect={carrier_suspect}, rep={reputation_score}, severity={severity:.2f}). "
-                                    "Treating as carrier (allow pivot)."
-                                )
-                                if hasattr(self.manager, "neighbor_tracking"):
-                                    state = self.manager.neighbor_tracking.setdefault(node_id, {})
-                                    state["carrier_suspect"] = True
-                                    state.setdefault("suspicious_count", 0)
-                                    state["status"] = "TESTING"
-                                # IMPORTANT: Do NOT confirm locally on ACTIVE reporters.
-                                # We must pivot through carriers to find the upstream attacker.
-                                self._allow_pivot_for_indirect_threats = True
-                            else:
-                                logging.info(
-                                    f"⚠️ [Honeypot] Node {node_id} flagged by Model Check but is ACTIVE reporter. "
-                                    f"Treating as possible victim/carrier (susp_count={suspicious_count}, max_bait={max_compliant_seen:.2%}, rep={reputation_score})."
-                                )
-                                if hasattr(self.manager, "neighbor_tracking"):
-                                    state = self.manager.neighbor_tracking.setdefault(node_id, {})
-                                    state["carrier_suspect"] = True
-                                    state.setdefault("suspicious_count", 0)
-                                    state["status"] = "TESTING"
-                        else:
-                            logging.critical(f"🚨 [Honeypot] POSITIVE MATCH! Node {node_id} (Silent)")
                             detected_attackers.add(node_id)
                             self.threat_confirmed_locally = True
-                    else:
-                        # VERIFIED BENIGN: Boost reputation significantly
-                        if hasattr(self._engine, "_reputation"):
-                            # Check if reputation exists inside the dict before call
-                            logging.info(f"[Honeypot] ✅ Node {node_id} passed safety check. Boosting Trust.")
-                            self._engine._reputation.manual_update(node_id, 2.0)
-                except Exception as e:
-                    logging.warning(f"[Honeypot] Check failed for {node_id}: {e}")
+                        else:
+                            logging.warning(
+                                f"[Honeypot] ⚠️ {node_id} MALICIOUS but evidence still weak "
+                                f"(silent={not is_active_reporter}, rounds={rounds_tested}, susp={suspicious_count}, "
+                                f"bait={max_compliant_seen:.2%}). Holding in TESTING."
+                            )
+                            if hasattr(self.manager, "neighbor_tracking"):
+                                state = self.manager.neighbor_tracking.setdefault(node_id, {})
+                                state["status"] = "TESTING"
+                            self._allow_pivot_for_indirect_threats = True
+            except Exception as e:
+                logging.warning(f"[Honeypot] Check failed for {node_id}: {e}")
 
         # --- NEW FEATURES: SILENT NODE DETECTION & VICTIM HANDLING ---
 
         # 1. Detect Silent Nodes (Reputation System Evasion)
-        # CRITICAL: Only mark as attacker if SILENT AND we haven't already verified it's a false positive
+        # Only escalate if manager already accumulated enough malicious evidence.
         if hasattr(self._engine, "_reputation") and hasattr(self._engine._reputation, "is_active_reporter"):
              # Fix: Access neighbors via Communication Manager (cm)
              neighbors = list(self._engine.cm.connections.keys()) if hasattr(self._engine, "cm") and hasattr(self._engine.cm, "connections") else []
              for node_id in neighbors:
                  if node_id == self._engine.addr: continue
 
-                 # If node is NOT sending reputation updates AND not already identified as false positive
                  if not self._engine._reputation.is_active_reporter(node_id):
-                      # Double-check: Is this node actually malicious in honeymap?
-                      # If it's SILENT but shows as BENIGN in model check → false positive (victim), skip
-                      is_verified_malicious = False
-                      if clean_batch:
-                          try:
-                              if node_id in updates_storage:
-                                  update_tuple = updates_storage[node_id]
-                                  if update_tuple and len(update_tuple) >= 1:
-                                      update_obj = update_tuple[0]
-                                      if update_obj and hasattr(update_obj, 'model') and update_obj.model:
-                                          self._engine.trainer.set_model_parameters(update_obj.model)
-                                          is_verified_malicious = self.manager.verify_model(self._engine.trainer.model, clean_batch)
-                          except Exception as e:
-                              logging.warning(f"[Honeypot] Could not verify model for {node_id}: {e}")
+                      tracker_state = {}
+                      if hasattr(self.manager, "neighbor_tracking"):
+                          tracker_state = self.manager.neighbor_tracking.get(node_id, {}) or {}
 
-                      if is_verified_malicious:
-                          logging.warning(f"🚨 [Honeypot] Node {node_id} is SILENT (No Reputation Reports) AND MALICIOUS. Marking as True Threat.")
-                          # Only mark as threat if BOTH conditions met: SILENT + VERIFIED MALICIOUS
+                      status = tracker_state.get("status", "TESTING")
+                      suspicious_count = int(tracker_state.get("suspicious_count", 0))
+                      rounds_tested = int(tracker_state.get("rounds_tested", 0))
+                      max_compliant_seen = float(tracker_state.get("max_compliant_seen", 0.0))
+
+                      if status == "MALICIOUS" and rounds_tested >= 3 and suspicious_count >= 2 and max_compliant_seen < 0.02:
+                          logging.warning(
+                              f"🚨 [Honeypot] Node {node_id} is SILENT + MALICIOUS by manager state "
+                              f"(rounds={rounds_tested}, susp={suspicious_count}, bait={max_compliant_seen:.2%})."
+                          )
                           detected_attackers.add(node_id)
                           self.threat_confirmed_locally = True
-                      else:
-                          logging.info(f"⚠️ [Honeypot] Node {node_id} is SILENT but shows BENIGN in honeymap. Likely false positive (victim). Allowing pivot search...")
+                      elif suspicious_count > 0 or tracker_state.get("carrier_suspect", False):
+                          logging.info(
+                              f"⚠️ [Honeypot] Silent node {node_id} still under investigation "
+                              f"(status={status}, rounds={rounds_tested}, susp={suspicious_count}, bait={max_compliant_seen:.2%})."
+                          )
+                          self._allow_pivot_for_indirect_threats = True
 
         # -------------------------------------------------------------
 
