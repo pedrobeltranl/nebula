@@ -523,7 +523,9 @@ def factory_role_behavior(role: str, engine: Engine, config: Config) -> RoleBeha
              # Check if we have already served/retired to prevent infinite loops
              is_already_retired = getattr(engine, "has_served_as_honeypot", False)
 
-             if honeypot_args.get("enabled", False) and not is_already_retired:
+             auto_select = honeypot_args.get("auto_select", True)
+
+             if honeypot_args.get("enabled", False) and auto_select and not is_already_retired:
                  scenario_args = config.participant.get("scenario_args", {})
                  device_args = config.participant.get("device_args", {})
 
@@ -1039,6 +1041,11 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         self._engine.has_served_as_honeypot = True
 
         target_state = self.manager.export_state()
+        handover_id = f"{int(asyncio.get_running_loop().time()*1000)}-{random.getrandbits(32):08x}"
+        target_state["__handover_id"] = handover_id
+        if hasattr(self._engine, "rb"):
+            self._engine.rb._pending_handover_id = handover_id
+            self._engine.rb._pending_pivot_candidate = candidate
         payload = json.dumps(target_state)
 
         log_message = f"HONEYPOT_TRANSFER:{payload}"
@@ -1053,6 +1060,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         except Exception as e:
             logging.error(f"[Honeypot] ❌ Failed to send transfer message to {candidate}: {e}")
             self._engine.has_served_as_honeypot = False
+            self._engine._waiting_honeypot_handover = False
+            if hasattr(self._engine, "rb"):
+                self._engine.rb._pending_handover_id = None
+                self._engine.rb._pending_pivot_candidate = None
 
     async def _revert_to_aggregator(self):
         """Reverts honeypot role back to aggregator after threat containment."""

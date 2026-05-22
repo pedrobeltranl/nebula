@@ -398,8 +398,8 @@ class HoneyPotManager:
                 f"Pivot-through candidate: {neighbor_id}."
             )
 
-        # Case 3: Benign → HR high
-        if honest_rate >= TAU_HONEST and suspicious_rate < TAU_SUSP:
+        # Case 3: Benign → HR high (only after minimum evidence)
+        if state["rounds_tested"] >= 3 and honest_rate >= TAU_HONEST and suspicious_rate < TAU_SUSP:
             state["status"] = "BENIGN"
             state["verified_round"] = current_round
             logging.info(
@@ -413,7 +413,7 @@ class HoneyPotManager:
         # RCA 22:45 (Fase 6.6): Reduced back to 0.02 (2%) because 15% was causing
         # False Positivos in Ring DFL due to signal dilution.
         BENIGN_COMPLIANT_THRESHOLD = 0.02
-        BENIGN_CONSISTENT_ROUNDS   = 1 # Requirement reduced for faster pivot response
+        BENIGN_CONSISTENT_ROUNDS   = 2
         BENIGN_WINDOW              = 3
         recent_history    = state["compliant_history"][-BENIGN_WINDOW:]
         consistent_rounds = sum(1 for _, r in recent_history if float(r) >= BENIGN_COMPLIANT_THRESHOLD)
@@ -652,6 +652,18 @@ class HoneyPotManager:
                 state["first_backdoor_round"] = current_round
 
         if has_genuine_bait:
+            reputation_module = getattr(self.engine, "_reputation", None)
+            is_active_reporter = bool(reputation_module and hasattr(reputation_module, "is_active_reporter") and reputation_module.is_active_reporter(neighbor_id))
+
+            # Silent + suspicious nodes must not be upgraded to BENIGN with weak bait leakage.
+            if not is_active_reporter and state["suspicious_count"] > 0:
+                state["status"] = "TESTING"
+                logging.warning(
+                    f"[Manager] ⚠️ Holding {neighbor_id} in TESTING: silent node with suspicious history "
+                    f"(susp={state['suspicious_count']}, max_bait={state['max_compliant_seen']:.2%})."
+                )
+                return "TESTING"
+
             # FEATURE: If node is CONSISTENTLY compliant but currently suspicious,
             # hold in TESTING — could be a smart adaptive attacker.
             if is_suspicious:

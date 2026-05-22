@@ -586,6 +586,9 @@ class Scenario:
         else:
             self.honeypot.update(honeypot_config)
 
+        # Ensure explicit role assignment is the only selection mechanism
+        honeypot_config.setdefault("auto_select", False)
+
         # Determine fallback role based on federation
         fallback_role = "aggregator"
         if self.federation == "DFL":

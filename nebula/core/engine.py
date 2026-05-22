@@ -806,8 +806,11 @@ class Engine:
         is_pivot = "MALICIOUS_PIVOT_TRANSFER" in msg_log
         is_honey = "HONEYPOT_TRANSFER:" in msg_log
 
-        # Filtros de Roles
-        if self._is_malicious and not is_pivot: return
+        # Role filters:
+        # A malicious node must still accept HONEYPOT transfers; otherwise
+        # the source honeypot will wait forever for ACK and get stuck pivoting.
+        if self._is_malicious and not (is_pivot or is_honey):
+            return
 
         current_role = str(self.rb.get_role())
 
