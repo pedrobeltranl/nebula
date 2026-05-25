@@ -1067,6 +1067,7 @@ class ScenarioManagement:
             ))
         self.topologymanager.update_nodes(temp_participants_info)
 
+
         for i in range(self.n_nodes):
             with open(f"{self.config_dir}/participant_" + str(i) + ".json") as f:
                 participant_config = json.load(f)

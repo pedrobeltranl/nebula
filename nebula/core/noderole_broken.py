@@ -606,6 +606,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         self.manager = HoneyPotManager(engine=engine, seed=seed, role_behavior=self)
         self._defense_active = True
 
+
         # Bandera clave: Si es True, hemos encontrado al malo y no nos movemos.
         self.threat_confirmed_locally = False
 
@@ -746,7 +747,13 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         detected_attackers = set()
         threat_detected_this_round = False
 
+
         current_round = getattr(self._engine, 'round', 0)
+        direct_neighbors = set()
+        try:
+            direct_neighbors = set(await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False))
+        except Exception as e:
+            logging.warning(f"[Honeypot] Failed to load direct neighbors: {e}")
         for node_id, update_tuple in updates_storage.items():
             if node_id == self._engine.addr:
                 continue
@@ -804,6 +811,14 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                     else:
                         # Silent + persistent malicious evidence => true attacker.
                         enough_evidence = rounds_tested >= 3 and suspicious_count >= 2 and max_compliant_seen < 0.02
+                        if node_id in direct_neighbors:
+                            logging.critical(
+                                f"🚨 [Honeypot] DIRECT NEIGHBOR {node_id} flagged MALICIOUS by model. "
+                                "Initiating containment immediately."
+                            )
+                            detected_attackers.add(node_id)
+                            self.threat_confirmed_locally = True
+                            continue
                         if enough_evidence:
                             logging.critical(
                                 f"🚨 [Honeypot] CONFIRMED ATTACKER {node_id} "
