@@ -812,12 +812,28 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                         # Silent + persistent malicious evidence => true attacker.
                         enough_evidence = rounds_tested >= 3 and suspicious_count >= 2 and max_compliant_seen < 0.02
                         if node_id in direct_neighbors:
-                            logging.critical(
-                                f"🚨 [Honeypot] DIRECT NEIGHBOR {node_id} flagged MALICIOUS by model. "
-                                "Initiating containment immediately."
+                            # Avoid false positives: do not contain direct neighbors on a single weak signal.
+                            direct_enough_evidence = (
+                                rounds_tested >= 2 and suspicious_count >= 1 and max_compliant_seen < 0.02
                             )
-                            detected_attackers.add(node_id)
-                            self.threat_confirmed_locally = True
+                            if direct_enough_evidence:
+                                logging.critical(
+                                    f"🚨 [Honeypot] DIRECT NEIGHBOR {node_id} confirmed MALICIOUS "
+                                    f"(rounds={rounds_tested}, susp={suspicious_count}, bait={max_compliant_seen:.2%}). "
+                                    "Initiating containment."
+                                )
+                                detected_attackers.add(node_id)
+                                self.threat_confirmed_locally = True
+                                continue
+                            logging.warning(
+                                f"[Honeypot] ⚠️ Direct neighbor {node_id} marked MALICIOUS but evidence is still weak "
+                                f"(rounds={rounds_tested}, susp={suspicious_count}, bait={max_compliant_seen:.2%}). "
+                                "Keeping in TESTING to prevent false positives."
+                            )
+                            if hasattr(self.manager, "neighbor_tracking"):
+                                state = self.manager.neighbor_tracking.setdefault(node_id, {})
+                                state["status"] = "TESTING"
+                            self._allow_pivot_for_indirect_threats = True
                             continue
                         if enough_evidence:
                             logging.critical(

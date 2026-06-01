@@ -828,6 +828,21 @@ class Engine:
         honeypot_transfer_id = None
 
         if is_honey:
+            # If this node has just retired from honeypot, do not accept immediate re-promotions.
+            # This prevents ping-pong handovers where the old honeypot keeps re-sending transfers.
+            cooldown_until_round = getattr(self, "_honeypot_reaccept_block_until_round", -1)
+            if (
+                getattr(self, "has_served_as_honeypot", False)
+                and cooldown_until_round >= 0
+                and getattr(self, "round", 0) <= cooldown_until_round
+            ):
+                logging.warning(
+                    f"🛡️  Ignoring HONEYPOT transfer from {source}: post-retirement cooldown active "
+                    f"(current_round={getattr(self, 'round', 0)}, block_until={cooldown_until_round})."
+                )
+                reject_msg = self.cm.create_message("control", "leadership_transfer_ack", log="REJECT")
+                asyncio.create_task(self.cm.send_message(source, reject_msg))
+                return
             logging.info(f"🍯 HONEYPOT TRANSFER from {source}")
             target_role = Role.HONEYPOT
             try:
@@ -1019,6 +1034,8 @@ class Engine:
 
                 logging.info(f"✅  Honeypot Handover Confirmed by {source}. I can now retire with honor.")
                 self.has_served_as_honeypot = True # FIX: Ensure we don't get re-promoted by factory
+                # Block immediate re-acceptance of honeypot transfers for a few rounds.
+                self._honeypot_reaccept_block_until_round = getattr(self, "round", 0) + 3
                 self._waiting_honeypot_handover = False
                 if hasattr(self.rb, "_pending_handover_id"):
                     self.rb._pending_handover_id = None
