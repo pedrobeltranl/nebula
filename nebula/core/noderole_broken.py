@@ -796,6 +796,15 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
                 if status == "MALICIOUS":
                     threat_detected_this_round = True
+                    # Priority rule: if malicious is a direct neighbor, contain immediately.
+                    if node_id in direct_neighbors:
+                        logging.critical(
+                            f"🚨 [Honeypot] DIRECT NEIGHBOR {node_id} flagged MALICIOUS. "
+                            "Initiating containment immediately."
+                        )
+                        detected_attackers.add(node_id)
+                        self.threat_confirmed_locally = True
+                        continue
                     if is_active_reporter:
                         # Active reporters are usually carriers/victims. Investigate through them.
                         logging.warning(
@@ -811,30 +820,6 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                     else:
                         # Silent + persistent malicious evidence => true attacker.
                         enough_evidence = rounds_tested >= 3 and suspicious_count >= 2 and max_compliant_seen < 0.02
-                        if node_id in direct_neighbors:
-                            # Avoid false positives: do not contain direct neighbors on a single weak signal.
-                            direct_enough_evidence = (
-                                rounds_tested >= 2 and suspicious_count >= 1 and max_compliant_seen < 0.02
-                            )
-                            if direct_enough_evidence:
-                                logging.critical(
-                                    f"🚨 [Honeypot] DIRECT NEIGHBOR {node_id} confirmed MALICIOUS "
-                                    f"(rounds={rounds_tested}, susp={suspicious_count}, bait={max_compliant_seen:.2%}). "
-                                    "Initiating containment."
-                                )
-                                detected_attackers.add(node_id)
-                                self.threat_confirmed_locally = True
-                                continue
-                            logging.warning(
-                                f"[Honeypot] ⚠️ Direct neighbor {node_id} marked MALICIOUS but evidence is still weak "
-                                f"(rounds={rounds_tested}, susp={suspicious_count}, bait={max_compliant_seen:.2%}). "
-                                "Keeping in TESTING to prevent false positives."
-                            )
-                            if hasattr(self.manager, "neighbor_tracking"):
-                                state = self.manager.neighbor_tracking.setdefault(node_id, {})
-                                state["status"] = "TESTING"
-                            self._allow_pivot_for_indirect_threats = True
-                            continue
                         if enough_evidence:
                             logging.critical(
                                 f"🚨 [Honeypot] CONFIRMED ATTACKER {node_id} "
@@ -1078,6 +1063,11 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
     async def _pivot_to(self, candidate):
         logging.info(f"[Honeypot] 👋 Pivoting to {candidate} (Next hop to target).")
         self._last_pivot_target = candidate
+
+        # Never open a second handover while one is pending.
+        if getattr(self._engine, "_waiting_honeypot_handover", False):
+             logging.info("[Honeypot] ⏳ Handover already pending. Skipping duplicate transfer.")
+             return
 
         # Check if connected (Do not force new connections)
         if candidate not in self._engine.cm.connections:

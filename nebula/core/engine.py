@@ -850,6 +850,7 @@ class Engine:
                 honeypot_state = json.loads(payload)
                 if isinstance(honeypot_state, dict):
                     honeypot_transfer_id = honeypot_state.get("__handover_id")
+                    self._incoming_honeypot_handover_id = honeypot_transfer_id
             except: pass
         elif is_pivot:
              logging.info(f"💀 MALICIOUS INFECTION from {source}")
@@ -904,7 +905,12 @@ class Engine:
              # FIX: Send ACK IMMEDIATELY so the sender can decommission within the 30s timeout.
              # Previously, the ACK was deferred to update_self_role() (~32s later),
              # always arriving 2s after the sender's 30s timeout → duplicate honeypots.
-             ack_log = f"HONEYPOT_ACK:{honeypot_transfer_id}" if honeypot_transfer_id else "HONEYPOT_ACK"
+             # Pre-ack only confirms reception, not activation of new honeypot role.
+             ack_log = (
+                 f"HONEYPOT_PREACK:{honeypot_transfer_id}"
+                 if honeypot_transfer_id else
+                 "HONEYPOT_PREACK"
+             )
              ack_msg = self.cm.create_message("control", "leadership_transfer_ack", log=ack_log)
              asyncio.create_task(self.cm.send_message(source, ack_msg))
              logging.info(
@@ -912,9 +918,8 @@ class Engine:
                  f" (handover_id={honeypot_transfer_id if honeypot_transfer_id else 'none'})"
              )
 
-             # Override any scheduled AGGREGATOR role from ACKs
-             # source_to_notificate=None because ACK was already sent above
-             await self.rb.set_next_role(target_role, source_to_notificate=None)
+             # Keep transfer source to emit FINAL ACK only after role is actually applied.
+             await self.rb.set_next_role(target_role, source_to_notificate=source)
 
              if honeypot_state:
                  self._pending_honeypot_state = honeypot_state
@@ -942,7 +947,7 @@ class Engine:
                           logging.info("[Engine] 🔄 Detection history reset - giving neighbors fresh start")
 
                  # Re-set next role to ensure update_self_role consumes it cleanly if called
-                 await self.rb.set_next_role(target_role, source_to_notificate=None)
+                 await self.rb.set_next_role(target_role, source_to_notificate=source)
                  await self.update_self_role()
              return
         # -------------------------------------------------------
@@ -1003,7 +1008,13 @@ class Engine:
                 raw_log = getattr(message, "log", "")
                 msg_log = raw_log.decode('utf-8', errors='ignore') if isinstance(raw_log, bytes) else (str(raw_log) if raw_log else "")
                 ack_handover_id = None
-                if "HONEYPOT_ACK:" in msg_log:
+                if "HONEYPOT_FINAL_ACK:" in msg_log:
+                    try:
+                        ack_handover_id = msg_log.split("HONEYPOT_FINAL_ACK:", 1)[1].strip() or None
+                    except Exception:
+                        ack_handover_id = None
+                elif "HONEYPOT_ACK:" in msg_log:
+                    # Backward compatibility with previous log tag.
                     try:
                         ack_handover_id = msg_log.split("HONEYPOT_ACK:", 1)[1].strip() or None
                     except Exception:
@@ -1765,7 +1776,17 @@ class Engine:
 
             if source_to_notificate:
                 logging.info(f"Sending role modification ACK to transferer: {source_to_notificate}")
-                message = self.cm.create_message("control", "leadership_transfer_ack")
+                if to_role == "honeypot":
+                    final_handover_id = getattr(self, "_incoming_honeypot_handover_id", None)
+                    log_payload = (
+                        f"HONEYPOT_FINAL_ACK:{final_handover_id}"
+                        if final_handover_id else
+                        "HONEYPOT_FINAL_ACK"
+                    )
+                    message = self.cm.create_message("control", "leadership_transfer_ack", log=log_payload)
+                    self._incoming_honeypot_handover_id = None
+                else:
+                    message = self.cm.create_message("control", "leadership_transfer_ack")
                 asyncio.create_task(self.cm.send_message(source_to_notificate, message))
 
         else:
@@ -1800,7 +1821,17 @@ class Engine:
                         self._pending_honeypot_state = None
 
                     logging.info(f"Sending role modification ACK to transferer: {source_to_notificate}")
-                    message = self.cm.create_message("control", "leadership_transfer_ack")
+                    if current_role_enum == Role.HONEYPOT:
+                        final_handover_id = getattr(self, "_incoming_honeypot_handover_id", None)
+                        log_payload = (
+                            f"HONEYPOT_FINAL_ACK:{final_handover_id}"
+                            if final_handover_id else
+                            "HONEYPOT_FINAL_ACK"
+                        )
+                        message = self.cm.create_message("control", "leadership_transfer_ack", log=log_payload)
+                        self._incoming_honeypot_handover_id = None
+                    else:
+                        message = self.cm.create_message("control", "leadership_transfer_ack")
                     asyncio.create_task(self.cm.send_message(source_to_notificate, message))
 
     async def _learning_cycle(self):
