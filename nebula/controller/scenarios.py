@@ -1295,20 +1295,9 @@ class ScenarioManagement:
         """
         import numpy as np
 
-        if self.scenario.topology == "Random":
-            # Create network topology using topology manager (random)
-            probability = float(self.scenario.random_topology_probability)
-            logging.info(
-                f"Creating random network topology using erdos_renyi_graph: nodes={self.n_nodes}, probability={probability}"
-            )
-            topologymanager = TopologyManager(
-                scenario_name=self.scenario_name,
-                n_nodes=self.n_nodes,
-                b_symmetric=True,
-                undirected_neighbor_num=3,
-            )
-            topologymanager.generate_random_topology(probability)
-        elif matrix is not None:
+        # IMPORTANT: If a matrix is provided (custom topology from scenario),
+        # it must take precedence over any topology type declaration.
+        if matrix is not None:
             if self.n_nodes > 2:
                 topologymanager = TopologyManager(
                     topology=np.array(matrix),
@@ -1325,6 +1314,19 @@ class ScenarioManagement:
                     b_symmetric=True,
                     undirected_neighbor_num=2,
                 )
+        elif self.scenario.topology == "Random":
+            # Create network topology using topology manager (random)
+            probability = float(self.scenario.random_topology_probability)
+            logging.info(
+                f"Creating random network topology using erdos_renyi_graph: nodes={self.n_nodes}, probability={probability}"
+            )
+            topologymanager = TopologyManager(
+                scenario_name=self.scenario_name,
+                n_nodes=self.n_nodes,
+                b_symmetric=True,
+                undirected_neighbor_num=3,
+            )
+            topologymanager.generate_random_topology(probability)
         elif self.scenario.topology == "Fully":
             # Create a fully connected network
             topologymanager = TopologyManager(
