@@ -605,6 +605,17 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         self.manager = HoneyPotManager(engine=engine, seed=seed, role_behavior=self)
         self._defense_active = True
+        self._baseline_neighbors = set()
+        try:
+            neighbors_str = (
+                config.participant
+                .get("network_args", {})
+                .get("neighbors", "")
+            )
+            if isinstance(neighbors_str, str):
+                self._baseline_neighbors = {n for n in neighbors_str.split() if n}
+        except Exception as e:
+            logging.warning(f"[Honeypot] Failed to load baseline neighbors: {e}")
 
 
         # Bandera clave: Si es True, hemos encontrado al malo y no nos movemos.
@@ -745,15 +756,11 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         updates_storage = self._engine.aggregator.us.us
 
         detected_attackers = set()
+        first_detected_attacker = None
         threat_detected_this_round = False
 
 
         current_round = getattr(self._engine, 'round', 0)
-        direct_neighbors = set()
-        try:
-            direct_neighbors = set(await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False))
-        except Exception as e:
-            logging.warning(f"[Honeypot] Failed to load direct neighbors: {e}")
         for node_id, update_tuple in updates_storage.items():
             if node_id == self._engine.addr:
                 continue
@@ -796,15 +803,16 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
                 if status == "MALICIOUS":
                     threat_detected_this_round = True
-                    # Priority rule: if malicious is a direct neighbor, contain immediately.
-                    if node_id in direct_neighbors:
+                    # Priority rule: immediate containment only for baseline scenario neighbors.
+                    if node_id in self._baseline_neighbors:
                         logging.critical(
-                            f"🚨 [Honeypot] DIRECT NEIGHBOR {node_id} flagged MALICIOUS. "
+                            f"🚨 [Honeypot] BASELINE NEIGHBOR {node_id} flagged MALICIOUS. "
                             "Initiating containment immediately."
                         )
                         detected_attackers.add(node_id)
+                        first_detected_attacker = node_id
                         self.threat_confirmed_locally = True
-                        continue
+                        break
                     if is_active_reporter:
                         # Active reporters are usually carriers/victims. Investigate through them.
                         logging.warning(
@@ -826,7 +834,9 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                                 f"(silent, rounds={rounds_tested}, susp={suspicious_count}, bait={max_compliant_seen:.2%})"
                             )
                             detected_attackers.add(node_id)
+                            first_detected_attacker = node_id
                             self.threat_confirmed_locally = True
+                            break
                         else:
                             logging.warning(
                                 f"[Honeypot] ⚠️ {node_id} MALICIOUS but evidence still weak "
@@ -841,10 +851,15 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 logging.warning(f"[Honeypot] Check failed for {node_id}: {e}")
 
         # --- NEW FEATURES: SILENT NODE DETECTION & VICTIM HANDLING ---
+        if first_detected_attacker is not None:
+            logging.info(
+                f"[Honeypot] 🛑 Attacker {first_detected_attacker} detected in this round. "
+                "Skipping further analysis to avoid false-positive cascade."
+            )
 
         # 1. Detect Silent Nodes (Reputation System Evasion)
         # Only escalate if manager already accumulated enough malicious evidence.
-        if hasattr(self._engine, "_reputation") and hasattr(self._engine._reputation, "is_active_reporter"):
+        if first_detected_attacker is None and hasattr(self._engine, "_reputation") and hasattr(self._engine._reputation, "is_active_reporter"):
              # Fix: Access neighbors via Communication Manager (cm)
              neighbors = list(self._engine.cm.connections.keys()) if hasattr(self._engine, "cm") and hasattr(self._engine.cm, "connections") else []
              for node_id in neighbors:
@@ -878,8 +893,8 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         if detected_attackers:
             self.consecutive_clean_rounds = 0  # Reset counter if threat detected
-            for attacker_id in detected_attackers:
-                 await self._execute_containment_protocol(attacker_id)
+            attacker_id = first_detected_attacker or next(iter(detected_attackers))
+            await self._execute_containment_protocol(attacker_id)
 
         elif self.threat_confirmed_locally:
             # CRITICAL: threat_confirmed_locally means we found a SILENT node that is POSITIVE in honeymap
