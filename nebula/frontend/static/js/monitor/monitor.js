@@ -401,42 +401,8 @@ class Monitor {
         this.gData.nodes = Array.from(uniqueNodes.values());
         this.log('Total unique nodes:', this.gData.nodes.length);
 
-        // Second pass: create links only between online nodes
-        this.log('Creating graph with', this.gData.nodes.length, 'nodes');
-        for (let i = 0; i < this.gData.nodes.length; i++) {
-            const sourceNode = this.gData.nodes[i];
-            const sourceIP = sourceNode.ip;
-
-            // Skip if source node is offline
-            if (this.offlineNodes.has(sourceNode.ipport)) {
-                this.log('Skipping links for offline source node:', sourceIP);
-                continue;
-            }
-
-            for (let j = i + 1; j < this.gData.nodes.length; j++) {
-                const targetNode = this.gData.nodes[j];
-                const targetIP = targetNode.ip;
-
-                // Skip if target node is offline
-                if (this.offlineNodes.has(targetNode.ipport)) {
-                    this.log('Skipping link to offline target node:', targetIP);
-                    continue;
-                }
-
-                // Add bidirectional links only between online nodes
-                this.gData.links.push({
-                    source: sourceNode.ipport,
-                    target: targetNode.ipport,
-                    value: this.randomFloatFromInterval(1.0, 1.3)
-                });
-
-                this.gData.links.push({
-                    source: targetNode.ipport,
-                    target: sourceNode.ipport,
-                    value: this.randomFloatFromInterval(1.0, 1.3)
-                });
-            }
-        }
+        // Build links from declared neighbors (scenario topology), not full mesh.
+        this.updateGraphDataFromStatus(data.nodes);
 
         // Process queue immediately
         this.processQueue();

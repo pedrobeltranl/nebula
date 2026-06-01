@@ -931,17 +931,34 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             logging.warning(f"[Honeypot] Topology info missing for {attacker_id}. Alerting local neighbors.")
             targets.update(await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False))
 
-        # 2. Enviar la orden de bloqueo
+        # 2. Conectar temporalmente con los vecinos del atacante para mantener inferencia
+        #    y poder propagar contención con alcance. Esta es la ÚNICA mutación permitida.
+        try:
+            self._engine.config.set_runtime_topology_override(True)
+            for neighbor in targets:
+                if neighbor == self._engine.addr:
+                    continue
+                if neighbor == attacker_id:
+                    continue
+                await self._engine.cm.connect(neighbor, direct=True, priority="high")
+        except Exception as e:
+            logging.warning(f"[Honeypot] Error creating containment support links: {e}")
+        finally:
+            self._engine.config.set_runtime_topology_override(False)
+
+        # 3. Enviar la orden de bloqueo
         for neighbor in targets:
-            if neighbor == self._engine.addr: continue # No me aviso a mí mismo
-            if neighbor == attacker_id: continue       # No avisamos al atacante
+            if neighbor == self._engine.addr:
+                continue
+            if neighbor == attacker_id:
+                continue
 
             logging.warning(f"[Honeypot] 📤 Sending KILL ORDER to {neighbor}: 'Block {attacker_id}'")
 
             msg = self._engine.cm.create_message(
                 "control",
                 "block_neighbor",
-                log=attacker_id # En el log va el ID del nodo a bloquear
+                log=attacker_id
             )
             asyncio.create_task(self._engine.cm.send_message(neighbor, msg))
 

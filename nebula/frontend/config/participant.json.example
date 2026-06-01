@@ -39,6 +39,8 @@
     "port": 45001,
     "addr": "127.0.0.1:45001",
     "neighbors": "",
+    "lock_scenario_topology": true,
+    "allow_runtime_topology_override": false,
     "interface": "eth0",
     "simulation": false,
     "bandwidth": "1Gbps",

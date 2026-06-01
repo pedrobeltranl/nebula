@@ -55,7 +55,7 @@ class Config:
 
         self.__set_default_logging(mode="a")
         self.__set_training_logging(mode="a")
-        
+
     def shutdown_logging(self):
         """
         Properly shuts down all loggers and their handlers in the system.
@@ -203,6 +203,8 @@ class Config:
             self.add_participant_config(participant)
 
     def add_neighbor_from_config(self, addr):
+        if self._is_scenario_topology_locked() and not self._is_runtime_topology_override_enabled():
+            return
         if self.participant != {}:
             if self.participant["network_args"]["neighbors"] == "":
                 self.participant["network_args"]["neighbors"] = addr
@@ -216,6 +218,8 @@ class Config:
         self.participant["mobility_args"]["neighbors_distance"] = {node: dist for node, (dist, _) in distances.items()}
 
     def update_neighbors_from_config(self, current_connections, dest_addr):
+        if self._is_scenario_topology_locked() and not self._is_runtime_topology_override_enabled():
+            return
         final_neighbors = []
         for n in current_connections:
             if n != dest_addr:
@@ -233,11 +237,31 @@ class Config:
         logging.info(f"Final neighbors: {final_neighbors_string} (config updated))")
 
     def remove_neighbor_from_config(self, addr):
+        if self._is_scenario_topology_locked() and not self._is_runtime_topology_override_enabled():
+            return
         if self.participant != {}:
             if self.participant["network_args"]["neighbors"] != "":
                 self.participant["network_args"]["neighbors"] = (
                     self.participant["network_args"]["neighbors"].replace(addr, "").replace("  ", " ").strip()
                 )
+
+    def _is_scenario_topology_locked(self):
+        if self.participant == {}:
+            return False
+        network_args = self.participant.get("network_args", {})
+        # Keep scenario topology immutable by default during runtime.
+        return network_args.get("lock_scenario_topology", True)
+
+    def _is_runtime_topology_override_enabled(self):
+        if self.participant == {}:
+            return False
+        return bool(self.participant.get("network_args", {}).get("allow_runtime_topology_override", False))
+
+    def set_runtime_topology_override(self, enabled: bool):
+        if self.participant == {}:
+            return
+        self.participant.setdefault("network_args", {})
+        self.participant["network_args"]["allow_runtime_topology_override"] = bool(enabled)
 
     def reload_config_file(self):
         config_dir = self.participant["tracking_args"]["config_dir"]
