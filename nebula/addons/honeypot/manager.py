@@ -38,6 +38,7 @@ class HoneyPotManager:
         self.current_map = {}
         self.previous_map = {}  # Store previous map to reduce false positives
         self.visited_history = []
+        self.path_history = []
         self.reputation_history = {}  # Historial global acumulado
         self.locked_target = None     # Fixed Target
 
@@ -711,7 +712,7 @@ class HoneyPotManager:
                     and state["rounds_tested"] >= 3
                     and state["suspicious_count"] >= 3
                     and state["semantic_malicious_streak"] >= 1
-                    and state["max_compliant_seen"] <= 0.25
+                    and state["max_compliant_seen"] <= 0.40
                 ):
                     state["status"] = "MALICIOUS"
                     state["verified_round"] = current_round
@@ -848,6 +849,24 @@ class HoneyPotManager:
             if neighbor_id not in self.weak_backdoor_nodes and state["negative_count"] >= MALICIOUS_ZERO_ROUNDS_REQUIRED:
                 # FASE 4: Priorizar evidencia histórica (max_compliant_seen) sobre consistencia inmediata.
                 # En el anillo (3.12% dilución), el cebo puede saltar rondas.
+                strong_consensus, consensus_candidates = self._has_strong_global_suspect_consensus(neighbor_id, reputation_module)
+                diluted_bait_but_attacker = (
+                    strong_consensus
+                    and stable_attack_target
+                    and state["rounds_tested"] >= 3
+                    and state["suspicious_count"] >= 3
+                    and state["semantic_malicious_streak"] >= 1
+                    and state["max_compliant_seen"] <= 0.40
+                )
+                if diluted_bait_but_attacker:
+                    state["status"] = "MALICIOUS"
+                    state["verified_round"] = current_round
+                    logging.critical(
+                        f"[Manager] 🚨 Neighbor {neighbor_id} CONFIRMED as MALICIOUS under strong global consensus "
+                        f"despite diluted bait (consensus={consensus_candidates}, rounds={state['rounds_tested']}, "
+                        f"susp={state['suspicious_count']}, max_bait={state['max_compliant_seen']:.2%})."
+                    )
+                    return "MALICIOUS"
                 if has_genuine_bait or state["max_compliant_seen"] >= BENIGN_COMPLIANT_THRESHOLD:
                     # Genuine carrier or node that has shown bait before: consistently absorbs bait → pivot through to find real source
                     state["carrier_suspect"] = True
@@ -1019,6 +1038,7 @@ class HoneyPotManager:
     def register_visit(self, node_id: str):
         if node_id not in self.visited_history:
             self.visited_history.append(node_id)
+        self.path_history.append(node_id)
 
     def is_visited(self, node_id: str) -> bool:
         return node_id in self.visited_history
@@ -1064,6 +1084,7 @@ class HoneyPotManager:
 
         state = {
             "history": self.visited_history,
+            "path_history": self.path_history,
             "reputation_history": self.reputation_history,
             "locked_target": self.locked_target,
             "transfer_source": getattr(self.engine, 'addr', None) if self.engine else None,
@@ -1073,6 +1094,12 @@ class HoneyPotManager:
             "suspect_confirmation": self.suspect_confirmation,  # Transfer suspect tracking
             "neighbor_tracking": self.neighbor_tracking  # CRITICAL: Preserve neighbor memory across pivots
         }
+        if self.role_behavior and hasattr(self.role_behavior, "_dfs_path_stack"):
+            state["dfs_path_stack"] = list(self.role_behavior._dfs_path_stack)
+        if self.role_behavior and hasattr(self.role_behavior, "_honeypot_epoch"):
+            state["honeypot_epoch"] = int(getattr(self.role_behavior, "_honeypot_epoch", 0))
+        if self.role_behavior and hasattr(self.role_behavior, "_handover_mode"):
+            state["handover_mode"] = getattr(self.role_behavior, "_handover_mode", "forward")
         if self.strategy:
             state["seed_state"] = self.strategy.get_state()
         return state
@@ -1085,6 +1112,7 @@ class HoneyPotManager:
         logging.info(f"[Manager] Importing State: keys={list(state.keys())}")
 
         if "history" in state: self.visited_history = state["history"]
+        if "path_history" in state: self.path_history = state.get("path_history", [])
         if "reputation_history" in state: self.reputation_history = state.get("reputation_history", {})
 
         if "locked_target" in state:
@@ -1099,6 +1127,14 @@ class HoneyPotManager:
             if self.role_behavior:
                 self.role_behavior._last_pivot_source = last_pivot_source
                 logging.info(f"[Manager] 🔙 PIVOT SOURCE restored: {last_pivot_source} (prevents backtrack)")
+        if self.role_behavior and "dfs_path_stack" in state:
+            self.role_behavior._dfs_path_stack = list(state.get("dfs_path_stack") or [])
+            logging.info(f"[Manager] 🪜 DFS path restored: {self.role_behavior._dfs_path_stack}")
+        if self.role_behavior and "honeypot_epoch" in state:
+            self.role_behavior._honeypot_epoch = int(state.get("honeypot_epoch", 0))
+            logging.info(f"[Manager] 🕒 Honeypot epoch restored: {self.role_behavior._honeypot_epoch}")
+        if self.role_behavior and "handover_mode" in state:
+            self.role_behavior._handover_mode = state.get("handover_mode", "forward")
 
         # Restore per-node grace period counter
         if "rounds_at_current_node" in state:
@@ -1718,11 +1754,9 @@ class HoneyPotManager:
                 logging.info(f"[DFS] Next pivot direction: {neighbor} (unvisited)")
                 return neighbor
 
-        # Si todos los vecinos han sido visitados, elegir aleatorio (exploración ciclada)
         if neighbors:
-            next_hop = random.choice(neighbors)
-            logging.info(f"[DFS] All neighbors visited, cycling: {next_hop}")
-            return next_hop
+            logging.info(f"[DFS] All forward neighbors already visited from {my_id}. Need backtrack.")
+            return None
 
         logging.warning(f"[DFS] No available next hop from {my_id}")
         return None

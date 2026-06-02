@@ -311,6 +311,9 @@ class AggregatorRoleBehavior(RoleBehavior):
         self._config = config
         self._role = factory_node_role("aggregator")
         self._transfer_send = False
+        self._generic_leadership_transfer_enabled = bool(
+            config.participant.get("device_args", {}).get("enable_generic_leadership_transfer", False)
+        )
 
     def get_role(self):
         return self._role
@@ -354,13 +357,14 @@ class AggregatorRoleBehavior(RoleBehavior):
         await self._engine._waiting_model_updates()
 
         # Transfer leadership
-        neighbors = await self._engine.cm.get_addrs_current_connections(myself=False)
-        if len(neighbors) and not self._transfer_send:
-            random_neighbor = random.choice(list(neighbors))
-            lt_message = self._engine.cm.create_message("control", "leadership_transfer")
-            logging.info(f"Sending transfer leadership to: {random_neighbor}")
-            asyncio.create_task(self._engine.cm.send_message(random_neighbor, lt_message))
-            self._transfer_send = True
+        if self._generic_leadership_transfer_enabled:
+            neighbors = await self._engine.cm.get_addrs_current_connections(myself=False)
+            if len(neighbors) and not self._transfer_send:
+                random_neighbor = random.choice(list(neighbors))
+                lt_message = self._engine.cm.create_message("control", "leadership_transfer")
+                logging.info(f"Sending transfer leadership to: {random_neighbor}")
+                asyncio.create_task(self._engine.cm.send_message(random_neighbor, lt_message))
+                self._transfer_send = True
 
     async def select_nodes_to_wait(self):
         nodes = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
@@ -631,6 +635,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         # NEW DFS: Track pivot path to avoid backtracking
         self._last_pivot_source = None  # De dónde venimos (para no retroceder)
+        self._dfs_path_stack = [engine.addr] if getattr(engine, "addr", None) else []
+        self._honeypot_epoch = 0
+        self._handover_mode = "forward"
+        self._honeypot_transfer_source = None
 
         # NEW: Control independent pivot allowance for indirect threats
         # When True, honeypot can pivot to find threat source even if threat_confirmed
@@ -671,6 +679,27 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         self._last_pivot_source = None
         logging.info("[Honeypot] 🧹 Honeypot behavior deactivated after handover/retirement.")
 
+    def set_transfer_source(self, source):
+        self._honeypot_transfer_source = source
+
+    def _ensure_current_in_path(self):
+        if getattr(self._engine, "addr", None) is None:
+            return
+        if not self._dfs_path_stack:
+            self._dfs_path_stack = [self._engine.addr]
+            return
+        if self._engine.addr in self._dfs_path_stack:
+            current_index = self._dfs_path_stack.index(self._engine.addr)
+            self._dfs_path_stack = self._dfs_path_stack[: current_index + 1]
+        else:
+            self._dfs_path_stack.append(self._engine.addr)
+
+    def _get_backtrack_target(self):
+        self._ensure_current_in_path()
+        if len(self._dfs_path_stack) >= 2:
+            return self._dfs_path_stack[-2]
+        return self._honeypot_transfer_source or self._last_pivot_source
+
     def _is_honeypot_active(self):
         return self._defense_active and self.get_role() == Role.HONEYPOT
 
@@ -678,6 +707,8 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         if not self._is_honeypot_active():
             logging.info("[Honeypot] Inactive behavior detected before cycle start. Skipping stale cycle.")
             return
+        self._ensure_current_in_path()
+        self.manager.update_current_node(self._engine.addr)
 
         # --- FIX: Mimic Benign Aggregator Behavior FIRST ---
         # The Honeypot must train (or fake it) and PROPAGATE its model so neighbors don't deadlock.
@@ -1158,19 +1189,30 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             # Registrar visita
             self.manager.register_visit(self._engine.addr)
 
-            await self._pivot_to(next_pivot)
+            await self._pivot_to(next_pivot, mode="forward")
         else:
-            logging.warning("[HONEYPOT DFS] ⚠️ No valid pivot direction found.")
-            # Unlock target to allow recalculation
-            self.manager.locked_target = None
+            backtrack_target = self._get_backtrack_target()
+            if backtrack_target and backtrack_target in neighbors:
+                logging.info(
+                    f"[HONEYPOT DFS] ↩️ Dead end at {self._engine.addr}. "
+                    f"Backtracking to previous honeypot {backtrack_target}."
+                )
+                self._last_pivot_round = current_round
+                await self._pivot_to(backtrack_target, mode="backtrack")
+            else:
+                logging.warning("[HONEYPOT DFS] ⚠️ No valid pivot direction found and no backtrack target available.")
+                # Unlock target to allow recalculation
+                self.manager.locked_target = None
 
-    async def _pivot_to(self, candidate):
+    async def _pivot_to(self, candidate, mode="forward"):
         if not self._is_honeypot_active():
             logging.info("[Honeypot] Inactive honeypot behavior. Refusing stale pivot request.")
             return
 
-        logging.info(f"[Honeypot] 👋 Pivoting to {candidate} (Next hop to target).")
+        self._ensure_current_in_path()
+        logging.info(f"[Honeypot] 👋 Pivoting to {candidate} (mode={mode}).")
         self._last_pivot_target = candidate
+        self._handover_mode = mode
 
         # Never open a second handover while one is pending.
         if getattr(self._engine, "_waiting_honeypot_handover", False):
@@ -1187,11 +1229,29 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         self._engine.has_served_as_honeypot = True
 
         target_state = self.manager.export_state()
+        next_epoch = int(getattr(self, "_honeypot_epoch", 0)) + 1
+        next_path = list(self._dfs_path_stack)
+        if not next_path or next_path[-1] != self._engine.addr:
+            next_path.append(self._engine.addr)
+        if mode == "forward":
+            if candidate != next_path[-1]:
+                next_path.append(candidate)
+        elif mode == "backtrack":
+            if next_path and next_path[-1] == self._engine.addr:
+                next_path.pop()
+            if not next_path or next_path[-1] != candidate:
+                next_path.append(candidate)
+        target_state["dfs_path_stack"] = next_path
+        target_state["honeypot_epoch"] = next_epoch
+        target_state["handover_mode"] = mode
         handover_id = f"{int(asyncio.get_running_loop().time()*1000)}-{random.getrandbits(32):08x}"
         target_state["__handover_id"] = handover_id
+        target_state["__handover_mode"] = mode
+        target_state["__honeypot_epoch"] = next_epoch
         if hasattr(self._engine, "rb"):
             self._engine.rb._pending_handover_id = handover_id
             self._engine.rb._pending_pivot_candidate = candidate
+            self._engine.rb._pending_honeypot_epoch = next_epoch
         payload = json.dumps(target_state)
 
         log_message = f"HONEYPOT_TRANSFER:{payload}"
@@ -1210,6 +1270,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             if hasattr(self._engine, "rb"):
                 self._engine.rb._pending_handover_id = None
                 self._engine.rb._pending_pivot_candidate = None
+                self._engine.rb._pending_honeypot_epoch = None
 
     async def _revert_to_aggregator(self):
         """Reverts honeypot role back to aggregator after threat containment."""

@@ -828,21 +828,6 @@ class Engine:
         honeypot_transfer_id = None
 
         if is_honey:
-            # If this node has just retired from honeypot, do not accept immediate re-promotions.
-            # This prevents ping-pong handovers where the old honeypot keeps re-sending transfers.
-            cooldown_until_round = getattr(self, "_honeypot_reaccept_block_until_round", -1)
-            if (
-                getattr(self, "has_served_as_honeypot", False)
-                and cooldown_until_round >= 0
-                and getattr(self, "round", 0) <= cooldown_until_round
-            ):
-                logging.warning(
-                    f"🛡️  Ignoring HONEYPOT transfer from {source}: post-retirement cooldown active "
-                    f"(current_round={getattr(self, 'round', 0)}, block_until={cooldown_until_round})."
-                )
-                reject_msg = self.cm.create_message("control", "leadership_transfer_ack", log="REJECT")
-                asyncio.create_task(self.cm.send_message(source, reject_msg))
-                return
             logging.info(f"🍯 HONEYPOT TRANSFER from {source}")
             target_role = Role.HONEYPOT
             try:
@@ -852,6 +837,42 @@ class Engine:
                     honeypot_transfer_id = honeypot_state.get("__handover_id")
                     self._incoming_honeypot_handover_id = honeypot_transfer_id
             except: pass
+            incoming_mode = None
+            incoming_epoch = None
+            if isinstance(honeypot_state, dict):
+                incoming_mode = honeypot_state.get("__handover_mode") or honeypot_state.get("handover_mode")
+                incoming_epoch = honeypot_state.get("__honeypot_epoch", honeypot_state.get("honeypot_epoch"))
+            try:
+                incoming_epoch = int(incoming_epoch) if incoming_epoch is not None else None
+            except Exception:
+                incoming_epoch = None
+
+            if getattr(self, "has_served_as_honeypot", False):
+                block_until = int(getattr(self, "_honeypot_reaccept_block_until_round", -1))
+                current_round = int(getattr(self, "round", 0))
+                last_epoch_served = int(getattr(self, "_last_honeypot_epoch_served", -1))
+                is_backtrack = incoming_mode == "backtrack"
+                is_newer_epoch = incoming_epoch is not None and incoming_epoch > last_epoch_served
+                if current_round < block_until and not is_backtrack:
+                    logging.warning(
+                        f"🛡️  Ignoring HONEYPOT transfer from {source}: cooldown active until round {block_until} "
+                        f"(mode={incoming_mode}, epoch={incoming_epoch})."
+                    )
+                    reject_msg = self.cm.create_message("control", "leadership_transfer_ack", log="REJECT")
+                    asyncio.create_task(self.cm.send_message(source, reject_msg))
+                    return
+                if incoming_epoch is not None and incoming_epoch <= last_epoch_served and not is_backtrack:
+                    logging.warning(
+                        f"🛡️  Ignoring stale HONEYPOT transfer from {source}: epoch={incoming_epoch} "
+                        f"<= last_served={last_epoch_served}."
+                    )
+                    reject_msg = self.cm.create_message("control", "leadership_transfer_ack", log="REJECT")
+                    asyncio.create_task(self.cm.send_message(source, reject_msg))
+                    return
+                logging.info(
+                    f"🍯 Allowing controlled reactivation as Honeypot from {source} "
+                    f"(mode={incoming_mode}, epoch={incoming_epoch}, newer_epoch={is_newer_epoch})."
+                )
         elif is_pivot:
              logging.info(f"💀 MALICIOUS INFECTION from {source}")
              target_role = Role.MALICIOUS
@@ -1013,6 +1034,18 @@ class Engine:
                 raw_log = getattr(message, "log", "")
                 msg_log = raw_log.decode('utf-8', errors='ignore') if isinstance(raw_log, bytes) else (str(raw_log) if raw_log else "")
                 ack_handover_id = None
+                if "REJECT" in msg_log:
+                    logging.warning(f"❌ Honeypot handover to {source} was rejected.")
+                    self._waiting_honeypot_handover = False
+                    if hasattr(self.rb, "_pending_handover_id"):
+                        self.rb._pending_handover_id = None
+                    if hasattr(self.rb, "_pending_pivot_candidate"):
+                        self.rb._pending_pivot_candidate = None
+                    if hasattr(self.rb, "_pending_honeypot_epoch"):
+                        self.rb._pending_honeypot_epoch = None
+                    if hasattr(self.rb, "_last_pivot_target"):
+                        self.rb._last_pivot_target = None
+                    return
                 if "HONEYPOT_FINAL_ACK:" in msg_log:
                     try:
                         ack_handover_id = msg_log.split("HONEYPOT_FINAL_ACK:", 1)[1].strip() or None
@@ -1055,6 +1088,9 @@ class Engine:
                 self.has_served_as_honeypot = True # FIX: Ensure we don't get re-promoted by factory
                 # Block immediate re-acceptance of honeypot transfers for a few rounds.
                 self._honeypot_reaccept_block_until_round = getattr(self, "round", 0) + 3
+                pending_epoch = getattr(self.rb, "_pending_honeypot_epoch", None)
+                if pending_epoch is not None:
+                    self._last_honeypot_epoch_served = int(pending_epoch)
                 self._waiting_honeypot_handover = False
                 if hasattr(self, "_role_behavior") and hasattr(self._role_behavior, "deactivate_honeypot"):
                     self._role_behavior.deactivate_honeypot()
@@ -1062,6 +1098,8 @@ class Engine:
                     self.rb._pending_handover_id = None
                 if hasattr(self.rb, "_pending_pivot_candidate"):
                     self.rb._pending_pivot_candidate = None
+                if hasattr(self.rb, "_pending_honeypot_epoch"):
+                    self.rb._pending_honeypot_epoch = None
                 target_role = Role.AGGREGATOR
 
                 if await self._round_in_process_lock.locked_async():
