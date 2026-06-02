@@ -788,6 +788,18 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 is_active_reporter = False
                 if hasattr(self._engine, "_reputation") and hasattr(self._engine._reputation, "is_active_reporter"):
                     is_active_reporter = bool(self._engine._reputation.is_active_reporter(node_id))
+                external_reporters = 0
+                if hasattr(self._engine, "_reputation") and hasattr(self._engine._reputation, "get_reporters"):
+                    try:
+                        external_reporters = len(
+                            {
+                                reporter_id
+                                for reporter_id in self._engine._reputation.get_reporters(node_id)
+                                if reporter_id and reporter_id != self._engine.addr
+                            }
+                        )
+                    except Exception:
+                        external_reporters = 0
 
                 # Single source of truth: manager/analyze_neighbor status.
                 if status == "BENIGN":
@@ -805,14 +817,32 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                     threat_detected_this_round = True
                     # Priority rule: immediate containment only for baseline scenario neighbors.
                     if node_id in self._baseline_neighbors:
-                        logging.critical(
-                            f"🚨 [Honeypot] BASELINE NEIGHBOR {node_id} flagged MALICIOUS. "
-                            "Initiating containment immediately."
+                        enough_baseline_confirmation = (
+                            external_reporters >= 1
+                            or (rounds_tested >= 3 and suspicious_count >= 2 and max_compliant_seen < 0.02)
                         )
-                        detected_attackers.add(node_id)
-                        first_detected_attacker = node_id
-                        self.threat_confirmed_locally = True
-                        break
+                        if enough_baseline_confirmation:
+                            logging.critical(
+                                f"🚨 [Honeypot] BASELINE NEIGHBOR {node_id} confirmed MALICIOUS "
+                                f"(reporters={external_reporters}, rounds={rounds_tested}, "
+                                f"susp={suspicious_count}, bait={max_compliant_seen:.2%}). "
+                                "Initiating containment."
+                            )
+                            detected_attackers.add(node_id)
+                            first_detected_attacker = node_id
+                            self.threat_confirmed_locally = True
+                            break
+                        logging.warning(
+                            f"[Honeypot] ⚠️ Baseline neighbor {node_id} looks MALICIOUS but lacks confirmation "
+                            f"(reporters={external_reporters}, rounds={rounds_tested}, "
+                            f"susp={suspicious_count}, bait={max_compliant_seen:.2%}). "
+                            "Holding in investigation mode and continuing pivot search."
+                        )
+                        if hasattr(self.manager, "neighbor_tracking"):
+                            state = self.manager.neighbor_tracking.setdefault(node_id, {})
+                            state["status"] = "TESTING"
+                        self._allow_pivot_for_indirect_threats = True
+                        continue
                     if is_active_reporter:
                         # Active reporters are usually carriers/victims. Investigate through them.
                         logging.warning(

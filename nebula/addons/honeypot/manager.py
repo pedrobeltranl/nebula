@@ -378,15 +378,24 @@ class HoneyPotManager:
         EPS = 0.02
         TAU_HONEST = 0.80
 
-        # Case 1: Malicious → SR high and CR ~ 0
-        if suspicious_rate >= TAU_SUSP and compliant_rate < EPS:
-            state["status"] = "MALICIOUS"
-            state["verified_round"] = current_round
-            logging.critical(
-                f"[Manager] 🚨 SEMANTIC MALICIOUS: SR={suspicious_rate:.2%} >= {TAU_SUSP:.2%} & "
-                f"CR={compliant_rate:.2%} < {EPS:.2%}. CONVICTING {neighbor_id}."
+        semantic_malicious_hit = suspicious_rate >= TAU_SUSP and compliant_rate < EPS
+        if semantic_malicious_hit:
+            semantic_rounds = state.setdefault("semantic_malicious_rounds", [])
+            semantic_rounds.append(current_round)
+            last_round = state.get("last_semantic_malicious_round")
+            if last_round is not None and current_round - last_round <= 1:
+                state["semantic_malicious_streak"] = int(state.get("semantic_malicious_streak", 0)) + 1
+            else:
+                state["semantic_malicious_streak"] = 1
+            state["last_semantic_malicious_round"] = current_round
+            state["status"] = "TESTING"
+            logging.warning(
+                f"[Manager] ⚠️ SEMANTIC MALICIOUS pattern observed for {neighbor_id}: "
+                f"SR={suspicious_rate:.2%} >= {TAU_SUSP:.2%} & CR={compliant_rate:.2%} < {EPS:.2%}. "
+                f"Holding for confirmation (streak={state['semantic_malicious_streak']})."
             )
-            return "MALICIOUS"
+        else:
+            state["semantic_malicious_streak"] = 0
 
         # Case 2: Carrier → SR > 0 and CR > 0
         if suspicious_rate > 0.0 and compliant_rate >= EPS:
@@ -1235,6 +1244,15 @@ class HoneyPotManager:
             "clash_count": 0,           # Counter for Honeymap contradictions (Honey target predictions)
         }
         for key, val in defaults.items():
+            if key not in state:
+                state[key] = val
+
+        extra_defaults = {
+            "semantic_malicious_streak": 0,
+            "semantic_malicious_rounds": [],
+            "last_semantic_malicious_round": None,
+        }
+        for key, val in extra_defaults.items():
             if key not in state:
                 state[key] = val
 
