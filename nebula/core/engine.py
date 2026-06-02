@@ -956,7 +956,12 @@ class Engine:
             # FIX: Send ACK immediately to prevent timeout at sender (Malicious Pivot)
             # relying on update_self_role at next round is too slow for 3s timeout.
             logging.info(f"Cycle active. Scheduling role {target_role} for next round. Sending immediate ACK to {source}.")
-            message = self.cm.create_message("control", "leadership_transfer_ack")
+            ack_log = (
+                f"HONEYPOT_PREACK:{honeypot_transfer_id}"
+                if target_role == Role.HONEYPOT and honeypot_transfer_id else
+                None
+            )
+            message = self.cm.create_message("control", "leadership_transfer_ack", log=ack_log)
             asyncio.create_task(self.cm.send_message(source, message))
 
             # Pass source_to_notificate=None so update_self_role doesn't send a duplicate ACK later
@@ -1019,6 +1024,9 @@ class Engine:
                         ack_handover_id = msg_log.split("HONEYPOT_ACK:", 1)[1].strip() or None
                     except Exception:
                         ack_handover_id = None
+                elif "HONEYPOT_PREACK:" in msg_log:
+                    logging.info(f"🍯 Received PREACK from {source}. Waiting for FINAL ACK before retiring.")
+                    return
 
                 expected_handover_id = getattr(self.rb, "_pending_handover_id", None)
                 expected_target = getattr(self.rb, "_pending_pivot_candidate", None)
@@ -1048,6 +1056,8 @@ class Engine:
                 # Block immediate re-acceptance of honeypot transfers for a few rounds.
                 self._honeypot_reaccept_block_until_round = getattr(self, "round", 0) + 3
                 self._waiting_honeypot_handover = False
+                if hasattr(self, "_role_behavior") and hasattr(self._role_behavior, "deactivate_honeypot"):
+                    self._role_behavior.deactivate_honeypot()
                 if hasattr(self.rb, "_pending_handover_id"):
                     self.rb._pending_handover_id = None
                 if hasattr(self.rb, "_pending_pivot_candidate"):

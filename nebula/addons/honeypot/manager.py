@@ -701,9 +701,26 @@ class HoneyPotManager:
         if has_genuine_bait:
             reputation_module = getattr(self.engine, "_reputation", None)
             is_active_reporter = bool(reputation_module and hasattr(reputation_module, "is_active_reporter") and reputation_module.is_active_reporter(neighbor_id))
+            strong_consensus, consensus_candidates = self._has_strong_global_suspect_consensus(neighbor_id, reputation_module)
 
             # Silent + suspicious nodes must not be upgraded to BENIGN with weak bait leakage.
             if not is_active_reporter and state["suspicious_count"] > 0:
+                if (
+                    strong_consensus
+                    and stable_attack_target
+                    and state["rounds_tested"] >= 3
+                    and state["suspicious_count"] >= 3
+                    and state["semantic_malicious_streak"] >= 1
+                    and state["max_compliant_seen"] <= 0.25
+                ):
+                    state["status"] = "MALICIOUS"
+                    state["verified_round"] = current_round
+                    logging.critical(
+                        f"[Manager] 🚨 Silent suspect {neighbor_id} promoted to MALICIOUS despite diluted bait "
+                        f"(consensus={consensus_candidates}, susp={state['suspicious_count']}, "
+                        f"rounds={state['rounds_tested']}, max_bait={state['max_compliant_seen']:.2%})."
+                    )
+                    return "MALICIOUS"
                 state["status"] = "TESTING"
                 logging.warning(
                     f"[Manager] ⚠️ Holding {neighbor_id} in TESTING: silent node with suspicious history "
@@ -1352,6 +1369,25 @@ class HoneyPotManager:
             )
 
         return ranked[0][0], ambiguous, ranked[:3]
+
+    def _has_strong_global_suspect_consensus(self, neighbor_id, reputation_module):
+        top_suspect, ambiguous, candidates = self._get_global_suspect_consensus(reputation_module)
+        if ambiguous or top_suspect != neighbor_id:
+            return False, candidates
+
+        leader_score = None
+        leader_reporters = 0
+        runner_up_score = None
+        if candidates:
+            leader_score = float(candidates[0][1])
+            leader_reporters = int(candidates[0][2])
+        if len(candidates) > 1:
+            runner_up_score = float(candidates[1][1])
+
+        strong_margin = runner_up_score is None or (runner_up_score - leader_score) >= 0.12
+        strong_reporters = leader_reporters >= 3
+        strong_score = leader_score is not None and leader_score <= 0.72
+        return strong_margin and strong_reporters and strong_score, candidates
 
     def analyze_neighbors_at_current_node(self, neighbors_models: dict, reputation_module, came_from: str = None, my_neighbors: set = None) -> tuple:
         """

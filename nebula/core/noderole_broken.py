@@ -663,7 +663,22 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         self._recovery_rounds_counter = 0  # Contador de rondas donde la reputación se recupera
         self._max_recovery_rounds = 3  # Si se recupera 3 rondas seguidas, desaparecer
 
+    def deactivate_honeypot(self):
+        """Hard-stop stale honeypot tasks after a confirmed handover."""
+        self._defense_active = False
+        self._allow_pivot_for_indirect_threats = False
+        self._last_pivot_target = None
+        self._last_pivot_source = None
+        logging.info("[Honeypot] 🧹 Honeypot behavior deactivated after handover/retirement.")
+
+    def _is_honeypot_active(self):
+        return self._defense_active and self.get_role() == Role.HONEYPOT
+
     async def extended_learning_cycle(self):
+        if not self._is_honeypot_active():
+            logging.info("[Honeypot] Inactive behavior detected before cycle start. Skipping stale cycle.")
+            return
+
         # --- FIX: Mimic Benign Aggregator Behavior FIRST ---
         # The Honeypot must train (or fake it) and PROPAGATE its model so neighbors don't deadlock.
 
@@ -724,6 +739,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 # Lock was not acquired, that's fine
                 pass
 
+        if not self._is_honeypot_active():
+            logging.info("[Honeypot] Cycle retired after training. Aborting stale post-training actions.")
+            return
+
         # 2. Self-Report
         try:
             self_update_event = UpdateReceivedEvent(
@@ -735,6 +754,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             await EventManager.get_instance().publish_node_event(self_update_event)
         except Exception as e:
             logging.error(f"[Honeypot] Error publishing self-update: {e}")
+
+        if not self._is_honeypot_active():
+            logging.info("[Honeypot] Cycle retired after self-report. Aborting stale propagation.")
+            return
 
         # 3. Propagate to neighbors
         try:
@@ -748,9 +771,17 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         except Exception as e:
             logging.error(f"[Honeypot] Error propagating model: {e}")
 
+        if not self._is_honeypot_active():
+            logging.info("[Honeypot] Cycle retired before waiting for updates. Aborting stale analysis.")
+            return
+
         # 4. Wait for Updates (Standard Sync)
         await self._engine._waiting_model_updates()
         # ----------------------------------------------------
+
+        if not self._is_honeypot_active():
+            logging.info("[Honeypot] Cycle retired while waiting for updates. Ignoring stale neighbor analysis.")
+            return
 
         logging.info("[Honeypot] 🕵️ Analyzing neighbor updates...")
         updates_storage = self._engine.aggregator.us.us
@@ -1041,6 +1072,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         3. Si no, selecciona un vecino para pivotar (sin retroceder)
         4. El honeypot avanza en profundidad hasta encontrar al atacante
         """
+        if not self._is_honeypot_active():
+            logging.info("[HONEYPOT DFS] Inactive honeypot behavior. Skipping stale pivot task.")
+            return
+
         current_round = getattr(self._engine, 'round', 0)
 
         # SAFETY: If we've retired, don't do anything with pivot logic
@@ -1130,6 +1165,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             self.manager.locked_target = None
 
     async def _pivot_to(self, candidate):
+        if not self._is_honeypot_active():
+            logging.info("[Honeypot] Inactive honeypot behavior. Refusing stale pivot request.")
+            return
+
         logging.info(f"[Honeypot] 👋 Pivoting to {candidate} (Next hop to target).")
         self._last_pivot_target = candidate
 
