@@ -846,6 +846,16 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 rounds_tested = int(tracker_state.get("rounds_tested", 0))
                 max_compliant_seen = float(tracker_state.get("max_compliant_seen", 0.0))
                 carrier_suspect = bool(tracker_state.get("carrier_suspect", False))
+                semantic_sr = 0.0
+                semantic_cr = max_compliant_seen
+                semantic_hr = 1.0
+                try:
+                    if hasattr(self.manager, "_check_neighbor_has_backdoor"):
+                        _, _, semantic_cr, _, semantic_sr, semantic_hr, _ = self.manager._check_neighbor_has_backdoor(update_obj.model)
+                except Exception:
+                    semantic_sr = 0.0
+                    semantic_cr = max_compliant_seen
+                    semantic_hr = 1.0
 
                 is_active_reporter = False
                 if hasattr(self._engine, "_reputation") and hasattr(self._engine._reputation, "is_active_reporter"):
@@ -881,6 +891,34 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 if status == "TESTING" and (carrier_suspect or suspicious_count > 0):
                     threat_detected_this_round = True
                     self._allow_pivot_for_indirect_threats = True
+                    strong_consensus = False
+                    if hasattr(self.manager, "_has_strong_global_suspect_consensus"):
+                        strong_consensus, _ = self.manager._has_strong_global_suspect_consensus(
+                            node_id,
+                            getattr(self._engine, "_reputation", None),
+                        )
+                    direct_neighbor_attacker = (
+                        not is_active_reporter
+                        and node_id in getattr(self._engine.cm, "connections", {})
+                        and rounds_tested >= 3
+                        and suspicious_count >= 3
+                        and semantic_sr >= 0.60
+                        and semantic_hr <= 0.10
+                        and max_compliant_seen <= 0.40
+                        and strong_consensus
+                        and not ambiguous_suspects
+                        and top_suspect == node_id
+                    )
+                    if direct_neighbor_attacker:
+                        logging.critical(
+                            f"🚨 [Honeypot] DIRECT NEIGHBOR {node_id} confirmed as ATTACKER under strong semantic evidence "
+                            f"(rounds={rounds_tested}, susp={suspicious_count}, CR={semantic_cr:.2%}, "
+                            f"SR={semantic_sr:.2%}, HR={semantic_hr:.2%}, bait={max_compliant_seen:.2%})."
+                        )
+                        detected_attackers.add(node_id)
+                        first_detected_attacker = node_id
+                        self.threat_confirmed_locally = True
+                        break
 
                 if status == "MALICIOUS":
                     threat_detected_this_round = True
@@ -1159,7 +1197,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             return
 
         # 3. ANALIZAR VECINOS USANDO DFS
-        attacker_found, attacker_id = self.manager.analyze_neighbors_at_current_node(
+        attacker_found, pivot_decision = self.manager.analyze_neighbors_at_current_node(
             neighbors_models=neighbors_models,
             reputation_module=self._engine._reputation if hasattr(self._engine, '_reputation') else None,
             came_from=self._last_pivot_source,  # No retroceder
@@ -1167,19 +1205,30 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         )
 
         if attacker_found:
-            logging.critical(f"[HONEYPOT DFS] 🎯 ATTACKER FOUND: {attacker_id}")
+            logging.critical(f"[HONEYPOT DFS] 🎯 ATTACKER FOUND: {pivot_decision}")
             self.threat_confirmed_locally = True
             self.consecutive_clean_rounds = 0
             # Ejecutar protocolo de contención
-            await self._execute_containment_protocol(attacker_id)
+            await self._execute_containment_protocol(pivot_decision)
+            return
+
+        if pivot_decision == getattr(self.manager, "HOLD_POSITION", "__HOLD__"):
+            logging.info("[HONEYPOT DFS] ⏸️ Manager requested HOLD. Skipping pivot this round.")
             return
 
         # 4. SI NO ENCONTRAMOS ATACANTE, SELECCIONAR SIGUIENTE DIRECCIÓN
-        next_pivot = self.manager.get_dfs_pivot_direction(
-            topology=topology,
-            my_id=self._engine.addr,
-            came_from=self._last_pivot_source
-        )
+        next_pivot = None
+        if pivot_decision and pivot_decision not in (
+            getattr(self.manager, "BACKTRACK_REQUIRED", "__BACKTRACK__"),
+            getattr(self.manager, "HOLD_POSITION", "__HOLD__"),
+        ):
+            next_pivot = pivot_decision
+        else:
+            next_pivot = self.manager.get_dfs_pivot_direction(
+                topology=topology,
+                my_id=self._engine.addr,
+                came_from=self._last_pivot_source
+            )
 
         if next_pivot:
             logging.info(f"[HONEYPOT DFS] 🚀 Pivoting to {next_pivot} (DFS deepening)")

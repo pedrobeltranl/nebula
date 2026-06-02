@@ -13,6 +13,9 @@ except ImportError:
     HoneyDataset = None
 
 class HoneyPotManager:
+    HOLD_POSITION = "__HOLD__"
+    BACKTRACK_REQUIRED = "__BACKTRACK__"
+
     def __init__(self, config=None, engine=None, seed: float = 0.5, role_behavior=None):
         self.config = config
         self.engine = engine
@@ -1481,7 +1484,7 @@ class HoneyPotManager:
             else:
                 logging.info(f"[DFS] ⏳ GRACE PERIOD at current node (round {self.rounds_at_current_node}/{self.grace_rounds_per_node})")
                 logging.info(f"[DFS] 🎣 Injecting HoneyDoor backdoor - waiting for propagation before analysis")
-                return (False, None)
+                return (False, self.HOLD_POSITION)
 
         # DESPUÉS DEL GRACE PERIOD: Analizar vecinos para detectar atacante
         logging.info(f"[DFS] ✅ Grace period COMPLETE - Starting neighbor analysis")
@@ -1520,7 +1523,7 @@ class HoneyPotManager:
 
             if waiting_for:
                 logging.warning(f"[DFS] ⏳ HOLDING: Waiting for models from lagging neighbors: {waiting_for}")
-                return (False, None)
+                return (False, self.HOLD_POSITION)
 
         compliant_neighbors = []     # Neighbors verified BENIGN (bait + clean round)
         investigation_neighbors = [] # Neighbors suspicious BUT COMPLIANT (victims/carriers)
@@ -1658,7 +1661,7 @@ class HoneyPotManager:
                 f"   Policy: Will wait {self.confirmation_rounds_required} rounds OR reach EXTENDED_MALICIOUS_THRESHOLD (10 neg rounds)\n"
                 f"   Action: HOLD & STRENGTHEN to differentiate weak backdoor (benign) from strong filtering (malicious)\n"
             )
-            return (False, None)
+            return (False, self.HOLD_POSITION)
 
         # 4. If everything visited/analyzed, we stay put (Active Monitoring)
         logging.error(
@@ -1670,7 +1673,7 @@ class HoneyPotManager:
             f"     - Weak backdoor nodes (strengthening): {list(self.weak_backdoor_nodes.keys())}\n"
             f"     - Visited: {list(self.visited_history)}\n"
         )
-        return (False, None)
+        return (False, self.BACKTRACK_REQUIRED)
 
     def _is_node_silent_to_neighbors(self, suspect_node: str, my_neighbors: set, reputation_module) -> bool:
         """
