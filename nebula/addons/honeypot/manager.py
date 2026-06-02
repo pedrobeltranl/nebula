@@ -372,13 +372,34 @@ class HoneyPotManager:
         state["last_cr"] = float(compliant_rate)
         state["last_sr"] = float(suspicious_rate)
         state["last_hr"] = float(honest_rate)
+        if dominant_target is not None:
+            state.setdefault("dominant_target_history", []).append((current_round, dominant_target))
+            if state.get("last_dominant_target") == dominant_target:
+                state["dominant_target_streak"] = int(state.get("dominant_target_streak", 0)) + 1
+            else:
+                state["dominant_target_streak"] = 1
+            state["last_dominant_target"] = dominant_target
+
+        recent_targets = [target for _, target in state.get("dominant_target_history", [])[-3:]]
+        stable_attack_target = (
+            dominant_target is not None
+            and (
+                state.get("dominant_target_streak", 0) >= 2
+                or recent_targets.count(dominant_target) >= 2
+            )
+        )
 
         # === SEMANTIC VERIFICATION (MadHoney Spec) ===
         TAU_SUSP = getattr(self.detector, "threshold", 0.40)
         EPS = 0.02
         TAU_HONEST = 0.80
+        LOW_HONESTY_THRESHOLD = 0.35
 
-        semantic_malicious_hit = suspicious_rate >= TAU_SUSP and compliant_rate < EPS
+        semantic_malicious_hit = (
+            suspicious_rate >= TAU_SUSP
+            and compliant_rate < EPS
+            and honest_rate < LOW_HONESTY_THRESHOLD
+        )
         if semantic_malicious_hit:
             semantic_rounds = state.setdefault("semantic_malicious_rounds", [])
             semantic_rounds.append(current_round)
@@ -392,7 +413,9 @@ class HoneyPotManager:
             logging.warning(
                 f"[Manager] ⚠️ SEMANTIC MALICIOUS pattern observed for {neighbor_id}: "
                 f"SR={suspicious_rate:.2%} >= {TAU_SUSP:.2%} & CR={compliant_rate:.2%} < {EPS:.2%}. "
-                f"Holding for confirmation (streak={state['semantic_malicious_streak']})."
+                f"HR={honest_rate:.2%} < {LOW_HONESTY_THRESHOLD:.2%}. "
+                f"Holding for confirmation (streak={state['semantic_malicious_streak']}, "
+                f"target={dominant_target}, stable_target={stable_attack_target})."
             )
         else:
             state["semantic_malicious_streak"] = 0
@@ -576,6 +599,7 @@ class HoneyPotManager:
                            external_reporters = 0
 
                   has_cross_confirmation = external_reporters >= 2
+                  top_suspect, consensus_ambiguous, consensus_candidates = self._get_global_suspect_consensus(reputation_module)
                   suspicious_rounds = state.get("suspicious_rounds", [])
                   clash_rounds = state.get("clash_rounds", [])
                   # Compute consecutive suspicion streak length from the end
@@ -603,8 +627,21 @@ class HoneyPotManager:
                            and state["max_compliant_seen"] < BENIGN_COMPLIANT_THRESHOLD
                            and has_recent_susp_streak
                            and has_recent_clash
+                           and stable_attack_target
                            and (has_cross_confirmation or local_extreme_evidence)
                        ):
+                           if top_suspect and top_suspect != neighbor_id:
+                               logging.warning(
+                                   f"[Manager] 🌍 Holding conviction for {neighbor_id}: "
+                                   f"global suspect leader is {top_suspect}, candidates={consensus_candidates}."
+                               )
+                               return "TESTING"
+                           if consensus_ambiguous:
+                               logging.warning(
+                                   f"[Manager] 🌫️ Holding conviction for {neighbor_id}: "
+                                   f"global suspect map is ambiguous {consensus_candidates}."
+                               )
+                               return "TESTING"
                            if not state.get("conviction_pending_round"):
                                state["conviction_pending_round"] = current_round
                                logging.warning(
@@ -635,7 +672,8 @@ class HoneyPotManager:
                                f"missing robust evidence (qualified_reporters={external_reporters}, "
                                f"raw_reporters={sorted(set(reporter_list)) if reporter_list else []}, "
                                f"qualified={sorted(set(qualified_reporters)) if qualified_reporters else []}, "
-                               f"recent_susp_streak={has_recent_susp_streak}, recent_clash={has_recent_clash})."
+                               f"recent_susp_streak={has_recent_susp_streak}, recent_clash={has_recent_clash}, "
+                               f"stable_target={stable_attack_target}, consensus={consensus_candidates})."
                            )
 
                        logging.warning(f"[Manager] 🛡️ {neighbor_id} is suspicious but has CLASHES ({state['clash_count']}). Treating as VICTIM CARRIER (Grace: {state['suspicious_count']}/{CLASH_GRACE_ROUNDS}).")
@@ -804,6 +842,25 @@ class HoneyPotManager:
                     )
                     return "TESTING"
                 else:
+                    top_suspect, consensus_ambiguous, consensus_candidates = self._get_global_suspect_consensus(reputation_module)
+                    if not stable_attack_target:
+                        logging.warning(
+                            f"[Manager] 🧭 Holding {neighbor_id} in TESTING: unstable dominant target "
+                            f"(target={dominant_target}, history={recent_targets})."
+                        )
+                        return "TESTING"
+                    if top_suspect and top_suspect != neighbor_id:
+                        logging.warning(
+                            f"[Manager] 🌍 Holding {neighbor_id} in TESTING: "
+                            f"global suspect leader is {top_suspect}, candidates={consensus_candidates}."
+                        )
+                        return "TESTING"
+                    if consensus_ambiguous:
+                        logging.warning(
+                            f"[Manager] 🌫️ Holding {neighbor_id} in TESTING: "
+                            f"global suspect map is ambiguous {consensus_candidates}."
+                        )
+                        return "TESTING"
                     # RCA 22:11 (Fase 6): Increased to 10 to give honest nodes time
                     # to show bait even under heavy local poisoning.
                     EXTENDED_MALICIOUS_THRESHOLD = 10 # Increased from 5
@@ -1251,12 +1308,50 @@ class HoneyPotManager:
             "semantic_malicious_streak": 0,
             "semantic_malicious_rounds": [],
             "last_semantic_malicious_round": None,
+            "dominant_target_history": [],
+            "last_dominant_target": None,
+            "dominant_target_streak": 0,
         }
         for key, val in extra_defaults.items():
             if key not in state:
                 state[key] = val
 
         return state
+
+    def _get_global_suspect_consensus(self, reputation_module, max_score_gap=0.08, min_reporters=2):
+        if not reputation_module or not hasattr(reputation_module, "get_global_trust_map"):
+            return None, False, []
+
+        try:
+            suspects_scores, _ = reputation_module.get_global_trust_map()
+        except Exception:
+            return None, False, []
+
+        ranked = []
+        for suspect, avg_score in suspects_scores.items():
+            reporters = 0
+            if hasattr(reputation_module, "get_reporters"):
+                try:
+                    reporters = len(set(reputation_module.get_reporters(suspect)))
+                except Exception:
+                    reporters = 0
+            if reporters >= min_reporters:
+                ranked.append((suspect, float(avg_score), reporters))
+
+        ranked.sort(key=lambda item: (item[1], -item[2], item[0]))
+        if not ranked:
+            return None, False, []
+
+        ambiguous = False
+        if len(ranked) > 1:
+            leader = ranked[0]
+            runner_up = ranked[1]
+            ambiguous = (
+                abs(runner_up[1] - leader[1]) <= max_score_gap
+                and runner_up[2] >= max(leader[2] - 1, 1)
+            )
+
+        return ranked[0][0], ambiguous, ranked[:3]
 
     def analyze_neighbors_at_current_node(self, neighbors_models: dict, reputation_module, came_from: str = None, my_neighbors: set = None) -> tuple:
         """

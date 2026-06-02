@@ -789,6 +789,9 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 if hasattr(self._engine, "_reputation") and hasattr(self._engine._reputation, "is_active_reporter"):
                     is_active_reporter = bool(self._engine._reputation.is_active_reporter(node_id))
                 external_reporters = 0
+                top_suspect = None
+                ambiguous_suspects = False
+                suspect_candidates = []
                 if hasattr(self._engine, "_reputation") and hasattr(self._engine._reputation, "get_reporters"):
                     try:
                         external_reporters = len(
@@ -800,6 +803,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                         )
                     except Exception:
                         external_reporters = 0
+                if hasattr(self.manager, "_get_global_suspect_consensus"):
+                    top_suspect, ambiguous_suspects, suspect_candidates = self.manager._get_global_suspect_consensus(
+                        getattr(self._engine, "_reputation", None)
+                    )
 
                 # Single source of truth: manager/analyze_neighbor status.
                 if status == "BENIGN":
@@ -821,7 +828,24 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                             external_reporters >= 1
                             or (rounds_tested >= 3 and suspicious_count >= 2 and max_compliant_seen < 0.02)
                         )
+                        globally_aligned = (
+                            top_suspect is None
+                            or (
+                                not ambiguous_suspects
+                                and top_suspect == node_id
+                            )
+                        )
                         if enough_baseline_confirmation:
+                            if not globally_aligned:
+                                logging.warning(
+                                    f"[Honeypot] 🌍 Baseline neighbor {node_id} looks MALICIOUS but global leader is "
+                                    f"{top_suspect} and candidates={suspect_candidates}. Holding investigation."
+                                )
+                                if hasattr(self.manager, "neighbor_tracking"):
+                                    state = self.manager.neighbor_tracking.setdefault(node_id, {})
+                                    state["status"] = "TESTING"
+                                self._allow_pivot_for_indirect_threats = True
+                                continue
                             logging.critical(
                                 f"🚨 [Honeypot] BASELINE NEIGHBOR {node_id} confirmed MALICIOUS "
                                 f"(reporters={external_reporters}, rounds={rounds_tested}, "
