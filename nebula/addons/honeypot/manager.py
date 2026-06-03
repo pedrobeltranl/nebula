@@ -706,9 +706,46 @@ class HoneyPotManager:
             reputation_module = getattr(self.engine, "_reputation", None)
             is_active_reporter = bool(reputation_module and hasattr(reputation_module, "is_active_reporter") and reputation_module.is_active_reporter(neighbor_id))
             strong_consensus, consensus_candidates = self._has_strong_global_suspect_consensus(neighbor_id, reputation_module)
+            semantic_sr_now = 0.0
+            semantic_hr_now = 1.0
+            semantic_cr_now = compliant_rate
+            try:
+                semantic_sr_now = float(suspicious_rate)
+            except Exception:
+                semantic_sr_now = 0.0
+            try:
+                semantic_hr_now = float(honest_rate)
+            except Exception:
+                semantic_hr_now = 1.0
+            try:
+                semantic_cr_now = float(compliant_rate)
+            except Exception:
+                semantic_cr_now = state["max_compliant_seen"]
 
             # Silent + suspicious nodes must not be upgraded to BENIGN with weak bait leakage.
             if not is_active_reporter and state["suspicious_count"] > 0:
+                severe_semantic_attacker_signature = (
+                    state["rounds_tested"] >= 3
+                    and state["suspicious_count"] >= 3
+                    and stable_attack_target
+                    and semantic_sr_now >= 0.70
+                    and semantic_hr_now <= 0.12
+                    and semantic_cr_now <= 0.20
+                    and state["max_compliant_seen"] <= 0.40
+                    and (
+                        strong_consensus
+                        or state["semantic_malicious_streak"] >= 2
+                    )
+                )
+                if severe_semantic_attacker_signature:
+                    state["status"] = "MALICIOUS"
+                    state["verified_round"] = current_round
+                    logging.critical(
+                        f"[Manager] 🚨 Silent suspect {neighbor_id} promoted to MALICIOUS via severe semantic fingerprint "
+                        f"(SR={semantic_sr_now:.2%}, HR={semantic_hr_now:.2%}, CR={semantic_cr_now:.2%}, "
+                        f"susp={state['suspicious_count']}, rounds={state['rounds_tested']}, max_bait={state['max_compliant_seen']:.2%})."
+                    )
+                    return "MALICIOUS"
                 if (
                     strong_consensus
                     and stable_attack_target

@@ -952,17 +952,20 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                     immediate_direct_neighbor_attacker = (
                         not is_active_reporter
                         and node_id in getattr(self._engine.cm, "connections", {})
-                        and semantic_sr >= 0.80
-                        and semantic_hr <= 0.05
+                        and rounds_tested >= 3
+                        and suspicious_count >= 3
+                        and semantic_sr >= 0.70
+                        and semantic_hr <= 0.12
                         and semantic_cr <= 0.25
                         and max_compliant_seen <= 0.40
                         and (
                             strong_consensus
+                            or rounds_tested >= 4
                             or status == "MALICIOUS"
                             or (
                                 top_suspect == node_id
                                 and not ambiguous_suspects
-                                and external_reporters >= 2
+                                and external_reporters >= 1
                             )
                         )
                     )
