@@ -1103,6 +1103,10 @@ class HoneyPotManager:
             state["honeypot_epoch"] = int(getattr(self.role_behavior, "_honeypot_epoch", 0))
         if self.role_behavior and hasattr(self.role_behavior, "_handover_mode"):
             state["handover_mode"] = getattr(self.role_behavior, "_handover_mode", "forward")
+        if self.role_behavior and hasattr(self.role_behavior, "_temporarily_rejected_forward_targets"):
+            state["temporarily_rejected_forward_targets"] = dict(
+                getattr(self.role_behavior, "_temporarily_rejected_forward_targets", {})
+            )
         if self.strategy:
             state["seed_state"] = self.strategy.get_state()
         return state
@@ -1138,6 +1142,14 @@ class HoneyPotManager:
             logging.info(f"[Manager] 🕒 Honeypot epoch restored: {self.role_behavior._honeypot_epoch}")
         if self.role_behavior and "handover_mode" in state:
             self.role_behavior._handover_mode = state.get("handover_mode", "forward")
+        if self.role_behavior and "temporarily_rejected_forward_targets" in state:
+            self.role_behavior._temporarily_rejected_forward_targets = dict(
+                state.get("temporarily_rejected_forward_targets", {}) or {}
+            )
+            logging.info(
+                f"[Manager] 🚧 Temporarily rejected forward targets restored: "
+                f"{self.role_behavior._temporarily_rejected_forward_targets}"
+            )
 
         # Restore per-node grace period counter
         if "rounds_at_current_node" in state:

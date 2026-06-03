@@ -1036,6 +1036,11 @@ class Engine:
                 ack_handover_id = None
                 if "REJECT" in msg_log:
                     logging.warning(f"❌ Honeypot handover to {source} was rejected.")
+                    if hasattr(self.rb, "handle_honeypot_handover_reject"):
+                        try:
+                            self.rb.handle_honeypot_handover_reject(source)
+                        except Exception as exc:
+                            logging.warning(f"Failed to process honeypot handover rejection for {source}: {exc}")
                     self._waiting_honeypot_handover = False
                     if hasattr(self.rb, "_pending_handover_id"):
                         self.rb._pending_handover_id = None
@@ -1043,6 +1048,8 @@ class Engine:
                         self.rb._pending_pivot_candidate = None
                     if hasattr(self.rb, "_pending_honeypot_epoch"):
                         self.rb._pending_honeypot_epoch = None
+                    if hasattr(self.rb, "_pending_handover_mode"):
+                        self.rb._pending_handover_mode = None
                     if hasattr(self.rb, "_last_pivot_target"):
                         self.rb._last_pivot_target = None
                     return
@@ -1100,6 +1107,8 @@ class Engine:
                     self.rb._pending_pivot_candidate = None
                 if hasattr(self.rb, "_pending_honeypot_epoch"):
                     self.rb._pending_honeypot_epoch = None
+                if hasattr(self.rb, "_pending_handover_mode"):
+                    self.rb._pending_handover_mode = None
                 target_role = Role.AGGREGATOR
 
                 if await self._round_in_process_lock.locked_async():

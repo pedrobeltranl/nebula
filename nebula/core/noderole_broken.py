@@ -639,6 +639,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         self._honeypot_epoch = 0
         self._handover_mode = "forward"
         self._honeypot_transfer_source = None
+        self._temporarily_rejected_forward_targets = {}
 
         # NEW: Control independent pivot allowance for indirect threats
         # When True, honeypot can pivot to find threat source even if threat_confirmed
@@ -678,6 +679,45 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         self._last_pivot_target = None
         self._last_pivot_source = None
         logging.info("[Honeypot] 🧹 Honeypot behavior deactivated after handover/retirement.")
+
+    def _prune_temporarily_rejected_forward_targets(self):
+        current_round = int(getattr(self._engine, "round", 0))
+        expired = [
+            node_id
+            for node_id, unblock_round in self._temporarily_rejected_forward_targets.items()
+            if current_round >= int(unblock_round)
+        ]
+        for node_id in expired:
+            self._temporarily_rejected_forward_targets.pop(node_id, None)
+
+    def _mark_forward_target_temporarily_unavailable(self, node_id: str, cooldown_rounds: int = 3):
+        if not node_id:
+            return
+        current_round = int(getattr(self._engine, "round", 0))
+        unblock_round = current_round + max(1, int(cooldown_rounds))
+        self._temporarily_rejected_forward_targets[node_id] = unblock_round
+        logging.warning(
+            f"[Honeypot] 🚧 Temporarily blacklisting forward pivot target {node_id} "
+            f"until round {unblock_round} after handover rejection."
+        )
+
+    def _is_forward_target_temporarily_unavailable(self, node_id: str) -> bool:
+        self._prune_temporarily_rejected_forward_targets()
+        unblock_round = self._temporarily_rejected_forward_targets.get(node_id)
+        if unblock_round is None:
+            return False
+        return int(getattr(self._engine, "round", 0)) < int(unblock_round)
+
+    def _get_temporarily_unavailable_forward_targets(self) -> set:
+        self._prune_temporarily_rejected_forward_targets()
+        return set(self._temporarily_rejected_forward_targets.keys())
+
+    def handle_honeypot_handover_reject(self, source: str):
+        pending_mode = getattr(self, "_pending_handover_mode", None)
+        pending_candidate = getattr(self, "_pending_pivot_candidate", None)
+        if pending_mode == "forward" and pending_candidate and source == pending_candidate:
+            self._mark_forward_target_temporarily_unavailable(source)
+        self._pending_handover_mode = None
 
     def set_transfer_source(self, source):
         self._honeypot_transfer_source = source
@@ -909,6 +949,33 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                         and not ambiguous_suspects
                         and top_suspect == node_id
                     )
+                    immediate_direct_neighbor_attacker = (
+                        not is_active_reporter
+                        and node_id in getattr(self._engine.cm, "connections", {})
+                        and semantic_sr >= 0.80
+                        and semantic_hr <= 0.05
+                        and semantic_cr <= 0.25
+                        and max_compliant_seen <= 0.40
+                        and (
+                            strong_consensus
+                            or status == "MALICIOUS"
+                            or (
+                                top_suspect == node_id
+                                and not ambiguous_suspects
+                                and external_reporters >= 2
+                            )
+                        )
+                    )
+                    if immediate_direct_neighbor_attacker:
+                        logging.critical(
+                            f"🚨 [Honeypot] DIRECT NEIGHBOR {node_id} immediately confirmed as ATTACKER "
+                            f"on first-contact semantic evidence (CR={semantic_cr:.2%}, SR={semantic_sr:.2%}, "
+                            f"HR={semantic_hr:.2%}, reporters={external_reporters}, bait={max_compliant_seen:.2%})."
+                        )
+                        detected_attackers.add(node_id)
+                        first_detected_attacker = node_id
+                        self.threat_confirmed_locally = True
+                        break
                     if direct_neighbor_attacker:
                         logging.critical(
                             f"🚨 [Honeypot] DIRECT NEIGHBOR {node_id} confirmed as ATTACKER under strong semantic evidence "
@@ -1218,16 +1285,32 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
         # 4. SI NO ENCONTRAMOS ATACANTE, SELECCIONAR SIGUIENTE DIRECCIÓN
         next_pivot = None
+        temporarily_unavailable_targets = self._get_temporarily_unavailable_forward_targets()
         if pivot_decision and pivot_decision not in (
             getattr(self.manager, "BACKTRACK_REQUIRED", "__BACKTRACK__"),
             getattr(self.manager, "HOLD_POSITION", "__HOLD__"),
         ):
-            next_pivot = pivot_decision
+            if pivot_decision in temporarily_unavailable_targets:
+                logging.info(
+                    f"[HONEYPOT DFS] 🚧 Manager suggested {pivot_decision}, but it is temporarily unavailable. "
+                    "Searching alternative forward branch first."
+                )
+            else:
+                next_pivot = pivot_decision
         else:
             next_pivot = self.manager.get_dfs_pivot_direction(
                 topology=topology,
                 my_id=self._engine.addr,
-                came_from=self._last_pivot_source
+                came_from=self._last_pivot_source,
+                exclude_nodes=temporarily_unavailable_targets,
+            )
+
+        if next_pivot is None and temporarily_unavailable_targets:
+            next_pivot = self.manager.get_dfs_pivot_direction(
+                topology=topology,
+                my_id=self._engine.addr,
+                came_from=self._last_pivot_source,
+                exclude_nodes=temporarily_unavailable_targets,
             )
 
         if next_pivot:
@@ -1240,6 +1323,23 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
 
             await self._pivot_to(next_pivot, mode="forward")
         else:
+            forward_candidates = []
+            if topology and self._engine.addr in topology:
+                forward_candidates = [
+                    node_id
+                    for node_id in topology[self._engine.addr]
+                    if node_id != self._last_pivot_source and not self.manager.is_visited(node_id)
+                ]
+            temporarily_blocked_candidates = [
+                node_id for node_id in forward_candidates
+                if node_id in temporarily_unavailable_targets
+            ]
+            if temporarily_blocked_candidates:
+                logging.info(
+                    f"[HONEYPOT DFS] ⏳ Holding position instead of backtracking: unvisited forward candidates "
+                    f"{temporarily_blocked_candidates} are temporarily unavailable."
+                )
+                return
             backtrack_target = self._get_backtrack_target()
             if backtrack_target and backtrack_target in neighbors:
                 logging.info(
@@ -1301,6 +1401,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             self._engine.rb._pending_handover_id = handover_id
             self._engine.rb._pending_pivot_candidate = candidate
             self._engine.rb._pending_honeypot_epoch = next_epoch
+            self._engine.rb._pending_handover_mode = mode
         payload = json.dumps(target_state)
 
         log_message = f"HONEYPOT_TRANSFER:{payload}"
@@ -1320,6 +1421,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 self._engine.rb._pending_handover_id = None
                 self._engine.rb._pending_pivot_candidate = None
                 self._engine.rb._pending_honeypot_epoch = None
+                self._engine.rb._pending_handover_mode = None
 
     async def _revert_to_aggregator(self):
         """Reverts honeypot role back to aggregator after threat containment."""
