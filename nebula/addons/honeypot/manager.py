@@ -724,12 +724,34 @@ class HoneyPotManager:
 
             # Silent + suspicious nodes must not be upgraded to BENIGN with weak bait leakage.
             if not is_active_reporter and state["suspicious_count"] > 0:
+                first_contact_direct_attacker_signature = (
+                    state["rounds_tested"] >= 2
+                    and state["suspicious_count"] >= 1
+                    and stable_attack_target
+                    and semantic_sr_now >= 0.75
+                    and semantic_hr_now <= 0.16
+                    and semantic_cr_now <= 0.20
+                    and state["max_compliant_seen"] <= 0.25
+                    and (
+                        strong_consensus
+                        or state["semantic_malicious_streak"] >= 1
+                    )
+                )
+                if first_contact_direct_attacker_signature:
+                    state["status"] = "MALICIOUS"
+                    state["verified_round"] = current_round
+                    logging.critical(
+                        f"[Manager] 🚨 Silent suspect {neighbor_id} promoted to MALICIOUS on first-contact direct signature "
+                        f"(SR={semantic_sr_now:.2%}, HR={semantic_hr_now:.2%}, CR={semantic_cr_now:.2%}, "
+                        f"susp={state['suspicious_count']}, rounds={state['rounds_tested']}, max_bait={state['max_compliant_seen']:.2%})."
+                    )
+                    return "MALICIOUS"
                 severe_semantic_attacker_signature = (
                     state["rounds_tested"] >= 3
-                    and state["suspicious_count"] >= 3
+                    and state["suspicious_count"] >= 2
                     and stable_attack_target
                     and semantic_sr_now >= 0.70
-                    and semantic_hr_now <= 0.12
+                    and semantic_hr_now <= 0.16
                     and semantic_cr_now <= 0.20
                     and state["max_compliant_seen"] <= 0.40
                     and (
