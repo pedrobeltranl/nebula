@@ -724,16 +724,22 @@ class HoneyPotManager:
 
             # Silent + suspicious nodes must not be upgraded to BENIGN with weak bait leakage.
             if not is_active_reporter and state["suspicious_count"] > 0:
+                attack_target_persistent = (
+                    stable_attack_target
+                    or state.get("dominant_target_streak", 0) >= 2
+                    or state.get("semantic_malicious_streak", 0) >= 1
+                )
                 first_contact_direct_attacker_signature = (
                     state["rounds_tested"] >= 2
                     and state["suspicious_count"] >= 1
-                    and stable_attack_target
+                    and attack_target_persistent
                     and semantic_sr_now >= 0.75
                     and semantic_hr_now <= 0.16
                     and semantic_cr_now <= 0.20
                     and state["max_compliant_seen"] <= 0.25
                     and (
                         strong_consensus
+                        or state["suspicious_count"] >= 2
                         or state["semantic_malicious_streak"] >= 1
                     )
                 )

@@ -959,7 +959,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                         and semantic_cr <= 0.25
                         and max_compliant_seen <= 0.25
                         and (
-                            strong_consensus
+                            suspicious_count >= 2
                             or rounds_tested >= 3
                             or status == "MALICIOUS"
                             or (
