@@ -998,24 +998,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                             external_reporters >= 1
                             or (rounds_tested >= 3 and suspicious_count >= 2 and max_compliant_seen < 0.02)
                         )
-                        globally_aligned = (
-                            top_suspect is None
-                            or (
-                                not ambiguous_suspects
-                                and top_suspect == node_id
-                            )
-                        )
                         if enough_baseline_confirmation:
-                            if not globally_aligned:
-                                logging.warning(
-                                    f"[Honeypot] 🌍 Baseline neighbor {node_id} looks MALICIOUS but global leader is "
-                                    f"{top_suspect} and candidates={suspect_candidates}. Holding investigation."
-                                )
-                                if hasattr(self.manager, "neighbor_tracking"):
-                                    state = self.manager.neighbor_tracking.setdefault(node_id, {})
-                                    state["status"] = "TESTING"
-                                self._allow_pivot_for_indirect_threats = True
-                                continue
                             logging.critical(
                                 f"🚨 [Honeypot] BASELINE NEIGHBOR {node_id} confirmed MALICIOUS "
                                 f"(reporters={external_reporters}, rounds={rounds_tested}, "
