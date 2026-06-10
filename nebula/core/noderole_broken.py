@@ -1118,9 +1118,17 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         # Permite pivoting SOLO si hay amenaza detectada en modelos pero NO hay una amenaza confirmada localmente
         # (es decir, hay víctimas/ecos pero no encontramos el nodo SILENT + POSITIVO aún)
         elif threat_detected_this_round and not self.threat_confirmed_locally:
-            # Detectamos víctimas pero no la fuente directa. Permitir búsqueda.
-            logging.info(f"[Honeypot] ⚠️ Threat detected via victims/echoes but source not found. Allowing pivot search...")
-            self._allow_pivot_for_indirect_threats = True
+            # Detectamos víctimas pero no la fuente directa. Solo permitimos pivot
+            # si no hay ya un candidato directo serio en el baseline local.
+            if self._has_pending_direct_attacker_candidate():
+                logging.info(
+                    "[Honeypot] ⚠️ Threat detected via victims/echoes, but a direct baseline attacker "
+                    "candidate is still under active investigation. Holding position."
+                )
+                self._allow_pivot_for_indirect_threats = False
+            else:
+                logging.info(f"[Honeypot] ⚠️ Threat detected via victims/echoes but source not found. Allowing pivot search...")
+                self._allow_pivot_for_indirect_threats = True
 
         if not self.threat_confirmed_locally and (not threat_detected_this_round or self._allow_pivot_for_indirect_threats):
             logging.info(
@@ -1133,6 +1141,35 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         # Detectar y reaccionar al pivotaje del atacante
         if self.threat_confirmed_locally and self._attacker_pivoting_enabled:
             asyncio.create_task(self._detect_and_react_to_attacker_pivot())
+
+    def _has_pending_direct_attacker_candidate(self) -> bool:
+        """
+        Returns True when a baseline neighbor is already showing a strong direct-contact
+        attacker signature, but has not yet been finalized as MALICIOUS.
+        """
+        if not getattr(self, "_baseline_neighbors", None):
+            return False
+
+        tracking = getattr(self.manager, "neighbor_tracking", {}) or {}
+        for node_id in self._baseline_neighbors:
+            state = tracking.get(node_id, {}) or {}
+            status = state.get("status", "TESTING")
+            rounds_tested = int(state.get("rounds_tested", 0))
+            suspicious_count = int(state.get("suspicious_count", 0))
+            max_compliant_seen = float(state.get("max_compliant_seen", 0.0))
+            last_sr = float(state.get("last_sr", 0.0))
+            last_hr = float(state.get("last_hr", 1.0))
+
+            if (
+                status != "MALICIOUS"
+                and rounds_tested >= 2
+                and suspicious_count >= 1
+                and last_sr >= 0.70
+                and last_hr <= 0.20
+                and max_compliant_seen >= 0.02
+            ):
+                return True
+        return False
 
     async def _execute_containment_protocol(self, attacker_id):
         """
