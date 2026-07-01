@@ -1325,7 +1325,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 topology=topology,
                 my_id=self._engine.addr,
                 came_from=self._last_pivot_source,
-                exclude_nodes=temporarily_unavailable_targets,
+                exclude_nodes=temporarily_unavailable_targets | set(self.manager.visited_history),
             )
 
         if next_pivot is None and temporarily_unavailable_targets:
@@ -1333,7 +1333,7 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 topology=topology,
                 my_id=self._engine.addr,
                 came_from=self._last_pivot_source,
-                exclude_nodes=temporarily_unavailable_targets,
+                exclude_nodes=temporarily_unavailable_targets | set(self.manager.visited_history),
             )
 
         if next_pivot:
@@ -1341,8 +1341,10 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             self._last_pivot_round = current_round
             self._last_pivot_source = self._engine.addr  # Recordar de dónde vinimos
 
-            # Registrar visita
+            # Registrar visita del nodo actual y del destino antes de enviar la transferencia,
+            # para evitar que el DFS vuelva al destino desde el nodo actual si el handover falla
             self.manager.register_visit(self._engine.addr)
+            self.manager.register_visit(next_pivot)
 
             await self._pivot_to(next_pivot, mode="forward")
         else:
@@ -1396,6 +1398,16 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
              logging.warning(f"[Honeypot] ⚠️ Next hop {candidate} is NOT in active connections. Cannot pivot yet.")
              # We do not retire. We keep the role and try again next time this method is called.
              return
+
+        # Never transfer the honeypot role to a confirmed attacker node
+        nt = self.manager.neighbor_tracking.get(candidate, {})
+        if nt.get("status") == "MALICIOUS" and not nt.get("carrier_suspect", False):
+            logging.error(
+                f"[Honeypot] ⛔ Refusing pivot to confirmed MALICIOUS node {candidate}. "
+                "Aborting transfer to prevent attacker from acquiring honeypot role."
+            )
+            self._engine.has_served_as_honeypot = False
+            return
 
         # Execute Transfer
         self._engine.has_served_as_honeypot = True

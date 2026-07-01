@@ -1630,6 +1630,24 @@ class Engine:
             message = self.cm.create_message("federation", "federation_ready")
             await self.cm.send_message_to_neighbors(message)
             logging.info("💤  Waiting until receiving the start signal from the start node")
+            asyncio.create_task(self._federation_start_watchdog())
+
+    async def _federation_start_watchdog(self):
+        """
+        Watchdog for non-start nodes: if federation_start is never received (e.g., due to
+        a connection drop during the startup race), force-start training after a timeout.
+        This prevents nodes from being stuck indefinitely waiting for a message that was
+        already sent before their connection was fully established.
+        """
+        grace = self.config.participant["misc_args"].get("grace_time_start_federation", 30)
+        watchdog_timeout = max(120, grace * 4)
+        await asyncio.sleep(watchdog_timeout)
+        if self.round is None:
+            logging.warning(
+                f"⚠️ [Watchdog] No federation_start received after {watchdog_timeout}s. "
+                f"Forcing trainer start to avoid deadlock."
+            )
+            await self.create_trainer_module()
 
     async def _start_learning(self):
         """

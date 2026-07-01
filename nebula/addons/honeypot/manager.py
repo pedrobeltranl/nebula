@@ -334,6 +334,9 @@ class HoneyPotManager:
         # Use helper to ensure consistent initialization and prevent KeyErrors
         state = self._get_or_create_neighbor_state(neighbor_id, current_round)
 
+        # Hoisted here so all code paths can access it without UnboundLocalError
+        reputation_module = getattr(self.engine, "_reputation", None)
+
         # Skip if already verified as MALICIOUS (no need to re-verify)
         if state["status"] == "MALICIOUS":
             return "MALICIOUS"
@@ -498,7 +501,6 @@ class HoneyPotManager:
 
             # Update suspect history
             # NEW: Don't flag as suspicious if we didn't send bait (Bait Safety for trusted nodes)
-            reputation_module = getattr(self.engine, "_reputation", None)
             is_extra_trusted = reputation_module and reputation_module.get_score(neighbor_id) > 1.5
 
             if is_extra_trusted:
@@ -570,7 +572,6 @@ class HoneyPotManager:
                   external_reporters = 0
                   reporter_list = []
                   qualified_reporters = []
-                  reputation_module = getattr(self.engine, "_reputation", None)
                   if reputation_module and hasattr(reputation_module, "get_reporters"):
                        try:
                            reporter_list = [
@@ -587,15 +588,12 @@ class HoneyPotManager:
 
                                reporter_state = self.neighbor_tracking.get(reporter_id, {})
                                reporter_suspicious = reporter_state.get("suspicious_count", 0)
-                               reporter_bait = reporter_state.get("max_compliant_seen", 0.0)
-                               reporter_benign = reporter_state.get("status") == "BENIGN"
-                               reporter_history = reporter_state.get("compliant_history", [])[-3:]
-                               reporter_consistent = sum(1 for _, r in reporter_history if float(r) >= BENIGN_COMPLIANT_THRESHOLD) >= 2
 
-                               # Reporter quality gate:
-                               # - not currently suspicious,
-                               # - and analytically BENIGN with consistent bait signal.
-                               if reporter_suspicious <= 1 and reporter_benign and reporter_consistent and reporter_score >= 0.75:
+                               # Reporter quality gate: use reputation score only.
+                               # reporter_benign/reporter_consistent require local neighbor_tracking
+                               # state that is unavailable for remote nodes in a multi-hop topology,
+                               # so those checks would always fail and leave qualified_reporters empty.
+                               if reporter_suspicious <= 1 and reporter_score >= 0.75:
                                    qualified_reporters.append(reporter_id)
 
                            external_reporters = len(set(qualified_reporters))
@@ -703,7 +701,6 @@ class HoneyPotManager:
                 state["first_backdoor_round"] = current_round
 
         if has_genuine_bait:
-            reputation_module = getattr(self.engine, "_reputation", None)
             is_active_reporter = bool(reputation_module and hasattr(reputation_module, "is_active_reporter") and reputation_module.is_active_reporter(neighbor_id))
             strong_consensus, consensus_candidates = self._has_strong_global_suspect_consensus(neighbor_id, reputation_module)
             semantic_sr_now = 0.0
@@ -1451,7 +1448,7 @@ class HoneyPotManager:
 
         return state
 
-    def _get_global_suspect_consensus(self, reputation_module, max_score_gap=0.08, min_reporters=2):
+    def _get_global_suspect_consensus(self, reputation_module, max_score_gap=0.08, min_reporters=1):
         if not reputation_module or not hasattr(reputation_module, "get_global_trust_map"):
             return None, False, []
 
@@ -1629,12 +1626,15 @@ class HoneyPotManager:
                 # it immediately — instead pivot THROUGH it to expose the real attacker.
                 node_state = self.neighbor_tracking.get(node_id, {})
                 if node_state.get("carrier_suspect", False):
-                    logging.warning(
-                        f"[DFS] 🚚 {node_id} has MALICIOUS status but is a CARRIER_SUSPECT. "
-                        f"Prioritizing as high-priority investigation target (pivot through)."
-                    )
-                    # High priority (score=2.0) — pivot through ASAP to find the real attacker
-                    investigation_neighbors.append((node_id, 2.0))
+                    if self.is_visited(node_id):
+                        logging.info(f"[DFS] 🔄 {node_id} is CARRIER_SUSPECT but already visited. Skipping re-pivot.")
+                    else:
+                        logging.warning(
+                            f"[DFS] 🚚 {node_id} has MALICIOUS status but is a CARRIER_SUSPECT. "
+                            f"Prioritizing as high-priority investigation target (pivot through)."
+                        )
+                        # High priority (score=2.0) — pivot through ASAP to find the real attacker
+                        investigation_neighbors.append((node_id, 2.0))
                 else:
                     # Local consensus guard: only convict if suspect is silent to its neighbors
                     # (reduces false positives from noisy cross-confirmation).
@@ -1831,6 +1831,10 @@ class HoneyPotManager:
         # Prioridad: seleccionar el que no hemos visitado aún
         for neighbor in neighbors:
             if neighbor not in self.visited_history:
+                nt = self.neighbor_tracking.get(neighbor, {})
+                if nt.get("status") == "MALICIOUS" and not nt.get("carrier_suspect", False):
+                    logging.warning(f"[DFS] Skipping confirmed MALICIOUS node {neighbor} as pivot target.")
+                    continue
                 logging.info(f"[DFS] Next pivot direction: {neighbor} (unvisited)")
                 return neighbor
 
