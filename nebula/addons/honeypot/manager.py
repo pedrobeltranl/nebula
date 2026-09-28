@@ -15,6 +15,63 @@ except ImportError:
 class HoneyPotManager:
     HOLD_POSITION = "__HOLD__"
     BACKTRACK_REQUIRED = "__BACKTRACK__"
+    # How many ACTUAL hops (real pivots, not re-validation calls) a locked navigation target gets
+    # before we give up on it. Measured in the same units as the journey (visited_history growth)
+    # so it can't expire before the honeypot even attempts to move — see
+    # reputation_navigation_suspect for why call-cadence-based grace failed.
+    NAV_HOP_BUDGET = 5
+
+    @staticmethod
+    def _detect_num_classes(engine, default=10):
+        """
+        Robustly determine the dataset's real class count for building the honey_map.
+
+        The naive `engine.trainer.datamodule.num_classes` returned 10 for CIFAR100 (should be
+        100) because that attribute was not the loaded value at honeypot-construction time.
+        The authoritative source is the partition handler, which loads num_classes from the
+        HDF5 attrs. We probe every plausible source and take the LARGEST valid value so a
+        stale/default 10 can never shadow the real 100.
+        """
+        candidates = []
+        try:
+            dm = getattr(getattr(engine, 'trainer', None), 'datamodule', None)
+            if dm is not None:
+                # Direct attribute on the datamodule.
+                v = getattr(dm, 'num_classes', None)
+                if isinstance(v, int) and v > 0:
+                    candidates.append(v)
+                # Partition handlers hold the value loaded from the HDF5 attrs (authoritative).
+                for attr in ('train_set', 'test_set', 'partition_handler', 'train_data', 'test_data'):
+                    ph = getattr(dm, attr, None)
+                    v = getattr(ph, 'num_classes', None)
+                    if isinstance(v, int) and v > 0:
+                        candidates.append(v)
+        except Exception:
+            pass
+        # Fall back to the scenario config if the datamodule was unhelpful.
+        try:
+            cfg = getattr(engine, 'config', None)
+            data_args = {}
+            if cfg is not None and hasattr(cfg, 'participant'):
+                data_args = cfg.participant.get('data_args', {}) or {}
+            v = data_args.get('num_classes')
+            if isinstance(v, int) and v > 0:
+                candidates.append(v)
+            # Last resort: map the known dataset name to its class count (timing-independent).
+            dataset_name = str(data_args.get('dataset', '')).upper()
+            known = {
+                "MNIST": 10, "FASHIONMNIST": 10, "FMNIST": 10,
+                "CIFAR10": 10, "SVHN": 10,
+                "EMNIST": 47, "CIFAR100": 100,
+            }
+            if dataset_name in known:
+                candidates.append(known[dataset_name])
+        except Exception:
+            pass
+        if candidates:
+            return max(candidates)
+        logging.warning(f"[HoneyManager] Could not detect num_classes; falling back to default={default}.")
+        return default
 
     def __init__(self, config=None, engine=None, seed: float = 0.5, role_behavior=None):
         self.config = config
@@ -26,11 +83,13 @@ class HoneyPotManager:
             real_seed = config
 
         if DefenseStrategyGenerator:
-            # Detect number of classes from datamodule if possible, else default to 10
-            num_classes = 10
-            if engine and hasattr(engine, 'trainer') and hasattr(engine.trainer, 'datamodule'):
-                num_classes = getattr(engine.trainer.datamodule, 'num_classes', 10)
-                logging.info(f"🔍 [HoneyManager] Detected num_classes: {num_classes}")
+            # Detect the real number of classes. The honeypot's honey_map MUST cover every
+            # class or it is malformed (the 2026-07-09 CIFAR100 bug: read 10 instead of 100
+            # because engine.trainer.datamodule.num_classes was not yet the loaded value).
+            # We probe several sources and take the largest plausible value, because the
+            # partition handler (which loads num_classes from the HDF5 attrs) is authoritative.
+            num_classes = self._detect_num_classes(engine, default=10)
+            logging.info(f"🔍 [HoneyManager] Detected num_classes: {num_classes}")
 
             self.strategy = DefenseStrategyGenerator(real_seed, num_classes=num_classes)
             self.detector = HoneyDetector()
@@ -44,6 +103,8 @@ class HoneyPotManager:
         self.path_history = []
         self.reputation_history = {}  # Historial global acumulado
         self.locked_target = None     # Fixed Target
+        self._navigation_target = None  # Sticky destination for reputation_navigation_suspect
+        self._navigation_lock_hop_count = 0  # len(visited_history) at the moment we locked on
 
         # PERMANENT MAP: The honey_map remains constant throughout the entire execution
         # to ensure benign nodes have enough time to converge on the bait.
@@ -51,8 +112,31 @@ class HoneyPotManager:
 
         # PER-NODE Grace Period: Track rounds spent at current node
         self.rounds_at_current_node = 0  # Reset when pivoting
-        self.grace_rounds_per_node = 1  # RCA 22:45 - FAST PIVOT: Target 1 round for active pursuit
+        # Must be >= LOCAL_STREAK_REQUIRED (4, see below): the grace period is the only
+        # window in which analyze_neighbor's sustained-streak conviction path can fire
+        # (pivot is held while grace is active). With grace=3 < streak_required=4, sparse
+        # topologies where the honeynode has no other reason to linger past grace pivoted
+        # away one round before the 4th consecutive hit, so local_streak never reached the
+        # threshold (observed 2026-07-22: MNIST/Fashion/CIFAR10 edge=0.2 Continue re-runs,
+        # max streak seen capped at 0-4, never converting). Set to 4 to close that gap.
+        self.grace_rounds_per_node = 4  # Must be >= LOCAL_STREAK_REQUIRED
         self.current_node_id = None      # Track which node we're at
+
+        # ============================================================================
+        # SELF-MEASURED SOURCE LOCALIZATION (reputation-free)
+        # ============================================================================
+        # Physics: the attacker poisons 70% of ITS OWN data, so its model is the poison at
+        # MAXIMUM concentration; neighbors only receive FedAvg-diluted poison. Poison
+        # intensity therefore DECAYS with distance from the source. We localize the source by
+        # gradient ascent on a self-measured poison-intensity scalar and convict the node that
+        # is the local INTENSITY PEAK (dominates its neighborhood) AND rejects our directly-fed
+        # bait. Both are relative/differential signals (spatial peak, temporal bait-rejection)
+        # that a diluted victim cannot exhibit — no reputation module involved.
+        self.SOURCE_INTENSITY = 0.55       # absolute floor for a node to be considered the source
+        self.DOMINANCE_FACTOR = 1.5        # source must be >=1.5x more intense than 2nd-most-intense neighbor
+        self.SOURCE_MIN_ROUNDS = 4         # rounds of direct bait-feeding before a resistance verdict
+        self.best_intensity_seen = 0.0     # highest neighbor intensity seen across all hops (gradient memory)
+        self.best_intensity_node = None
 
         # SUSPECT CONFIRMATION: Track suspects before declaring as attackers
         # Format: {node_id: confirmation_rounds}
@@ -427,6 +511,51 @@ class HoneyPotManager:
         else:
             state["semantic_malicious_streak"] = 0
 
+        # ============================================================================
+        # EXTREME-SIGNATURE STREAK (self-measured source discriminator, no reputation)
+        # ============================================================================
+        # Forensic result: in a fully-meshed topology the poison fingerprint reaches every
+        # node in one hop, so CR / intensity / bait-response cannot separate source from
+        # victim. The ONE axis that DID separate in the real logs is the EXTREME, SUSTAINED
+        # SR/HR signature: the true attacker sits pinned at SR≈100% / HR≈0% every single round
+        # (its 70%-poisoned local training dominates), whereas honest neighbors that merely
+        # aggregate the diluted poison fluctuate (SR ~45-93%, with meaningful HR) and never
+        # hold the absolute extreme continuously. We therefore track a SEPARATE streak with a
+        # much stricter bar than the ordinary semantic streak, and require it to be SUSTAINED.
+        EXTREME_SR = 0.98          # attacker pins ~100%; victims peaked ~93% but not sustained at ~100%
+        EXTREME_HR = 0.02          # attacker ~0% honest; victims retain real honesty
+        extreme_hit = (
+            suspicious_rate >= EXTREME_SR
+            and honest_rate <= EXTREME_HR
+            and compliant_rate < EPS
+        )
+        if extreme_hit:
+            last_ext = state.get("last_extreme_round")
+            if last_ext is not None and current_round - last_ext <= 1:
+                state["extreme_streak"] = int(state.get("extreme_streak", 0)) + 1
+            else:
+                state["extreme_streak"] = 1
+            state["last_extreme_round"] = current_round
+            logging.warning(
+                f"[Manager] 🔴 EXTREME signature for {neighbor_id}: SR={suspicious_rate:.2%} (>= {EXTREME_SR:.0%}) "
+                f"& HR={honest_rate:.2%} (<= {EXTREME_HR:.0%}) & CR={compliant_rate:.2%}. "
+                f"extreme_streak={state['extreme_streak']} (sustained pinned-extreme = attacker signature)."
+            )
+        else:
+            state["extreme_streak"] = 0
+
+        # ============================================================================
+        # PRIORITY CONVICTION: hybrid gate (local signature + reputation attribution)
+        # ============================================================================
+        # Evaluated BEFORE the legacy VICTIM-CARRIER / consensus gates so the source is not
+        # intercepted and held in TESTING forever (the 07:56:10 / 15:24 "VICTIM CARRIER 90/3"
+        # and manager.py:696 "qualified_reporters=0" stalls). Local signature detects the
+        # attack presence fast; reputation is consulted only to attribute the source.
+        if state["status"] != "MALICIOUS" and self._confirm_malicious(
+            neighbor_id, state, current_round, reputation_module=reputation_module, reason="priority"
+        ):
+            return "MALICIOUS"
+
         # Case 2: Carrier → SR > 0 and CR > 0
         if suspicious_rate > 0.0 and compliant_rate >= EPS:
             state["carrier_suspect"] = True
@@ -540,18 +669,25 @@ class HoneyPotManager:
              # If they have bait, we treat them as victims (CARRIERS).
              # We stay in TESTING to allow pivoting THROUGH them.
              # EXCEPT if they are overwhelmingly suspicious (>80% error rate directly against our bait)
-             if state["max_compliant_seen"] >= BENIGN_COMPLIANT_THRESHOLD and not is_overwhelmingly_suspicious:
+             #
+             # CRITICAL: gate on has_genuine_bait (consistent absorption across recent rounds),
+             # NOT on max_compliant_seen. A single isolated FedAvg dilution spike (~3.12% in the
+             # ring) would otherwise pin max_compliant_seen above the 2% threshold permanently and
+             # trap a genuine attacker in VICTIM CARRIER forever, blocking conviction. A real carrier
+             # absorbs bait repeatedly, so has_genuine_bait stays true across rounds.
+             if has_genuine_bait and not is_overwhelmingly_suspicious:
                  logging.warning(
                      f"[Manager] ⚠️ Neighbor {neighbor_id} is persistently suspicious ({state['suspicious_count']}) "
-                     f"BUT has shown bait historically ({state['max_compliant_seen']:.2%}). Treating as VICTIM CARRIER."
+                     f"BUT shows CONSISTENT bait ({consistent_rounds}/{BENIGN_WINDOW} recent rounds, "
+                     f"max_seen={state['max_compliant_seen']:.2%}). Treating as VICTIM CARRIER."
                  )
                  # Note: We return "TESTING" but analyze_neighbors_at_current_node will see it's a good pivot target
                  return "TESTING"
              else:
-                  if is_overwhelmingly_suspicious and state["max_compliant_seen"] >= BENIGN_COMPLIANT_THRESHOLD:
-                       logging.error(f"[Manager] ‼️ Overwhelmingly Suspicious (>80%) despite historical bait! Bypassing VICTIM CARRIER protection. CONVICTING {neighbor_id}.")
-                       state["status"] = "MALICIOUS"
-                       return "MALICIOUS"
+                  if is_overwhelmingly_suspicious and has_genuine_bait:
+                       logging.error(f"[Manager] ‼️ Overwhelmingly Suspicious (>80%) despite historical bait! Bypassing VICTIM CARRIER protection for {neighbor_id}.")
+                       if self._confirm_malicious(neighbor_id, state, current_round, reputation_module, reason="overwhelming-suspicion"):
+                           return "MALICIOUS"
 
                   # RCA 16:17 (Fase 5): If we are already planning to investigate (pivot through)
                   # because it's the only path, we give it 2 more rounds of grace even with 0% bait.
@@ -656,12 +792,13 @@ class HoneyPotManager:
                                return "TESTING"
 
                            logging.error(
-                               f"[Manager] ‼️ ANALYTICAL IDENTITY CONFIRMED for {neighbor_id}. "
+                               f"[Manager] ‼️ ANALYTICAL IDENTITY signature for {neighbor_id}. "
                                f"Persistent Clashes + 0% Bait + "
-                               f"{'cross-confirmation' if has_cross_confirmation else 'extreme local evidence'}. CONVICTING."
+                               f"{'cross-confirmation' if has_cross_confirmation else 'extreme local evidence'}."
                            )
-                           state["status"] = "MALICIOUS"
-                           return "MALICIOUS"
+                           if self._confirm_malicious(neighbor_id, state, current_round, reputation_module, reason="analytical-identity"):
+                               return "MALICIOUS"
+                           return "TESTING"
 
                        if (
                            state["clash_count"] >= MIN_CLASHES_FOR_CONVICTION
@@ -677,6 +814,21 @@ class HoneyPotManager:
                                f"recent_susp_streak={has_recent_susp_streak}, recent_clash={has_recent_clash}, "
                                f"stable_target={stable_attack_target}, consensus={consensus_candidates})."
                            )
+
+                       # A node with persistent CLASHES + 0% bait is EITHER the source OR a
+                       # relay victim. "VICTIM CARRIER → keep pivoting through" is only correct
+                       # for the latter; applied to the source it makes the DFS try to pivot
+                       # past a terminal attacker forever (the 07:56:10 .4↔.11 oscillation, where
+                       # the gate was never reached). Consult the reputation-asymmetry gate here
+                       # to disambiguate: a silent sink is the source → CONVICT; a participant is
+                       # a victim → keep treating as carrier and pivot through.
+                       if (
+                           state["clash_count"] >= MIN_CLASHES_FOR_CONVICTION
+                           and state["rounds_tested"] >= MIN_ROUNDS_FOR_CONVICTION
+                           and state["max_compliant_seen"] < BENIGN_COMPLIANT_THRESHOLD
+                           and self._confirm_malicious(neighbor_id, state, current_round, reputation_module, reason="clash-carrier-disambiguation")
+                       ):
+                           return "MALICIOUS"
 
                        logging.warning(f"[Manager] 🛡️ {neighbor_id} is suspicious but has CLASHES ({state['clash_count']}). Treating as VICTIM CARRIER (Grace: {state['suspicious_count']}/{CLASH_GRACE_ROUNDS}).")
                        return "TESTING"
@@ -741,14 +893,8 @@ class HoneyPotManager:
                     )
                 )
                 if first_contact_direct_attacker_signature:
-                    state["status"] = "MALICIOUS"
-                    state["verified_round"] = current_round
-                    logging.critical(
-                        f"[Manager] 🚨 Silent suspect {neighbor_id} promoted to MALICIOUS on first-contact direct signature "
-                        f"(SR={semantic_sr_now:.2%}, HR={semantic_hr_now:.2%}, CR={semantic_cr_now:.2%}, "
-                        f"susp={state['suspicious_count']}, rounds={state['rounds_tested']}, max_bait={state['max_compliant_seen']:.2%})."
-                    )
-                    return "MALICIOUS"
+                    if self._confirm_malicious(neighbor_id, state, current_round, reputation_module, reason="first-contact-signature"):
+                        return "MALICIOUS"
                 severe_semantic_attacker_signature = (
                     state["rounds_tested"] >= 3
                     and state["suspicious_count"] >= 2
@@ -763,14 +909,8 @@ class HoneyPotManager:
                     )
                 )
                 if severe_semantic_attacker_signature:
-                    state["status"] = "MALICIOUS"
-                    state["verified_round"] = current_round
-                    logging.critical(
-                        f"[Manager] 🚨 Silent suspect {neighbor_id} promoted to MALICIOUS via severe semantic fingerprint "
-                        f"(SR={semantic_sr_now:.2%}, HR={semantic_hr_now:.2%}, CR={semantic_cr_now:.2%}, "
-                        f"susp={state['suspicious_count']}, rounds={state['rounds_tested']}, max_bait={state['max_compliant_seen']:.2%})."
-                    )
-                    return "MALICIOUS"
+                    if self._confirm_malicious(neighbor_id, state, current_round, reputation_module, reason="severe-semantic"):
+                        return "MALICIOUS"
                 if (
                     strong_consensus
                     and stable_attack_target
@@ -779,14 +919,8 @@ class HoneyPotManager:
                     and state["semantic_malicious_streak"] >= 1
                     and state["max_compliant_seen"] <= 0.40
                 ):
-                    state["status"] = "MALICIOUS"
-                    state["verified_round"] = current_round
-                    logging.critical(
-                        f"[Manager] 🚨 Silent suspect {neighbor_id} promoted to MALICIOUS despite diluted bait "
-                        f"(consensus={consensus_candidates}, susp={state['suspicious_count']}, "
-                        f"rounds={state['rounds_tested']}, max_bait={state['max_compliant_seen']:.2%})."
-                    )
-                    return "MALICIOUS"
+                    if self._confirm_malicious(neighbor_id, state, current_round, reputation_module, reason="diluted-bait-consensus"):
+                        return "MALICIOUS"
                 state["status"] = "TESTING"
                 logging.warning(
                     f"[Manager] ⚠️ Holding {neighbor_id} in TESTING: silent node with suspicious history "
@@ -924,21 +1058,18 @@ class HoneyPotManager:
                     and state["max_compliant_seen"] <= 0.40
                 )
                 if diluted_bait_but_attacker:
-                    state["status"] = "MALICIOUS"
-                    state["verified_round"] = current_round
-                    logging.critical(
-                        f"[Manager] 🚨 Neighbor {neighbor_id} CONFIRMED as MALICIOUS under strong global consensus "
-                        f"despite diluted bait (consensus={consensus_candidates}, rounds={state['rounds_tested']}, "
-                        f"susp={state['suspicious_count']}, max_bait={state['max_compliant_seen']:.2%})."
-                    )
-                    return "MALICIOUS"
-                if has_genuine_bait or state["max_compliant_seen"] >= BENIGN_COMPLIANT_THRESHOLD:
-                    # Genuine carrier or node that has shown bait before: consistently absorbs bait → pivot through to find real source
+                    if self._confirm_malicious(neighbor_id, state, current_round, reputation_module, reason="diluted-bait-strong-consensus"):
+                        return "MALICIOUS"
+                if has_genuine_bait:
+                    # Genuine carrier: consistently absorbs bait (>=2 of last 3 rounds) → pivot through to find real source.
+                    # NOTE: a single isolated max_compliant_seen spike (e.g. a one-round FedAvg
+                    # dilution artifact in ring topologies, ~3.12%) is NOT sufficient on its own —
+                    # requiring consistency here keeps genuine attackers from getting stuck
+                    # permanently as CARRIER_SUSPECT, which would block fast conviction.
                     state["carrier_suspect"] = True
                     state["status"] = "TESTING"
-                    reason = "consistent bait" if has_genuine_bait else f"historical bait ({state['max_compliant_seen']:.1%})"
                     logging.warning(
-                        f"[Manager] 🚚 {neighbor_id} CARRIER_SUSPECT — {reason} "
+                        f"[Manager] 🚚 {neighbor_id} CARRIER_SUSPECT — consistent bait "
                         f"despite suspicion ({state['negative_count']} rounds). DFS will pivot through to find real source."
                     )
                     return "TESTING"
@@ -972,17 +1103,12 @@ class HoneyPotManager:
                          )
                          return "TESTING"
 
-                    # No genuine consistent bait + persistent suspicion → genuine attacker
-                    # (one-off FedAvg spikes don't count as real bait absorption)
-                    state["status"] = "MALICIOUS"
-                    state["verified_round"] = current_round
-                    logging.critical(
-                        f"[Manager] 🚨 Neighbor {neighbor_id} CONFIRMED as MALICIOUS "
-                        f"(consistent_bait={consistent_rounds}/{BENIGN_WINDOW}, "
-                        f"negative_rounds={state['negative_count']}, "
-                        f"suspicious={state['suspicious_count']})"
-                    )
-                    return "MALICIOUS"
+                    # No genuine consistent bait + persistent suspicion → attacker signature.
+                    # Still requires reputation-asymmetry corroboration to avoid convicting a
+                    # relay victim that happens to sit at 0% bait.
+                    if self._confirm_malicious(neighbor_id, state, current_round, reputation_module, reason="persistent-zero-bait"):
+                        return "MALICIOUS"
+                    return "TESTING"
 
             return "TESTING"
 
@@ -1108,6 +1234,56 @@ class HoneyPotManager:
     def is_visited(self, node_id: str) -> bool:
         return node_id in self.visited_history
 
+    def get_confirmed_malicious_nodes(self) -> set:
+        """Set of neighbor IDs confirmed MALICIOUS (and not benign carrier_suspects)."""
+        return {
+            nid for nid, st in self.neighbor_tracking.items()
+            if st.get("status") == "MALICIOUS" and not st.get("carrier_suspect", False)
+        }
+
+    def next_hop_towards(self, topology: dict, my_id: str, target_id: str, avoid: set = None) -> str:
+        """
+        Shortest-path (BFS) first hop from my_id toward target_id over the topology.
+
+        Proximity guidance for the DFS: when the honeypot has identified an attacker
+        (locked_target) but its normal depth-first exploration hits a dead end — because
+        every unvisited branch leads away from the attacker — we must be able to re-approach
+        rather than getting stranded (the 16:52:44 failure: honeypot pivoted to a carrier
+        topologically distant from the attacker and never moved again for 97 rounds).
+
+        This deliberately IGNORES visited_history for pathing so the honeypot can re-tread
+        nodes to close in on a known attacker. `avoid` (e.g. confirmed-malicious nodes we
+        must never route THROUGH as an intermediate hop) is still respected.
+        Returns the immediate next neighbor to pivot to, or None if unreachable.
+        """
+        if not topology or my_id not in topology or target_id is None:
+            return None
+        if my_id == target_id:
+            return None
+        avoid = avoid or set()
+        # BFS from my_id; record the first hop taken on each shortest path.
+        from collections import deque
+        queue = deque()
+        for nbr in topology.get(my_id, []):
+            if nbr in avoid and nbr != target_id:
+                continue
+            queue.append((nbr, nbr))  # (current_node, first_hop)
+        seen = {my_id}
+        while queue:
+            node, first_hop = queue.popleft()
+            if node in seen:
+                continue
+            seen.add(node)
+            if node == target_id:
+                return first_hop
+            for nbr in topology.get(node, []):
+                if nbr in seen:
+                    continue
+                if nbr in avoid and nbr != target_id:
+                    continue
+                queue.append((nbr, first_hop))
+        return None
+
     def update_current_node(self, node_id: str):
         """
         Update tracking when honeypot arrives at a new node.
@@ -1152,12 +1328,16 @@ class HoneyPotManager:
             "path_history": self.path_history,
             "reputation_history": self.reputation_history,
             "locked_target": self.locked_target,
+            "navigation_target": self._navigation_target,
+            "navigation_lock_hop_count": self._navigation_lock_hop_count,
             "transfer_source": getattr(self.engine, 'addr', None) if self.engine else None,
             "last_pivot_source": last_pivot_source,  # Prevent backtracking
             "rounds_at_current_node": self.rounds_at_current_node,  # Transfer grace counter
             "current_node_id": self.current_node_id,  # Transfer node position
             "suspect_confirmation": self.suspect_confirmation,  # Transfer suspect tracking
-            "neighbor_tracking": self.neighbor_tracking  # CRITICAL: Preserve neighbor memory across pivots
+            "neighbor_tracking": self.neighbor_tracking,  # CRITICAL: Preserve neighbor memory across pivots
+            "best_intensity_seen": self.best_intensity_seen,  # Gradient-ascent memory across hops
+            "best_intensity_node": self.best_intensity_node,
         }
         if self.role_behavior and hasattr(self.role_behavior, "_dfs_path_stack"):
             state["dfs_path_stack"] = list(self.role_behavior._dfs_path_stack)
@@ -1183,12 +1363,20 @@ class HoneyPotManager:
         if "history" in state: self.visited_history = state["history"]
         if "path_history" in state: self.path_history = state.get("path_history", [])
         if "reputation_history" in state: self.reputation_history = state.get("reputation_history", {})
+        if "best_intensity_seen" in state: self.best_intensity_seen = float(state.get("best_intensity_seen", 0.0) or 0.0)
+        if "best_intensity_node" in state: self.best_intensity_node = state.get("best_intensity_node")
 
         if "locked_target" in state:
             self.locked_target = state.get("locked_target")
             logging.info(f"[Manager] 🔓=>🔒 LOCKED TARGET imported: {self.locked_target}")
         else:
             logging.info("[Manager] No 'locked_target' in state.")
+
+        if "navigation_target" in state:
+            self._navigation_target = state.get("navigation_target")
+            if self._navigation_target:
+                logging.info(f"[Manager] 🧭 Navigation target imported: {self._navigation_target}")
+        self._navigation_lock_hop_count = int(state.get("navigation_lock_hop_count", 0) or 0)
 
         # CRITICAL: Restore _last_pivot_source to prevent ping-pong
         if "last_pivot_source" in state and state["last_pivot_source"]:
@@ -1441,12 +1629,338 @@ class HoneyPotManager:
             "dominant_target_history": [],
             "last_dominant_target": None,
             "dominant_target_streak": 0,
+            "extreme_streak": 0,
+            "last_extreme_round": None,
         }
         for key, val in extra_defaults.items():
             if key not in state:
                 state[key] = val
 
         return state
+
+    def _reputation_asymmetry(self, neighbor_id, reputation_module):
+        """
+        The ONE discriminator that separates the attack SOURCE from a victim/relay.
+
+        Forensic finding (runs 2026-07-03 10:43/14:00/17:56): local honeypot metrics
+        (SR, CR, HR, clash_count, dominant_target) are IDENTICAL between the true poisoner
+        and the honest neighbors that merely aggregate its poisoned gradients — victims are
+        often even more extreme. Convicting on those metrics blocked innocent aggregators
+        while the real attacker escaped. Worse, "sustained 0% bait" is INVERTED: the attacker
+        aggregates its honest neighbors' bait-laden updates and leaks a little bait, whereas a
+        clean relay victim can sit at exactly 0%.
+
+        The robust asymmetry is behavioural in the reputation graph:
+          - The attacker is a reputation SINK: accused by several honest peers, but it never
+            accuses anyone (it won't denounce the poison it is producing) and does not actively
+            participate in the reputation protocol.
+          - A victim/relay PARTICIPATES: it reports on its own neighbors, so it both accuses
+            others and is a recent active reporter.
+
+        Returns dict with:
+          accused_by      : number of distinct peers accusing neighbor_id
+          accuses_others  : number of distinct nodes neighbor_id accuses
+          is_active_reporter : whether neighbor_id recently participated in reputation
+          is_silent_sink  : True iff strongly-accused AND accuses no one AND not an active reporter
+        """
+        result = {
+            "accused_by": 0,
+            "accuses_others": 0,
+            "is_active_reporter": False,
+            "is_silent_sink": False,
+        }
+        if not reputation_module:
+            return result
+
+        self_addr = getattr(self.engine, "addr", None)
+
+        # How many distinct peers accuse this node (exclude ourself: our own bait-based
+        # accusation must not be counted as independent corroboration).
+        try:
+            accusers = set(reputation_module.get_reporters(neighbor_id))
+            accusers.discard(self_addr)
+            result["accused_by"] = len(accusers)
+        except Exception:
+            pass
+
+        # How many distinct nodes does THIS node accuse? (participation signal)
+        try:
+            latest = getattr(reputation_module, "latest_accusations", {}) or {}
+            accuses = {
+                suspect for suspect, reporters in latest.items()
+                if neighbor_id in reporters and suspect != neighbor_id
+            }
+            result["accuses_others"] = len(accuses)
+        except Exception:
+            pass
+
+        # Did it recently participate as a reporter at all?
+        try:
+            if hasattr(reputation_module, "is_active_reporter"):
+                result["is_active_reporter"] = bool(
+                    reputation_module.is_active_reporter(neighbor_id, freshness_window=5)
+                )
+        except Exception:
+            pass
+
+        # Silent sink = the attacker profile: corroborated by >=2 independent peers,
+        # while itself denouncing no one and not participating in reputation.
+        # Silent-sink = the attacker profile. The INFALSIFIABLE-by-a-victim part is the
+        # silence: a real victim/relay participates in reputation (accuses its own neighbors
+        # and/or is a recent active reporter), so `accuses_others == 0 AND not active_reporter`
+        # is something only the true poisoner exhibits. We deliberately do NOT require a high
+        # accused_by count: in sparse/edge topologies the attacker may have only one honest
+        # neighbor able to accuse it (observed: only .2 accuses .4), and requiring >=2 would
+        # let the real attacker escape. Corroboration is provided by the honeypot's own strong
+        # local signature at the call site plus at least one independent accuser.
+        result["is_silent_sink"] = (
+            result["accuses_others"] == 0
+            and not result["is_active_reporter"]
+            and result["accused_by"] >= 1
+        )
+        return result
+
+    def _bfs_distance(self, topology, src, dst):
+        """Hop count from src to dst over topology, or None if unreachable/unknown."""
+        if not topology or src not in topology or src == dst:
+            return 0 if src == dst else None
+        seen = {src}
+        frontier = [src]
+        dist = 0
+        while frontier:
+            dist += 1
+            nxt = []
+            for u in frontier:
+                for v in topology.get(u, []):
+                    if v in seen:
+                        continue
+                    if v == dst:
+                        return dist
+                    seen.add(v)
+                    nxt.append(v)
+            frontier = nxt
+        return None
+
+    def reputation_navigation_suspect(self, reputation_module, my_id=None, topology=None):
+        """
+        NAVIGATION-ONLY: which non-visited node should the honeypot travel toward?
+
+        In sparse topologies the honeypot may not be a direct neighbor of the attacker, so it
+        never measures it and never convicts (the 22:13:35 failure). Reputation is used here
+        ONLY to pick a travel destination — NOT to convict and NOT to fetch models. The global
+        accusation graph points at the attacker even from afar; we steer the honeypot toward the
+        most-accused silent-sink candidate so it can become a direct neighbor and then run the
+        normal local+reputation conviction there.
+
+        STICKY TARGET (fix 2026-07-15a): this used to recompute the "best" candidate from
+        scratch on every call, with no memory. Early in a run, many honest nodes simply haven't
+        accused anyone yet (they look "silent" only for lack of data), so the ranking flip-flops
+        round to round. We now lock onto a candidate and keep steering toward it as long as it
+        remains a valid silent sink; only re-evaluate when it stops qualifying.
+
+        PLAUSIBILITY BY DISTANCE (fix 2026-07-15b): the sticky lock alone just made the honeypot
+        commit faithfully to whichever candidate happened to satisfy the silent-sink test FIRST
+        in dict-iteration order — no notion of whether that candidate was anywhere near the
+        honeypot's own reachable frontier. Observed on EMNIST edge0.2: it locked onto a dead-end
+        node 4 hops away in the wrong branch while a stronger, 1-hop-closer candidate (on the
+        actual shortest path to the attacker) sat unused. When `topology` is available we now
+        rank candidates by BFS distance from `my_id` (closer = more plausible to be the reason
+        we're seeing gossiped accusations at all) and only fall back to accused_by as a tie-break,
+        instead of the reverse. Unreachable candidates are skipped entirely.
+
+        Returns the candidate node id (most plausible silent sink) or None.
+        """
+        if not reputation_module:
+            return None
+
+        # If we're already committed to a target, keep going until we either reach it (it becomes
+        # visited/analyzed) or a bounded number of ACTUAL HOPS have passed without success. This
+        # is what turns "chase the loudest signal this instant" into "commit to a hypothesis and
+        # walk the path to verify it" — the latter is what actually converges.
+        #
+        # NO RE-VALIDATION BY DESIGN (fix 2026-07-15d, replacing the 15c grace-counter attempt):
+        # reputation visibility is NOT globally consistent — a candidate that looks silent from
+        # one node's gossip view can look like an active reporter from a neighbor a single hop
+        # away with fresher/more-complete accusation data (observed: .3 looked silent from .5,
+        # but actively-reporting from .6). Re-validating "is this still a silent sink?" on every
+        # call — even with a strike counter — ties abandonment to CALL CADENCE (~1/round while
+        # stationary), which is a different, faster clock than the PIVOT cadence (gated by
+        # grace_rounds_per_node): all 3 strikes could burn while the honeypot is still waiting out
+        # its own per-node grace period, before it ever attempts the hop toward the target
+        # (confirmed on EMNIST edge0.2, 4th attempt — strikes 1-3 all fired within 2 rounds at the
+        # same host, zero hops attempted in between). So we no longer re-validate silent-sink
+        # status once locked at all. The only ways to release a target now are: it becomes our
+        # direct neighbor (handled by the caller, which stops navigating and analyzes locally),
+        # it gets visited, or NAV_HOP_BUDGET actual hops elapse without reaching it — hop count is
+        # tracked via len(visited_history) growth, which only advances on real pivots, so this
+        # grace is measured in the same units as the journey itself.
+        if self._navigation_target and self._navigation_target != my_id:
+            if not self.is_visited(self._navigation_target):
+                hops_since_lock = len(self.visited_history) - self._navigation_lock_hop_count
+                if hops_since_lock < self.NAV_HOP_BUDGET:
+                    return self._navigation_target
+                logging.info(
+                    f"[Manager] 🧭 Navigation target {self._navigation_target} not reached after "
+                    f"{hops_since_lock} hops (budget={self.NAV_HOP_BUDGET}). Re-evaluating."
+                )
+            self._navigation_target = None
+
+        try:
+            latest = getattr(reputation_module, "latest_accusations", {}) or {}
+        except Exception:
+            return None
+
+        # Rank candidates by (distance ascending, accused_by descending). Distance is the
+        # primary key: a node we can actually reach soon is a more useful hypothesis to commit
+        # to than a maximally-accused node stuck behind an unrelated branch of the graph.
+        best, best_key = None, None
+        for suspect, reporters in latest.items():
+            if suspect == my_id or self.is_visited(suspect):
+                continue
+            asym = self._reputation_asymmetry(suspect, reputation_module)
+            # Same bar as conviction's is_silent_sink: accuses no one, not an active reporter,
+            # AND actually accused by someone. Without the accused_by>=1 requirement, a node
+            # that simply hasn't reported yet (common early in a run) looks identical to a
+            # silent attacker, which is what caused the mis-navigation.
+            if not asym["is_silent_sink"]:
+                continue
+            if topology is not None and my_id is not None:
+                dist = self._bfs_distance(topology, my_id, suspect)
+                if dist is None:
+                    continue  # unreachable in the known topology view — skip
+            else:
+                dist = 0  # no topology info available: fall back to pure accused_by ranking
+            key = (dist, -asym["accused_by"])
+            if best_key is None or key < best_key:
+                best, best_key = suspect, key
+        if best is not None:
+            self._navigation_target = best
+            self._navigation_lock_hop_count = len(self.visited_history)
+            logging.info(
+                f"[Manager] 🧭 Reputation navigation LOCKED onto {best} "
+                f"(distance={best_key[0]}, accused_by={-best_key[1]}, silent). Hop budget={self.NAV_HOP_BUDGET}. "
+                f"Honeypot will steer toward it until it becomes a direct neighbor, is reached, or budget expires."
+            )
+            return best
+        return None
+
+    def _poison_intensity(self, state) -> float:
+        """
+        Self-measured poison-intensity scalar for a neighbor (NO reputation).
+
+        The attacker poisons 70% of its OWN data, so its model carries the poison at maximum
+        concentration; neighbors only see FedAvg-diluted poison. Intensity therefore peaks at
+        the source and decays with hop-distance. This scalar combines only quantities the
+        honeypot measures directly:
+          - suspicious_rate (SR): fraction of bait probes the node answers with the attack label
+          - clash density: how often the node's dominant prediction directly overrides our
+            honey_map remap (clashes per analyzed round)
+          - target stability: a real source pushes ONE consistent target; relays wobble
+          - sustained bait rejection: source never absorbs our directly-fed bait
+        Range ~[0,1]; higher = closer to / is the source.
+        """
+        rounds = max(1, int(state.get("rounds_tested", 0)))
+        sr = max(0.0, min(1.0, float(state.get("last_sr", 0.0))))
+        clash_density = min(1.0, int(state.get("clash_count", 0)) / rounds)
+        susp_density = min(1.0, int(state.get("suspicious_count", 0)) / rounds)
+        target_stability = min(1.0, int(state.get("dominant_target_streak", 0)) / 4.0)
+        bait_rejection = 1.0 if float(state.get("max_compliant_seen", 0.0)) < 0.02 else 0.0
+        return (
+            0.35 * sr
+            + 0.25 * clash_density
+            + 0.15 * susp_density
+            + 0.15 * target_stability
+            + 0.10 * bait_rejection
+        )
+
+    # Sustained-extreme conviction parameters (self-measured, reputation-free).
+    # Local attack-signature streak required to OPEN an investigation (fast, low bar).
+    LOCAL_STREAK_REQUIRED = 4     # consecutive rounds of strong local poison signature
+
+    def _confirm_malicious(self, neighbor_id, state, current_round, reputation_module=None,
+                           reason="", peer_intensities=None):
+        """
+        HYBRID conviction gate: LOCAL honeypot detection + REPUTATION for attribution only.
+
+        Empirically established across all runs: the honeypot's LOCAL poison fingerprint
+        (SR/CR/HR/clash/intensity) detects the PRESENCE of the attack but CANNOT attribute the
+        SOURCE — it propagates via FedAvg, so victims score as high as the attacker (honest .2
+        reached SR=93.75%, same as the attacker's peak; no SR threshold separates them). What
+        DOES separate source from victim is a behavioural asymmetry in the reputation graph:
+        the attacker is a SILENT SINK (it accuses no one and does not participate in reputation,
+        while honest peers accuse it), whereas a victim/relay actively reports its neighbors.
+
+        Division of labour (by design):
+          * LOCAL (necessary trigger): a sustained strong attack signature — this is what the
+            honeypot measures itself by feeding bait and probing the neighbor's model. It flags
+            a node as attack-INVOLVED and opens the investigation fast (LOCAL_STREAK_REQUIRED).
+          * REPUTATION (attribution ONLY): among nodes with the local signature, convict the one
+            that is the silent sink. Reputation is used ONLY to disambiguate WHO the source is —
+            never to fetch neighbor models and never to mitigate (containment stays local).
+
+        Both are required: local signature (presence) AND reputation asymmetry (attribution).
+        A victim has the local signature but participates in reputation → spared.
+        """
+        sr = float(state.get("last_sr", 0.0))
+        hr = float(state.get("last_hr", 1.0))
+        cr = float(state.get("last_cr", 0.0))
+        clash = int(state.get("clash_count", 0))
+        rounds_tested = int(state.get("rounds_tested", 0))
+        # Local streak: reuse the semantic streak (SR>=TAU & CR<EPS & HR low) — the ordinary,
+        # attainable attack signature (NOT the unreachable 98% extreme). This is the fast trigger.
+        local_streak = max(
+            int(state.get("semantic_malicious_streak", 0)),
+            int(state.get("extreme_streak", 0)),
+        )
+        stable_target = (
+            int(state.get("dominant_target_streak", 0)) >= 2
+            or int(state.get("semantic_malicious_streak", 0)) >= 2
+        )
+
+        # 1) LOCAL trigger — necessary. Strong, sustained, attack-shaped signature + clashes.
+        local_signature = (
+            local_streak >= self.LOCAL_STREAK_REQUIRED
+            and clash >= 3
+            and stable_target
+            and cr < 0.02
+            and rounds_tested >= self.LOCAL_STREAK_REQUIRED
+        )
+        if not local_signature:
+            logging.warning(
+                f"[Manager] 🛡️ Holding {neighbor_id} in TESTING [{reason}]: local attack signature not yet "
+                f"sustained (local_streak={local_streak}/{self.LOCAL_STREAK_REQUIRED}, clash={clash}, "
+                f"stable_target={stable_target}, SR={sr:.2%}, CR={cr:.2%})."
+            )
+            return False
+
+        # 2) REPUTATION attribution — the disambiguator. Only the SOURCE is a silent sink.
+        asym = self._reputation_asymmetry(neighbor_id, reputation_module)
+        is_silent_sink = (
+            asym["accuses_others"] == 0
+            and not asym["is_active_reporter"]
+            and asym["accused_by"] >= 1
+        )
+
+        if is_silent_sink:
+            state["status"] = "MALICIOUS"
+            state["verified_round"] = current_round
+            logging.critical(
+                f"[Manager] 🚨 {neighbor_id} CONFIRMED MALICIOUS [{reason}/local+reputation] — sustained LOCAL "
+                f"attack signature (local_streak={local_streak}, clash={clash}, SR={sr:.2%}, HR={hr:.2%}, "
+                f"CR={cr:.2%}) ATTRIBUTED to source by reputation asymmetry "
+                f"(accused_by={asym['accused_by']}, accuses_others={asym['accuses_others']}, "
+                f"active_reporter={asym['is_active_reporter']})."
+            )
+            return True
+
+        logging.warning(
+            f"[Manager] 🛡️ Holding {neighbor_id} in TESTING [{reason}]: strong LOCAL signature "
+            f"(local_streak={local_streak}) but reputation attribution NOT met "
+            f"(silent_sink={is_silent_sink}: accused_by={asym['accused_by']}, "
+            f"accuses_others={asym['accuses_others']}, active_reporter={asym['is_active_reporter']}). "
+            f"Likely a victim/relay that participates in reputation — spared; DFS keeps investigating."
+        )
+        return False
 
     def _get_global_suspect_consensus(self, reputation_module, max_score_gap=0.08, min_reporters=1):
         if not reputation_module or not hasattr(reputation_module, "get_global_trust_map"):
@@ -1498,7 +2012,7 @@ class HoneyPotManager:
             runner_up_score = float(candidates[1][1])
 
         strong_margin = runner_up_score is None or (runner_up_score - leader_score) >= 0.12
-        strong_reporters = leader_reporters >= 3
+        strong_reporters = leader_reporters >= 2
         strong_score = leader_score is not None and leader_score <= 0.72
         return strong_margin and strong_reporters and strong_score, candidates
 
@@ -1544,21 +2058,23 @@ class HoneyPotManager:
         grace_period_active = self.is_grace_period_active(neighbors_models)
 
         if grace_period_active:
-            # OPTIMIZATION: If we already have strong evidence of a poison trail (carrier),
-            # we skip the remaining grace period to pivot ASAP towards the attacker.
-            found_carrier = False
+            # During grace we STILL analyze every neighbor each round (so the sustained-extreme
+            # streak accumulates and the attacker can be convicted immediately once it has held
+            # SR≈100%/HR≈0% long enough — critical in fully-meshed topologies where the honeypot
+            # is already adjacent to the attacker and needs no travel). Grace only suppresses the
+            # PIVOT, not the analysis. If a neighbor reaches the sustained-extreme verdict, we
+            # convict right now.
+            current_round = getattr(self.engine, 'round', 0) if self.engine else 0
             for nid, model in neighbors_models.items():
-                is_valid, has_bait, rate, is_suspicious, _, _, _ = self._check_neighbor_has_backdoor(model)
-                if has_bait and is_suspicious:
-                    found_carrier = True
-                    break
+                if nid == came_from:
+                    continue
+                status = self.analyze_neighbor(nid, model, current_round)
+                if status == "MALICIOUS":
+                    logging.critical(f"[DFS] 🎯 ATTACKER CONFIRMED during grace: {nid} (sustained-extreme).")
+                    return (True, nid)
 
-            if found_carrier:
-                logging.info(f"[DFS] ⚡ CARRIER DETECTED! Skipping residual grace period to pursue poison trail.")
-            else:
-                logging.info(f"[DFS] ⏳ GRACE PERIOD at current node (round {self.rounds_at_current_node}/{self.grace_rounds_per_node})")
-                logging.info(f"[DFS] 🎣 Injecting HoneyDoor backdoor - waiting for propagation before analysis")
-                return (False, self.HOLD_POSITION)
+            logging.info(f"[DFS] ⏳ GRACE PERIOD at current node (round {self.rounds_at_current_node}/{self.grace_rounds_per_node}) — analyzing but holding pivot")
+            return (False, self.HOLD_POSITION)
 
         # DESPUÉS DEL GRACE PERIOD: Analizar vecinos para detectar atacante
         logging.info(f"[DFS] ✅ Grace period COMPLETE - Starting neighbor analysis")
@@ -1603,6 +2119,7 @@ class HoneyPotManager:
         investigation_neighbors = [] # Neighbors suspicious BUT COMPLIANT (victims/carriers)
         suspicious_neighbors = []    # Neighbors suspicious AND NO BAIT (threats)
         current_round = getattr(self.engine, 'round', 0) if self.engine else 0
+        peer_intensities = {}        # Self-measured poison intensity per analyzed neighbor
 
         for node_id, model_obj in neighbors_models.items():
             if node_id == came_from:
@@ -1613,6 +2130,9 @@ class HoneyPotManager:
             # UNIFIED ANALYSIS: Use memory-based analyze_neighbor
             # ============================================================================
             status = self.analyze_neighbor(node_id, model_obj, current_round)
+
+            # Self-measured poison intensity (for gradient-ascent pivoting + peak conviction)
+            peer_intensities[node_id] = self._poison_intensity(self.neighbor_tracking.get(node_id, {}))
 
             # Use tracking state instead of non-existent detector methods
             state = self.neighbor_tracking.get(node_id, {})
@@ -1636,17 +2156,12 @@ class HoneyPotManager:
                         # High priority (score=2.0) — pivot through ASAP to find the real attacker
                         investigation_neighbors.append((node_id, 2.0))
                 else:
-                    # Local consensus guard: only convict if suspect is silent to its neighbors
-                    # (reduces false positives from noisy cross-confirmation).
-                    if my_neighbors and not self._is_node_silent_to_neighbors(node_id, my_neighbors, reputation_module):
-                        logging.warning(
-                            f"[DFS] 🔎 Holding conviction for {node_id}: not silent to neighbors. "
-                            "Continuing investigation."
-                        )
-                        investigation_neighbors.append((node_id, 1.5))
-                    else:
-                        logging.critical(f"[DFS] 🎯 ATTACKER CONFIRMED: {node_id} (Verdict from Manager)")
-                        return (True, node_id)
+                    # analyze_neighbor already applied the full conviction gate
+                    # (_confirm_malicious: strong local signature AND reputation asymmetry —
+                    # silent sink + accuser). A MALICIOUS status here is therefore already
+                    # corroborated; no second, divergent silence check is needed.
+                    logging.critical(f"[DFS] 🎯 ATTACKER CONFIRMED: {node_id} (Verdict from Manager)")
+                    return (True, node_id)
 
             elif status == "BENIGN":
                 compliant_neighbors.append((node_id, 0.0))
@@ -1672,7 +2187,18 @@ class HoneyPotManager:
                 # RCA 23:40 (Fase 6.13): SAFETY FIRST - ZERO BAIT NO PIVOT.
                 # RCA 10:22 (Fase 6.14): BRAVE PIVOT - If we have a CLASH, we pivot immediately.
                 if clash_count > 0:
-                    logging.info(f"[DFS] 🧩 {node_id} has 0% bait but {clash_count} CLASHES. Confirmed victim carrier. Pivoting!")
+                    # ANTI-OSCILLATION / TERMINAL-SOURCE GUARD: "0% bait + clashes → pivot through"
+                    # assumes the node is a RELAY victim. If we have ALREADY visited this node
+                    # (the honeypot has been here / pivoted here before) and it STILL shows the
+                    # attack signature, it is not a pass-through relay — it is the terminal source.
+                    # Consult the reputation-asymmetry gate: a silent sink → CONVICT (stops the
+                    # 07:56:10 attacker↔neighbor oscillation where the gate was never reached).
+                    if self.is_visited(node_id) and self._confirm_malicious(
+                        node_id, node_state, current_round, reputation_module, reason="dfs-terminal-clash-carrier"
+                    ):
+                        logging.critical(f"[DFS] 🎯 ATTACKER CONFIRMED at terminal carrier {node_id} (visited + silent sink).")
+                        return (True, node_id)
+                    logging.info(f"[DFS] 🧩 {node_id} has 0% bait but {clash_count} CLASHES. Victim carrier — pivoting through.")
                     investigation_neighbors.append((node_id, 2.0))
                 elif rounds_with_suspicion >= 1:
                     logging.warning(f"[DFS] 🛡️ {node_id} has 0% bait/clashes. HOLDING position to differentiate via reinforcement.")
@@ -1686,6 +2212,42 @@ class HoneyPotManager:
             compliant_neighbors.sort(key=lambda item: item[0])
             investigation_neighbors.sort(key=lambda item: (-item[1], item[0]))
             suspicious_neighbors.sort(key=lambda item: (-item[1], item[0]))
+
+        # ============================================================================
+        # SELF-MEASURED SOURCE LOCALIZATION (gradient ascent on poison intensity)
+        # ============================================================================
+        if peer_intensities:
+            peak_node = max(peer_intensities, key=peer_intensities.get)
+            peak_intensity = peer_intensities[peak_node]
+            logging.info(
+                f"[DFS] 🌡️ Poison-intensity map: "
+                f"{ {k: round(v,2) for k,v in sorted(peer_intensities.items(), key=lambda x:-x[1])} } "
+                f"(peak={peak_node}:{peak_intensity:.2f}, best_seen={self.best_intensity_seen:.2f})"
+            )
+
+            # CONVICTION: is the peak neighbor the SOURCE? (local intensity peak + bait rejection)
+            peak_state = self.neighbor_tracking.get(peak_node, {})
+            if self._confirm_malicious(
+                peak_node, peak_state, current_round, reputation_module=reputation_module,
+                reason="gradient-peak", peer_intensities=peer_intensities
+            ):
+                logging.critical(f"[DFS] 🎯 SOURCE LOCALIZED: {peak_node} is the poison-intensity peak. CONVICTING.")
+                return (True, peak_node)
+
+            # GRADIENT ASCENT: if the peak is uphill (more intense than anything seen so far)
+            # and unvisited, climb toward it — this drives the honeypot to the source fast.
+            if peak_intensity > self.best_intensity_seen:
+                self.best_intensity_seen = peak_intensity
+                self.best_intensity_node = peak_node
+            if peak_intensity >= self.SOURCE_INTENSITY * 0.5 and not self.is_visited(peak_node):
+                logging.critical(
+                    f"[DFS] ⛰️ GRADIENT ASCENT: climbing toward higher poison intensity via {peak_node} "
+                    f"(intensity={peak_intensity:.2f}). Prioritizing this hop."
+                )
+                # Put the peak at the very front of the investigation queue.
+                investigation_neighbors = [(peak_node, 3.0)] + [
+                    it for it in investigation_neighbors if it[0] != peak_node
+                ]
 
         # ============================================================================
         # PIVOT OR HOLD DECISION

@@ -568,13 +568,20 @@ class Scenario:
         import random
         import logging
 
-        # CAMBIO 1: Si no hay config o está deshabilitado, forzamos que se habilite para tu prueba
+        # honeypot_config must be an explicit, already-enabled dict to reach this function
+        # (every call site gates on `honeypot_config and honeypot_config.get("enabled")` before
+        # calling here). Do NOT default "enabled" to True if missing: that silently turned
+        # Attack-only and other non-honeypot scenarios into honeypot-defended runs whenever the
+        # scenario request omitted the honeypot field, corrupting the Attack-only baseline
+        # (observed 2026-08: all 15 Attack scenarios had an active honeypot node injecting bait).
         if not honeypot_config:
             honeypot_config = {}
+            honeypot_config["enabled"] = False
+            return nodes
 
-        # FORZAR CONFIGURACIÓN PARA EL PIVOTE (Solo si no está definido)
-        if "enabled" not in honeypot_config:
-            honeypot_config["enabled"] = True
+        if not honeypot_config.get("enabled", False):
+            return nodes
+
         if "mode" not in honeypot_config:
             honeypot_config["mode"] = "dynamic"
         # honeypot_config["attacker_pivoting"] = True  # Eliminamos forzado
@@ -820,6 +827,16 @@ class ScenarioManagement:
                      if "pivot_round" in self.scenario.honeypot:
                          participant_config["adversarial_args"]["pivot_round"] = self.scenario.honeypot["pivot_round"]
 
+                # Malicious nodes can never be auto-selected as honeypot by
+                # factory_role_behavior() (it requires actual_role != "malicious"), but
+                # sanitize defense_args here too so no stale template default lingers.
+                if "defense_args" not in participant_config:
+                    participant_config["defense_args"] = {}
+                if self.scenario.honeypot and self.scenario.honeypot.get("enabled"):
+                    participant_config["defense_args"]["honeypot"] = self.scenario.honeypot.copy()
+                else:
+                    participant_config["defense_args"]["honeypot"] = {"enabled": False}
+
             elif node_config["role"] == "honeypot":
                 # Configuración base
                 participant_config["adversarial_args"]["attack_params"] = {"attacks": "No Attack"}
@@ -843,7 +860,11 @@ class ScenarioManagement:
 
                     "seed": node_config.get("honeypot_seed", hp_conf.get("seed", 0.5)),
                     "count": hp_conf.get("count", 1),
-                    "global_reset": hp_conf.get("global_reset", True)
+                    "global_reset": hp_conf.get("global_reset", True),
+                    # Post-containment sanitization strategy. Overrides "global_reset" above
+                    # when set: one of "global_reset", "no_reset", "gradient_ascent", "sisa",
+                    # "influence_function", "fed_eraser". See Engine._get_sanitization_strategy().
+                    "sanitization_strategy": hp_conf.get("sanitization_strategy"),
                 }
 
                 # Also save the entire raw honeypot configuration to defense_args
@@ -854,6 +875,19 @@ class ScenarioManagement:
             else:
                 participant_config["adversarial_args"]["attack_params"] = {"attacks": "No Attack"}
                 participant_config["defense_args"]["reputation"] = reputation_config
+
+                # Explicitly disable honeypot for non-honeypot nodes instead of relying on
+                # whatever participant.json.example ships with. This is defense-in-depth:
+                # previously the template's "honeypot.enabled": true leaked into every
+                # normal aggregator's defense_args, causing noderole_broken.py's
+                # factory_role_behavior() auto-select logic to promote a random aggregator
+                # to honeypot at runtime even when the scenario had no honeypot configured.
+                if "defense_args" not in participant_config:
+                    participant_config["defense_args"] = {}
+                if self.scenario.honeypot and self.scenario.honeypot.get("enabled"):
+                    participant_config["defense_args"]["honeypot"] = self.scenario.honeypot.copy()
+                else:
+                    participant_config["defense_args"]["honeypot"] = {"enabled": False}
 
             participant_config["mobility_args"]["random_geo"] = self.scenario.random_geo
             participant_config["mobility_args"]["latitude"] = self.scenario.latitude

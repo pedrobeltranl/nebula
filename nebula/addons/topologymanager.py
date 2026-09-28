@@ -260,7 +260,35 @@ class TopologyManager:
         Returns:
             None: Updates self.topology with the generated random topology
         """
+        # Ensure a CONNECTED graph. Erdos-Renyi with small n and low p (e.g. n=10, p=0.2)
+        # frequently produces disconnected graphs / isolated nodes, which strands the mobile
+        # honeypot in a component that can never reach the attacker (observed: EMNIST edge0.2
+        # never detected; MNIST edge0.2 partitioned and stalled). We regenerate until connected;
+        # if that fails within a bounded number of tries, we force connectivity by linking the
+        # separate components with minimal extra edges.
         random_graph = nx.erdos_renyi_graph(self.n_nodes, probability)
+        max_tries = 100
+        tries = 0
+        while not nx.is_connected(random_graph) and tries < max_tries:
+            random_graph = nx.erdos_renyi_graph(self.n_nodes, probability)
+            tries += 1
+        if not nx.is_connected(random_graph):
+            # Deterministic fallback: connect components by adding one edge between each
+            # consecutive pair of components (minimal spanning connection).
+            components = list(nx.connected_components(random_graph))
+            for i in range(len(components) - 1):
+                u = next(iter(components[i]))
+                v = next(iter(components[i + 1]))
+                random_graph.add_edge(u, v)
+            logging.warning(
+                f"[TopologyManager] Erdos-Renyi(p={probability}, n={self.n_nodes}) stayed disconnected "
+                f"after {max_tries} tries; forced connectivity by linking {len(components)} components."
+            )
+        else:
+            logging.info(
+                f"[TopologyManager] Connected Erdos-Renyi topology generated "
+                f"(p={probability}, n={self.n_nodes}, retries={tries})."
+            )
         self.topology = nx.to_numpy_array(random_graph, dtype=np.float32)
         np.fill_diagonal(self.topology, 0)  # No self-loops
 

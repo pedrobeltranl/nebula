@@ -119,7 +119,7 @@
       "weighting_factor": "dynamic"
     },
     "honeypot": {
-      "enabled": true,
+      "enabled": false,
       "mode": "fixed",
       "count": 1,
       "seed": 0.5,

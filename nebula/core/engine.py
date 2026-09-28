@@ -225,6 +225,14 @@ class Engine:
         self._recovery_rounds = 0 # Rounds remaining for post-poisoning recovery boost
         self._pending_reset_round = None # Round scheduled for global model reset
         self._original_batch_size = None # Stores scenario batch size for temporary recovery adjustments
+        # Post-correction watch state for honeypot-guided unlearning: after a correction
+        # pass, the node keeps re-checking the backdoor signature for a few rounds in case
+        # it reappears (e.g. from continuing to aggregate with another still-contaminated
+        # honest neighbor that hadn't been cleaned yet), and re-triggers cleanup if so,
+        # rather than cleaning once at conviction time and never looking again.
+        self._unlearning_watch = None # dict: {honey_map, patch_size, dominant_target,
+                                       #        verified_round, local_streak_required,
+                                       #        rounds_remaining} or None if no active watch
 
         self.config.reload_config_file()
 
@@ -462,6 +470,901 @@ class Engine:
                 fh.write(json.dumps(snapshot) + "\n")
         except Exception as e:
             logging.warning(f"[Engine] Could not write snapshot file: {e}")
+
+    def _maybe_save_checkpoint(self, checkpoint_interval: int = 10):
+        """Save a full weight checkpoint every `checkpoint_interval` rounds.
+
+        Written to `<log_dir>/checkpoints/<name>_round<N>.pt`, so unlearning
+        strategies that need a clean prior state to retrain or reconstruct
+        from (SISA-style sharded retraining, FedEraser-style reconstruction)
+        have a recent checkpoint to fall back to. Best-effort: a failure here
+        must never interrupt training.
+        """
+        try:
+            if self.round is None or self.round % checkpoint_interval != 0:
+                return
+            import torch
+
+            checkpoint_dir = os.path.join(self.log_dir, "checkpoints")
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            path = os.path.join(checkpoint_dir, f"{self.name}_round{self.round}.pt")
+            torch.save(self.trainer.model.state_dict(), path)
+            logging.debug(f"[Engine] Saved checkpoint for round {self.round} at {path}")
+        except Exception as e:
+            logging.warning(f"[Engine] Could not save checkpoint at round {self.round}: {e}")
+
+    async def _check_unlearning_watch(self):
+        """Phase 4 of honeypot-guided unlearning: post-correction backdoor-reappearance watch.
+
+        Invoked once per round from the main round loop (same call site as
+        `_maybe_save_checkpoint`). If `self._unlearning_watch` is armed (set by
+        `unlearn_honeypot_guided` after a correction pass), re-runs the honeypot's own
+        `HoneyDetector.check()` against this node's CURRENT model using the same honey_map/
+        dominant_target that triggered the original correction. If the backdoor signature
+        is still/again above `verify_threshold`, re-triggers a fresh `unlearn_honeypot_guided`
+        pass — this is what lets a node recover if it kept aggregating with another honest
+        neighbor that had absorbed the same poison but had not been cleaned yet, rather than
+        cleaning once at conviction time and never checking again. The watch disarms itself
+        after `rounds_remaining` reaches zero, whether or not the signature ever reappeared.
+        Best-effort: any failure here disarms the watch and logs, but never interrupts training.
+        """
+        watch = self._unlearning_watch
+        if not watch:
+            return
+        try:
+            import torch
+            from nebula.addons.honeypot.dataset import HoneyDataset
+            from nebula.addons.honeypot.detector import HoneyDetector
+
+            watch["rounds_remaining"] -= 1
+            model = self.trainer.model
+            device = next(model.parameters()).device
+            base_dataset = self.trainer.datamodule.data_train
+            honey_map = watch["honey_map"]
+            patch_size = watch["patch_size"]
+
+            probe_set = HoneyDataset(base_dataset, honey_map, patch_size=patch_size, injection_ratio=1.0)
+            probe_loader = torch.utils.data.DataLoader(probe_set, batch_size=min(64, len(probe_set)), shuffle=True)
+            inputs, labels = next(iter(probe_loader))
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            detector = HoneyDetector(patch_size=patch_size)
+            was_training = model.training
+            _, _, compliant_rate, _, _, _ = detector.check(model, (inputs, labels), honey_map)
+            if was_training:
+                model.train()
+
+            logging.info(
+                f"[Engine] 👁️ Unlearning watch (round {self.round}, "
+                f"{watch['rounds_remaining']} round(s) left): compliant_rate={compliant_rate:.2%} "
+                f"(threshold={watch['verify_threshold']:.2%})."
+            )
+
+            if compliant_rate > watch["verify_threshold"]:
+                logging.warning(
+                    f"[Engine] 🚨 Unlearning watch: backdoor signature reappeared "
+                    f"(compliant_rate={compliant_rate:.2%}); re-triggering honeypot-guided unlearning."
+                )
+                self._unlearning_watch = None  # disarm before recursing to avoid re-entrant watch churn
+                ascent_steps, synth_steps = self._scale_unlearning_effort(None)  # no fresh rounds_tested signal here; base budget
+                await self.unlearn_honeypot_guided(
+                    honey_map, patch_size,
+                    verified_round=watch["verified_round"],
+                    local_streak_required=watch["local_streak_required"],
+                    dominant_target=watch["dominant_target"],
+                    num_ascent_steps=ascent_steps,
+                    clean_synth_steps=synth_steps,
+                )
+                return  # unlearn_honeypot_guided may have re-armed a fresh watch itself
+
+            if watch["rounds_remaining"] <= 0:
+                logging.info("[Engine] 👁️ Unlearning watch window elapsed with no recurrence; disarming.")
+                self._unlearning_watch = None
+        except Exception as e:
+            logging.warning(f"[Engine] Error during unlearning watch check: {e}")
+            self._unlearning_watch = None
+
+    def _get_sanitization_strategy(self) -> str:
+        """Reads the configured sanitization strategy for post-containment recovery.
+
+        Backward-compatible with the legacy boolean `global_reset` flag: True maps to
+        "global_reset", False maps to "no_reset". New deployments can instead set the
+        string field `sanitization_strategy` directly to one of: "global_reset",
+        "no_reset", "gradient_ascent", "sisa", "influence_function", "fed_eraser".
+        """
+        try:
+            honeypot_args = self.config.participant.get("honeypot_args", {})
+            if isinstance(honeypot_args, dict) and honeypot_args.get("sanitization_strategy"):
+                return str(honeypot_args["sanitization_strategy"])
+            if isinstance(honeypot_args, dict) and "global_reset" in honeypot_args:
+                return "global_reset" if honeypot_args["global_reset"] else "no_reset"
+            # Fallback location, mirroring _global_reset_enabled() in noderole_broken.py.
+            defense_honeypot = self.config.participant.get("defense_args", {}).get("honeypot", {})
+            if isinstance(defense_honeypot, dict) and defense_honeypot.get("sanitization_strategy"):
+                return str(defense_honeypot["sanitization_strategy"])
+            if isinstance(defense_honeypot, dict) and "global_reset" in defense_honeypot:
+                return "global_reset" if defense_honeypot["global_reset"] else "no_reset"
+        except Exception as e:
+            logging.warning(f"[Engine] Could not read sanitization_strategy: {e}. Defaulting to no_reset.")
+        return "no_reset"
+
+    async def _maybe_run_unlearning(
+        self,
+        honey_map: dict,
+        patch_size: int = 4,
+        verified_round: int | None = None,
+        local_streak_required: int = 4,
+        dominant_target: int | None = None,
+        contamination_rounds: int | None = None,
+    ):
+        """Dispatches to the configured unlearning strategy, if one is active.
+
+        Called from `_control_block_neighbor_callback` once containment has been
+        confirmed for an attacker and the HoneyNode has broadcast the honey_map needed
+        to reconstruct this node's own trap dataset locally. `verified_round` and
+        `local_streak_required` (only meaningful for SISA-style rollback) locate roughly
+        when contamination began: verified_round - local_streak_required. `dominant_target`
+        (only meaningful for the honeypot-guided strategy) is the specific class the
+        attacker's poisoned predictions concentrated on, as measured by the honeypot.
+        `contamination_rounds` (`rounds_tested` from the honeypot's own tracking of this
+        attacker, i.e. how long it was actually under audit before conviction) is used by
+        the honeypot-guided strategy to scale its correction effort to how long the poison
+        signal was actually present, instead of a flat budget for every conviction.
+        """
+        strategy = self._get_sanitization_strategy()
+        if strategy == "gradient_ascent":
+            await self.unlearn_gradient_ascent(honey_map, patch_size)
+        elif strategy == "influence_function":
+            await self.unlearn_influence_function(honey_map, patch_size)
+        elif strategy == "sisa":
+            await self.unlearn_sisa(honey_map, patch_size, verified_round, local_streak_required)
+        elif strategy == "fed_eraser":
+            await self.unlearn_fed_eraser(honey_map, patch_size, verified_round, local_streak_required)
+        elif strategy == "honeypot_guided":
+            ascent_steps, synth_steps = self._scale_unlearning_effort(contamination_rounds)
+            await self.unlearn_honeypot_guided(
+                honey_map, patch_size, verified_round, local_streak_required, dominant_target,
+                num_ascent_steps=ascent_steps, clean_synth_steps=synth_steps,
+            )
+        # "global_reset" and "no_reset" are handled by the existing reset/shock-training
+        # paths (reinitialize_model / _recovery_rounds) and do not need this dispatch.
+
+    @staticmethod
+    def _scale_unlearning_effort(
+        contamination_rounds: int | None,
+        base_steps: int = 3,
+        rounds_per_extra_step: int = 2,
+        max_steps: int = 15,
+    ) -> tuple[int, int]:
+        """Scales unlearning correction effort to how long contamination actually lasted.
+
+        Replaces a flat budget (previously a fixed 3 steps regardless of case) with one
+        that grows with `contamination_rounds` (the honeypot's own `rounds_tested` for this
+        attacker: how many rounds it was under audit before conviction, a real measure of
+        exposure rather than a guess). A conviction reached quickly (few rounds_tested)
+        implies little accumulated contamination and keeps the base budget; one that took
+        much longer to confirm implies more residual poison to correct and gets a larger
+        budget, capped at `max_steps` to bound worst-case cost across the experimental
+        matrix (60 configurations x up to 10 nodes). `rounds_per_extra_step` = 2 means every
+        2 extra rounds of contamination exposure earns 1 extra correction step; this
+        constant, like `base_steps`, is not yet empirically tuned — a reasoned starting
+        point, not a validated one (see the "known gaps" note in project memory).
+
+        Returns (ascent_steps, clean_synth_steps) — both scaled identically, since both
+        phases of the honeypot-guided correction should plausibly need proportionally more
+        work under longer exposure.
+        """
+        if not contamination_rounds or contamination_rounds <= 0:
+            return base_steps, base_steps
+        extra = int(contamination_rounds) // rounds_per_extra_step
+        scaled = min(base_steps + extra, max_steps)
+        return scaled, scaled
+
+    async def unlearn_gradient_ascent(
+        self,
+        honey_map: dict,
+        patch_size: int = 4,
+        num_steps: int = 3,
+        injection_ratio: float = 1.0,
+        ascent_lr: float | None = None,
+    ):
+        """Gradient-ascent unlearning over the honeypot's trap dataset.
+
+        Forget set: this node's OWN local benign dataset, wrapped with the HoneyNode's
+        broadcast honey_map (pi_t) and trigger patch, i.e. a local reconstruction of
+        D^(t)_trap (Eq. trapdataset, design.tex sec:methodologybait) — the sample set
+        already known-poisoned by construction, since it is what the conviction's high-CR
+        signature was measured against. This node's OWN data is used (not the HoneyNode's),
+        since only the honey_map/trigger can be safely broadcast, not raw training data.
+
+        Ascends (rather than descends) the loss on this forget set for a small, fixed
+        budget of `num_steps`, to push the model's response to the trigger away from the
+        poisoned mapping. These steps are NOT counted as lost training rounds against the
+        T-round horizon (unlike Global Reset, which discards accumulated progress) — they
+        are applied as extra local steps and normal training resumes immediately after.
+        """
+        try:
+            import torch
+            from nebula.addons.honeypot.dataset import HoneyDataset
+
+            if not honey_map:
+                logging.warning("[Engine] unlearn_gradient_ascent called without a honey_map; skipping.")
+                return
+
+            async with self.trainning_in_progress_lock:
+                model = self.trainer.model
+                base_dataset = self.trainer.datamodule.data_train
+                forget_set = HoneyDataset(base_dataset, honey_map, patch_size=patch_size, injection_ratio=injection_ratio)
+
+                loader = torch.utils.data.DataLoader(
+                    forget_set,
+                    batch_size=getattr(self.trainer.datamodule, "batch_size", 32),
+                    shuffle=True,
+                )
+
+                lr = ascent_lr
+                if lr is None:
+                    lr = self.config.participant.get("training_args", {}).get("learning_rate")
+                    if lr is None:
+                        lr = getattr(model, "learning_rate", 0.01)
+
+                optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+                criterion = getattr(model, "criterion", torch.nn.CrossEntropyLoss())
+
+                model.train()
+                logging.warning(
+                    f"[Engine] 🔥 Starting gradient-ascent unlearning over trap dataset "
+                    f"({num_steps} steps, lr={lr}, {len(forget_set)} local samples)."
+                )
+                steps_done = 0
+                for _ in range(num_steps):
+                    for inputs, targets in loader:
+                        device = next(model.parameters()).device
+                        inputs = inputs.to(device)
+                        targets = targets.to(device)
+
+                        optimizer.zero_grad()
+                        outputs = model(inputs)
+                        loss = criterion(outputs, targets)
+                        # Gradient ASCENT: minimize the negative loss, i.e. push predictions
+                        # AWAY from the poisoned honey_map targets rather than toward them.
+                        (-loss).backward()
+                        optimizer.step()
+
+                        steps_done += 1
+                        if steps_done >= num_steps:
+                            break
+                    if steps_done >= num_steps:
+                        break
+
+                model.set_updated_round(self.round)
+                logging.warning(f"[Engine] ✅ Gradient-ascent unlearning complete ({steps_done} steps).")
+        except Exception as e:
+            logging.error(f"[Engine] Error during gradient-ascent unlearning: {e}", exc_info=True)
+
+    def _lissa_hvp(self, model, criterion, damp_dataset_iter, v: list, damping: float = 0.01, scale: float = 25.0):
+        """One LiSSA recursion step: refines an estimate of H^{-1}v without ever forming H.
+
+        Implements the recursive update from Agarwal et al. / Koh & Liang's influence
+        functions: given the current estimate `v` (a list of per-parameter tensors, same
+        shapes as model.parameters()), computes a Hessian-vector product Hv via a second
+        forward+backward through the same v (double backprop, `create_graph=True`), then
+        returns `v_next = v + (1 - damping) * v - Hv / scale`, i.e. one step of the Neumann-
+        series expansion of H^{-1}. `damp_dataset_iter` yields the (inputs, targets) batch
+        used to estimate H at this recursion step (a fresh batch each call reduces variance,
+        following the stochastic part of LiSSA's name).
+        """
+        import torch
+
+        inputs, targets = next(damp_dataset_iter)
+        device = next(model.parameters()).device
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+        params = [p for p in model.parameters() if p.requires_grad]
+        grads = torch.autograd.grad(loss, params, create_graph=True)
+
+        # Hessian-vector product: d/dtheta ( grads . v )
+        flat_grad_v = sum((g * vv).sum() for g, vv in zip(grads, v))
+        hvp = torch.autograd.grad(flat_grad_v, params, retain_graph=False)
+
+        return [vv + (1 - damping) * vv - hv / scale for vv, hv in zip(v, hvp)]
+
+    async def unlearn_influence_function(
+        self,
+        honey_map: dict,
+        patch_size: int = 4,
+        lissa_iterations: int = 10,
+        injection_ratio: float = 1.0,
+        influence_lr: float | None = None,
+    ):
+        """Influence-function-based unlearning over the honeypot's trap dataset.
+
+        Rather than descending/ascending gradients directly on the forget set (as
+        `unlearn_gradient_ascent` does), this estimates each forget-set point's influence
+        on the trained parameters via the classic influence-functions result
+        (Koh & Liang, 2017): I(z) = -H^{-1} grad_theta L(z, theta), where H is the Hessian
+        of the training loss at the current parameters. Exact H^{-1} is infeasible here
+        (up to 6.62M params on CIFAR-100), so it is approximated with LiSSA (Agarwal et al.),
+        a stochastic linear-time recursion that only needs Hessian-VECTOR products (via
+        double backprop), never the explicit Hessian — `lissa_iterations` fixed at a small
+        budget (10) to keep cost comparable to gradient-ascent's 3 steps rather than the
+        literature's occasional 50, since this runs across the full 5x3x4x10-node matrix.
+
+        Forget set: same local reconstruction of D^(t)_trap as gradient-ascent (this node's
+        own data wrapped with the broadcast honey_map/trigger). The parameter update removes
+        (rather than ascends away from) the estimated influence: theta <- theta - I(forget_set),
+        i.e. theta <- theta + H^{-1} grad_theta L(forget_set, theta), an approximate one-shot
+        correction rather than an iterative training pass over the forget set itself.
+        """
+        try:
+            import torch
+            from nebula.addons.honeypot.dataset import HoneyDataset
+
+            if not honey_map:
+                logging.warning("[Engine] unlearn_influence_function called without a honey_map; skipping.")
+                return
+
+            async with self.trainning_in_progress_lock:
+                model = self.trainer.model
+                base_dataset = self.trainer.datamodule.data_train
+                forget_set = HoneyDataset(base_dataset, honey_map, patch_size=patch_size, injection_ratio=injection_ratio)
+
+                batch_size = getattr(self.trainer.datamodule, "batch_size", 32)
+                forget_loader = torch.utils.data.DataLoader(forget_set, batch_size=batch_size, shuffle=True)
+                criterion = getattr(model, "criterion", torch.nn.CrossEntropyLoss())
+                params = [p for p in model.parameters() if p.requires_grad]
+
+                model.train()
+                logging.warning(
+                    f"[Engine] 🔬 Starting influence-function unlearning over trap dataset "
+                    f"({lissa_iterations} LiSSA iterations, {len(forget_set)} local samples)."
+                )
+
+                # Step 1: accumulate the average gradient of the loss on the forget set.
+                forget_grad = [torch.zeros_like(p) for p in params]
+                device = next(model.parameters()).device
+                n_batches = 0
+                for inputs, targets in forget_loader:
+                    inputs, targets = inputs.to(device), targets.to(device)
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
+                    grads = torch.autograd.grad(loss, params)
+                    forget_grad = [fg + g.detach() for fg, g in zip(forget_grad, grads)]
+                    n_batches += 1
+                if n_batches == 0:
+                    logging.warning("[Engine] unlearn_influence_function: empty forget set; skipping.")
+                    return
+                forget_grad = [fg / n_batches for fg in forget_grad]
+
+                # Step 2: approximate H^{-1} @ forget_grad via `lissa_iterations` LiSSA steps.
+                # Uses the training set (not the forget set) to estimate H, since H should
+                # reflect the loss landscape the model was actually trained on.
+                def _train_batch_iter():
+                    train_loader = torch.utils.data.DataLoader(base_dataset, batch_size=batch_size, shuffle=True)
+                    while True:
+                        for batch in train_loader:
+                            yield batch
+
+                hvp_estimate = [g.clone() for g in forget_grad]
+                batch_iter = _train_batch_iter()
+                for _ in range(lissa_iterations):
+                    hvp_estimate = self._lissa_hvp(model, criterion, batch_iter, hvp_estimate)
+
+                # Step 3: one-shot parameter correction, removing the estimated influence.
+                lr = influence_lr
+                if lr is None:
+                    lr = self.config.participant.get("training_args", {}).get("learning_rate")
+                    if lr is None:
+                        lr = getattr(model, "learning_rate", 0.01)
+
+                with torch.no_grad():
+                    for p, hv in zip(params, hvp_estimate):
+                        p.add_(hv, alpha=lr)
+
+                model.set_updated_round(self.round)
+                logging.warning(f"[Engine] ✅ Influence-function unlearning complete ({lissa_iterations} LiSSA iterations).")
+        except Exception as e:
+            logging.error(f"[Engine] Error during influence-function unlearning: {e}", exc_info=True)
+
+    def _find_clean_checkpoint(self, before_round: int) -> str | None:
+        """Finds the most recent saved checkpoint at or before `before_round`.
+
+        Checkpoints are saved every 10 rounds by `_maybe_save_checkpoint` as
+        `<log_dir>/checkpoints/<name>_round<N>.pt`. Returns the path to the newest one
+        with N <= before_round, or None if no such checkpoint exists (e.g. contamination
+        was detected before round 10, the first checkpoint).
+        """
+        try:
+            checkpoint_dir = os.path.join(self.log_dir, "checkpoints")
+            if not os.path.isdir(checkpoint_dir):
+                return None
+            prefix = f"{self.name}_round"
+            candidates = []
+            for fname in os.listdir(checkpoint_dir):
+                if fname.startswith(prefix) and fname.endswith(".pt"):
+                    try:
+                        ckpt_round = int(fname[len(prefix):-len(".pt")])
+                    except ValueError:
+                        continue
+                    if ckpt_round <= before_round:
+                        candidates.append((ckpt_round, fname))
+            if not candidates:
+                return None
+            candidates.sort(key=lambda x: x[0])
+            best_round, best_fname = candidates[-1]
+            return os.path.join(checkpoint_dir, best_fname)
+        except Exception as e:
+            logging.warning(f"[Engine] Could not locate a clean checkpoint before round {before_round}: {e}")
+            return None
+
+    async def unlearn_sisa(
+        self,
+        honey_map: dict,
+        patch_size: int = 4,
+        verified_round: int | None = None,
+        local_streak_required: int = 4,
+        retrain_epochs: int = 1,
+    ):
+        """SISA-style unlearning: roll back to the last clean checkpoint and retrain.
+
+        Classic SISA (Bourtoule et al.) shards the dataset and retrains only the affected
+        shard from scratch. There is no natural data-shard structure here (each node trains
+        continuously on its own local data across rounds), so the adapted notion of "shard"
+        used here is the TIME axis: the checkpoint saved before contamination began is the
+        clean starting point, and only the contaminated span is redone (a much smaller
+        retraining cost than a full Global Reset, which discards all T-round progress).
+
+        Contamination is estimated to have started at
+        `verified_round - local_streak_required` (Eq. local-streak in design.tex
+        sec:methodology-detection: conviction requires `local_streak_required` consecutive
+        rounds of sustained signature, so the signature started roughly that many rounds
+        before the round it was confirmed). The nearest checkpoint at or before that round
+        is loaded, replacing the current (contaminated) weights, and the model is retrained
+        for `retrain_epochs` epoch(s) over this node's own clean local data (NOT the trap/
+        forget set — SISA retrains on legitimate data, it does not ascend on poisoned data
+        like `unlearn_gradient_ascent` does) to recover the training progress made during
+        the contaminated span, now without the attacker's contribution (already blocked by
+        this point via BLOCK_NEIGHBOR, so the retraining rounds no longer aggregate its
+        updates).
+        """
+        try:
+            import torch
+
+            if verified_round is None:
+                logging.warning("[Engine] unlearn_sisa called without verified_round; cannot locate a rollback point. Skipping.")
+                return
+
+            contamination_start = max(0, int(verified_round) - int(local_streak_required))
+            checkpoint_path = self._find_clean_checkpoint(contamination_start)
+            if checkpoint_path is None:
+                logging.warning(
+                    f"[Engine] unlearn_sisa: no checkpoint found at or before round {contamination_start} "
+                    f"(verified_round={verified_round}, local_streak_required={local_streak_required}). "
+                    f"Contamination likely predates the first checkpoint; skipping rollback."
+                )
+                return
+
+            async with self.trainning_in_progress_lock:
+                model = self.trainer.model
+
+                logging.warning(
+                    f"[Engine] ⏮️ SISA-style unlearning: rolling back to {checkpoint_path} "
+                    f"(estimated contamination start: round {contamination_start})."
+                )
+                state_dict = torch.load(checkpoint_path, map_location=next(model.parameters()).device)
+                model.load_state_dict(state_dict)
+
+                # Clear optimizer state, mirroring the existing Global Reset behavior
+                # (reinitialize_model): a rolled-back model should not keep momentum/Adam
+                # buffers accumulated under the now-discarded contaminated weights.
+                if hasattr(model, "reset_optimizer_state"):
+                    model.reset_optimizer_state()
+                elif hasattr(model, "_optimizer") and model._optimizer:
+                    model._optimizer.state.clear()
+
+                # Retrain on this node's OWN clean local data (not the trap/forget set) to
+                # redo the contaminated span's progress without the attacker's contribution.
+                train_loader = torch.utils.data.DataLoader(
+                    self.trainer.datamodule.data_train,
+                    batch_size=getattr(self.trainer.datamodule, "batch_size", 32),
+                    shuffle=True,
+                )
+                lr = self.config.participant.get("training_args", {}).get("learning_rate")
+                if lr is None:
+                    lr = getattr(model, "learning_rate", 0.01)
+                optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+                criterion = getattr(model, "criterion", torch.nn.CrossEntropyLoss())
+                device = next(model.parameters()).device
+
+                model.train()
+                for _ in range(retrain_epochs):
+                    for inputs, targets in train_loader:
+                        inputs, targets = inputs.to(device), targets.to(device)
+                        optimizer.zero_grad()
+                        loss = criterion(model(inputs), targets)
+                        loss.backward()
+                        optimizer.step()
+
+                model.set_updated_round(self.round)
+                logging.warning(
+                    f"[Engine] ✅ SISA-style unlearning complete: rolled back to round "
+                    f"{contamination_start} checkpoint and retrained {retrain_epochs} epoch(s) on clean data."
+                )
+        except Exception as e:
+            logging.error(f"[Engine] Error during SISA-style unlearning: {e}", exc_info=True)
+
+    async def unlearn_fed_eraser(
+        self,
+        honey_map: dict,
+        patch_size: int = 4,
+        verified_round: int | None = None,
+        local_streak_required: int = 4,
+        calibration_steps: int = 3,
+    ):
+        """FedEraser-style unlearning: recalibrate the contaminated span's contribution.
+
+        Classic FedEraser (Liu et al., 2021) keeps a full per-round, per-client update
+        history and, to remove a client's influence, recalibrates each historical round's
+        update against a reference update computed without that client, then replays the
+        corrected updates forward. That per-round update history is not available here
+        (only every-10-round AGGREGATED weight checkpoints, from `_maybe_save_checkpoint`,
+        the same ones `unlearn_sisa` uses) — a from-scratch per-round history mechanism
+        was deliberately not added for this approximation, since it would need its own
+        disk-cost sizing decision the way the checkpoint interval did.
+
+        Approximation used here, DISTINCT from `unlearn_sisa`'s discard-and-retrain: rather
+        than rolling back to the clean checkpoint and retraining from scratch, this computes
+        a CALIBRATED CORRECTION VECTOR — the direction of legitimate progress between the
+        last clean checkpoint (before contamination, same lookup as SISA) and the CURRENT
+        (contaminated) weights — and RESCALES that direction per-tensor by its cosine
+        similarity to a clean-data reference gradient computed at the clean checkpoint's
+        weights, before adding it back on top of the clean checkpoint. Tensors whose
+        contaminated-span progress points in roughly the same direction as the clean
+        reference gradient are kept close to their full magnitude (that part of `delta` is
+        plausibly legitimate training progress); tensors whose progress diverges from the
+        clean reference are shrunk (that part of `delta` is plausibly attacker-influenced).
+        This keeps whatever legitimate progress happened during the contaminated span
+        (unlike SISA, which discards it outright) while still damping the estimated
+        contaminated component, mirroring FedEraser's "correct, don't discard" philosophy
+        with coarser inputs than the original per-round update history it assumes.
+        """
+        try:
+            import torch
+            import torch.nn.functional as F
+
+            if verified_round is None:
+                logging.warning("[Engine] unlearn_fed_eraser called without verified_round; cannot locate a reference checkpoint. Skipping.")
+                return
+
+            contamination_start = max(0, int(verified_round) - int(local_streak_required))
+            checkpoint_path = self._find_clean_checkpoint(contamination_start)
+            if checkpoint_path is None:
+                logging.warning(
+                    f"[Engine] unlearn_fed_eraser: no reference checkpoint found at or before round "
+                    f"{contamination_start}; skipping."
+                )
+                return
+
+            async with self.trainning_in_progress_lock:
+                model = self.trainer.model
+                device = next(model.parameters()).device
+
+                clean_state = torch.load(checkpoint_path, map_location=device)
+                current_state = {k: v.clone() for k, v in model.state_dict().items()}
+
+                # Direction of legitimate progress from the last clean checkpoint to the
+                # current (contaminated) weights: delta = current - clean. Only trainable
+                # parameters are corrected (matched by name, not by zip-ing state_dict keys
+                # against model.parameters(), since state_dict also includes non-trainable
+                # buffers like BatchNorm running_mean/running_var that model.parameters()
+                # does not enumerate — zip-ing the two would silently misalign keys/tensors
+                # as soon as any such buffer exists).
+                param_names = {name for name, p in model.named_parameters() if p.requires_grad}
+                delta = {k: current_state[k] - clean_state[k].to(device) for k in param_names}
+
+                train_loader = torch.utils.data.DataLoader(
+                    self.trainer.datamodule.data_train,
+                    batch_size=getattr(self.trainer.datamodule, "batch_size", 32),
+                    shuffle=True,
+                )
+                criterion = getattr(model, "criterion", torch.nn.CrossEntropyLoss())
+
+                logging.warning(
+                    f"[Engine] 🧮 Starting FedEraser-style unlearning: recalibrating post-round-"
+                    f"{contamination_start} contribution ({calibration_steps} calibration steps)."
+                )
+
+                model.train()
+                # Estimate a clean-data reference gradient at the clean checkpoint's weights.
+                model.load_state_dict(clean_state)
+                named_params = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
+                clean_grad = {name: torch.zeros_like(p) for name, p in named_params}
+                n_batches = 0
+                for inputs, targets in train_loader:
+                    inputs, targets = inputs.to(device), targets.to(device)
+                    loss = criterion(model(inputs), targets)
+                    grads = torch.autograd.grad(loss, [p for _, p in named_params])
+                    clean_grad = {name: clean_grad[name] + g.detach() for (name, _), g in zip(named_params, grads)}
+                    n_batches += 1
+                    if n_batches >= calibration_steps:
+                        break
+                if n_batches > 0:
+                    clean_grad = {name: g / n_batches for name, g in clean_grad.items()}
+
+                # Recalibrated update: for each tensor, rescale delta by how aligned it is
+                # with the clean-data reference gradient direction. cosine in [-1, 1] is
+                # remapped to a [0, 1] keep-fraction (1.0 = same direction as clean gradient,
+                # kept in full; 0.0 = opposite direction, treated as fully contaminated and
+                # dropped), so a divergent tensor is damped rather than either blindly kept
+                # (the old bug) or discarded outright (which would just collapse into SISA).
+                with torch.no_grad():
+                    for name in delta:
+                        d = delta[name].flatten()
+                        g = clean_grad[name].flatten()
+                        if torch.count_nonzero(d) == 0 or torch.count_nonzero(g) == 0:
+                            keep_fraction = 1.0  # no gradient signal to compare against; keep progress as-is
+                        else:
+                            cosine = F.cosine_similarity(d.unsqueeze(0), g.unsqueeze(0)).item()
+                            keep_fraction = (cosine + 1.0) / 2.0
+                        recalibrated_delta = delta[name] * keep_fraction
+                        model.get_parameter(name).copy_(clean_state[name].to(device) + recalibrated_delta)
+
+                model.set_updated_round(self.round)
+                logging.warning(
+                    f"[Engine] ✅ FedEraser-style unlearning complete: recalibrated contribution "
+                    f"since round {contamination_start}."
+                )
+        except Exception as e:
+            logging.error(f"[Engine] Error during FedEraser-style unlearning: {e}", exc_info=True)
+
+    async def unlearn_honeypot_guided(
+        self,
+        honey_map: dict,
+        patch_size: int = 4,
+        verified_round: int | None = None,
+        local_streak_required: int = 4,
+        dominant_target: int | None = None,
+        num_ascent_steps: int = 3,
+        clean_synth_steps: int = 3,
+        ascent_lr: float | None = None,
+        max_correction_rounds: int = 5,
+        verify_threshold: float = 0.10,
+        watch_rounds: int = 5,
+    ):
+        """Honeypot-guided unlearning: this work's proposed method.
+
+        Four parts, combining signals unique to the honeypot's own detection pipeline
+        that none of the four generic baselines above use:
+
+        Phase 1 — DIRECTED forget set via `dominant_target`: instead of ascending on the
+        whole trap dataset (as `unlearn_gradient_ascent` does), this restricts the forget
+        set to samples whose ORIGINAL label maps, under the broadcast honey_map, to the
+        specific class the attacker's poisoned predictions concentrated on (`dominant_target`,
+        measured in `HoneyDetector.check()`/`detector.py:29`, tracked as
+        `state["last_dominant_target"]` in `manager.py`). This targets the actual measured
+        (trigger, source_class) -> dominant_target association the honeypot observed, not a
+        generic hypothesis about what was poisoned.
+
+        Phase 2 — correction direction via a synthesized theta_clean vs. the current
+        (contaminated) model: the real design.tex dual-model formulation (theta_bait vs.
+        theta_clean maintained simultaneously) does not exist in this codebase — the
+        HoneyNode trains a single model on a dataloader temporarily wrapped with the trap
+        set for its own audit round (see `noderole_broken.py`'s `baited_loader_factory`),
+        it does not persist two parallel models. So theta_clean is SYNTHESIZED on demand
+        here: starting from the last clean checkpoint before contamination (same
+        `_find_clean_checkpoint` lookup SISA/FedEraser use), fine-tune a short-lived copy
+        for `clean_synth_steps` steps on this node's OWN local data WITHOUT any honey_map/
+        trigger wrapper (genuinely clean data) — this synthesized copy stands in for
+        theta_clean. The CURRENT in-memory model (which has, transitively via aggregation,
+        absorbed some of the honey_map's signal, even without ever training on the trap set
+        directly) stands in for theta_bait. The correction direction is
+        `theta_clean_synth - theta_current`, applied as a targeted gradient-ascent-style
+        pass restricted to the Phase-1 directed forget set, so both unique signals
+        contribute to the same corrective step rather than being used independently.
+
+        Phase 3 — VERIFIED stopping criterion: rather than trusting a single fixed-size
+        correction pass blindly (what every method above, including this one's earlier
+        version, did), this re-runs the honeypot's OWN detector (`HoneyDetector.check()`)
+        against the corrected model after each correction pass. If the backdoor signature
+        (compliant_rate, i.e. how often the corrected model still predicts dominant_target
+        when shown the trigger) is still above `verify_threshold`, another correction pass
+        is applied and re-checked, up to `max_correction_rounds` (default 5) to bound
+        worst-case cost. This replaces "apply N steps and hope" with "clean until the
+        honeypot's own evidence says it's clean, or the round budget runs out."
+
+        Phase 4 — POST-CORRECTION WATCH: once this method returns, it registers a watch
+        (`self._unlearning_watch`) checked once per round for `watch_rounds` (default 5)
+        subsequent rounds by `_check_unlearning_watch()` (invoked from the main round loop,
+        same call site as `_maybe_save_checkpoint`). If the backdoor signature reappears
+        above `verify_threshold` during the watch window — plausible if this node keeps
+        aggregating with another honest neighbor that absorbed the same poison but had not
+        been cleaned yet — the watch re-triggers a fresh `unlearn_honeypot_guided` call
+        automatically, rather than cleaning once at conviction time and never checking again.
+        """
+        try:
+            import torch
+            from nebula.addons.honeypot.dataset import HoneyDataset
+            from nebula.addons.honeypot.detector import HoneyDetector
+
+            if not honey_map:
+                logging.warning("[Engine] unlearn_honeypot_guided called without a honey_map; skipping.")
+                return
+
+            async with self.trainning_in_progress_lock:
+                model = self.trainer.model
+                device = next(model.parameters()).device
+                base_dataset = self.trainer.datamodule.data_train
+                batch_size = getattr(self.trainer.datamodule, "batch_size", 32)
+                criterion = getattr(model, "criterion", torch.nn.CrossEntropyLoss())
+
+                # --- Phase 1: build the directed forget set ---
+                # Restrict to samples whose original label the honey_map maps onto
+                # dominant_target, i.e. the specific (source_class -> dominant_target) leg
+                # of the association actually measured for this attacker. Falls back to the
+                # full honey_map-wrapped set (same as gradient-ascent's forget set) if
+                # dominant_target was not available (e.g. broadcast from an older payload,
+                # or the honeypot never measured a stable dominant target for this attacker).
+                full_forget_set = HoneyDataset(base_dataset, honey_map, patch_size=patch_size, injection_ratio=1.0)
+                if dominant_target is not None:
+                    source_classes = {y for y, y_prime in honey_map.items() if y_prime == dominant_target}
+                    if source_classes:
+                        directed_indices = []
+                        for i in range(len(base_dataset)):
+                            label = base_dataset[i][1]
+                            label_val = label.item() if torch.is_tensor(label) else label
+                            if label_val in source_classes:
+                                directed_indices.append(i)
+                        if directed_indices:
+                            forget_set = torch.utils.data.Subset(full_forget_set, directed_indices)
+                        else:
+                            logging.warning(
+                                "[Engine] unlearn_honeypot_guided: dominant_target given but no local "
+                                "samples map to it; falling back to the full honey_map forget set."
+                            )
+                            forget_set = full_forget_set
+                    else:
+                        forget_set = full_forget_set
+                else:
+                    forget_set = full_forget_set
+
+                # Held-out validation batch for Phase 3's verified stopping criterion, drawn
+                # from the same directed forget set (BEFORE trigger injection is randomized
+                # per-epoch by the loader below) so verification measures response to the
+                # SAME (trigger, source_class) association Phase 1 targeted.
+                verify_loader = torch.utils.data.DataLoader(forget_set, batch_size=min(64, len(forget_set)), shuffle=True)
+                verify_inputs, verify_labels = next(iter(verify_loader))
+                verify_inputs, verify_labels = verify_inputs.to(device), verify_labels.to(device)
+                detector = HoneyDetector(patch_size=patch_size)
+
+                # --- Phase 2: synthesize theta_clean from the last clean checkpoint ---
+                contamination_start = None
+                clean_state = None
+                if verified_round is not None:
+                    contamination_start = max(0, int(verified_round) - int(local_streak_required))
+                    checkpoint_path = self._find_clean_checkpoint(contamination_start)
+                    if checkpoint_path is not None:
+                        clean_state = torch.load(checkpoint_path, map_location=device)
+
+                theta_clean_direction = None
+                if clean_state is not None:
+                    clean_model_state = {k: v.clone() for k, v in model.state_dict().items()}
+                    model.load_state_dict(clean_state)
+                    clean_optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+                    clean_loader = torch.utils.data.DataLoader(base_dataset, batch_size=batch_size, shuffle=True)
+                    model.train()
+                    n_steps = 0
+                    for inputs, targets in clean_loader:
+                        inputs, targets = inputs.to(device), targets.to(device)
+                        clean_optimizer.zero_grad()
+                        loss = criterion(model(inputs), targets)
+                        loss.backward()
+                        clean_optimizer.step()
+                        n_steps += 1
+                        if n_steps >= clean_synth_steps:
+                            break
+                    theta_clean_synth = {k: v.clone() for k, v in model.state_dict().items()}
+                    theta_clean_direction = {
+                        k: theta_clean_synth[k] - clean_model_state[k]
+                        for k in theta_clean_synth
+                        if theta_clean_synth[k].dtype.is_floating_point
+                    }
+                    # Restore the current (contaminated) weights before the corrective pass below.
+                    model.load_state_dict(clean_model_state)
+                else:
+                    logging.warning(
+                        "[Engine] unlearn_honeypot_guided: no clean checkpoint available to synthesize "
+                        "theta_clean; proceeding with directed gradient-ascent only (Phase 1 signal only)."
+                    )
+
+                lr = ascent_lr
+                if lr is None:
+                    lr = self.config.participant.get("training_args", {}).get("learning_rate")
+                    if lr is None:
+                        lr = getattr(model, "learning_rate", 0.01)
+
+                logging.warning(
+                    f"[Engine] 🎯 Starting honeypot-guided unlearning: directed forget set "
+                    f"({len(forget_set)} samples, dominant_target={dominant_target}), up to "
+                    f"{max_correction_rounds} verified correction rounds ({num_ascent_steps} ascent "
+                    f"steps each), theta_clean synthesis={'yes' if theta_clean_direction else 'no'}."
+                )
+
+                total_steps_done = 0
+                correction_round = 0
+                final_compliant_rate = None
+                for correction_round in range(1, max_correction_rounds + 1):
+                    # --- Corrective pass: directed gradient ascent, nudged toward theta_clean ---
+                    # A pure ascent step (like unlearn_gradient_ascent) is combined with a pull
+                    # toward the synthesized theta_clean direction when available, so both unique
+                    # honeypot signals contribute to the same update rather than independently.
+                    forget_loader = torch.utils.data.DataLoader(forget_set, batch_size=batch_size, shuffle=True)
+                    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+                    model.train()
+                    steps_done = 0
+                    for _ in range(num_ascent_steps):
+                        for inputs, targets in forget_loader:
+                            inputs, targets = inputs.to(device), targets.to(device)
+                            optimizer.zero_grad()
+                            loss = criterion(model(inputs), targets)
+                            (-loss).backward()  # ascend on the directed forget set (Phase 1)
+                            optimizer.step()
+                            steps_done += 1
+                            if steps_done >= num_ascent_steps:
+                                break
+                        if steps_done >= num_ascent_steps:
+                            break
+                    total_steps_done += steps_done
+
+                    if theta_clean_direction is not None:
+                        with torch.no_grad():
+                            for name, p in model.named_parameters():
+                                if name in theta_clean_direction and p.requires_grad:
+                                    # Pull toward the direction the synthesized theta_clean moved
+                                    # relative to the SAME clean starting point (Phase 2).
+                                    p.add_(theta_clean_direction[name].to(device), alpha=0.1)
+
+                    # --- Phase 3: verify against the honeypot's own detector ---
+                    _, _, compliant_rate, _, _, _ = detector.check(model, (verify_inputs, verify_labels), honey_map)
+                    final_compliant_rate = compliant_rate
+                    logging.warning(
+                        f"[Engine] 🔎 Honeypot-guided unlearning round {correction_round}/{max_correction_rounds}: "
+                        f"post-correction compliant_rate={compliant_rate:.2%} (threshold={verify_threshold:.2%})."
+                    )
+                    if compliant_rate <= verify_threshold:
+                        break
+                    model.train()  # detector.check() switches to eval(); back to train() for the next pass, if any.
+
+                model.set_updated_round(self.round)
+                cleared = final_compliant_rate is not None and final_compliant_rate <= verify_threshold
+                final_rate_str = f"{final_compliant_rate:.2%}" if final_compliant_rate is not None else "n/a"
+                logging.warning(
+                    f"[Engine] ✅ Honeypot-guided unlearning complete: {correction_round} correction round(s), "
+                    f"{total_steps_done} total ascent steps, "
+                    f"{'backdoor signature cleared' if cleared else 'max rounds reached, signature still present'} "
+                    f"(final compliant_rate={final_rate_str})."
+                )
+
+                # --- Phase 4: register the post-correction watch ---
+                # Re-checked once per round for watch_rounds by _check_unlearning_watch(),
+                # invoked from the main round loop. Registered even if `cleared` is False
+                # (max rounds reached without clearing) — that case especially benefits from
+                # continued watching, since Phase 3 already ran out of budget without success.
+                if watch_rounds > 0:
+                    self._unlearning_watch = {
+                        "honey_map": honey_map,
+                        "patch_size": patch_size,
+                        "dominant_target": dominant_target,
+                        "verified_round": verified_round,
+                        "local_streak_required": local_streak_required,
+                        "rounds_remaining": watch_rounds,
+                        "verify_threshold": verify_threshold,
+                    }
+                    logging.info(f"[Engine] 👁️ Honeypot-guided watch armed for {watch_rounds} rounds.")
+        except Exception as e:
+            logging.error(f"[Engine] Error during honeypot-guided unlearning: {e}", exc_info=True)
 
     def _collect_snapshot_sync(self, snapshot_point: str) -> dict:
         """Collect a synchronous snapshot (used at startup).
@@ -1275,6 +2178,19 @@ class Engine:
 
             self._processed_model_reset_floods[hash_val] = True
 
+            # IDEMPOTENCY BY ATTACKER: only ONE reset per blocked attacker, ever. Without this,
+            # a reset re-emitted with a different target_round (or by a second honeypot) passes
+            # the payload-hash dedup above and re-wipes the model every round — the network never
+            # converges (observed 2026-07-13/14 reset runs: 74-92 resets, accuracy pinned ~0.10).
+            blocked_attacker = payload.get("blocked")
+            if blocked_attacker is not None:
+                if not hasattr(self, "_reset_done_for_attacker"):
+                    self._reset_done_for_attacker = set()
+                if blocked_attacker in self._reset_done_for_attacker:
+                    logging.debug(f"[Engine] Reset already applied for attacker {blocked_attacker}; ignoring duplicate.")
+                    return
+                self._reset_done_for_attacker.add(blocked_attacker)
+
             target_reset_round = payload.get("target_round")
 
             if target_reset_round is not None:
@@ -2083,6 +2999,9 @@ class Engine:
                     title="Round information",
                 )
 
+                self._maybe_save_checkpoint()
+                await self._check_unlearning_watch()
+
                 self.trainer.on_round_end()
 
                 # NEW: Decrement warmup rounds
@@ -2321,11 +3240,35 @@ class Engine:
     async def _control_block_neighbor_callback(self, source, message):
         """
         Recibe orden del Honeypot para aislar a un nodo atacante.
+
+        El payload puede venir en dos formatos por compatibilidad: un string plano con
+        solo el attacker_id (formato legacy), o un JSON estructurado que además incluye
+        honey_map/patch_size para que este nodo pueda reconstruir localmente el trap
+        dataset D^(t)_trap y aplicar unlearning guiado por honeypot (ver sanitization_strategy).
         """
         try:
-            # El ID del atacante viene en el log del mensaje
             raw_log = getattr(message, "log", "")
-            attacker_id = raw_log.decode('utf-8') if isinstance(raw_log, bytes) else str(raw_log)
+            raw_log = raw_log.decode('utf-8') if isinstance(raw_log, bytes) else str(raw_log)
+
+            attacker_id = raw_log
+            honey_map = None
+            patch_size = 4
+            verified_round = None
+            local_streak_required = 4
+            dominant_target = None
+            contamination_rounds = None
+            try:
+                payload = json.loads(raw_log)
+                if isinstance(payload, dict) and payload.get("type") == "block_neighbor":
+                    attacker_id = payload.get("attacker_id", "")
+                    honey_map = payload.get("honey_map")
+                    patch_size = payload.get("patch_size", 4)
+                    verified_round = payload.get("verified_round")
+                    local_streak_required = payload.get("local_streak_required") or 4
+                    dominant_target = payload.get("dominant_target")
+                    contamination_rounds = payload.get("contamination_rounds")
+            except (json.JSONDecodeError, TypeError):
+                pass  # Legacy plain-string payload: attacker_id already set above.
 
             if attacker_id and attacker_id != self.addr:
                 logging.warning(f"🛡️ SECURITY ALERT received from {source}. Blocking data from {attacker_id} (Connection kept open).")
@@ -2341,6 +3284,15 @@ class Engine:
 
                 # Opcional: Cortar conexión física si quieres ser agresivo
                 # await self.cm.disconnect(attacker_id)
+
+                if honey_map:
+                    await self._maybe_run_unlearning(
+                        honey_map, patch_size,
+                        verified_round=verified_round,
+                        local_streak_required=local_streak_required,
+                        dominant_target=dominant_target,
+                        contamination_rounds=contamination_rounds,
+                    )
         except Exception as e:
             logging.error(f"Error processing block order: {e}")
 

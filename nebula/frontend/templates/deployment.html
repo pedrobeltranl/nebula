@@ -663,6 +663,18 @@
                         <h5 class="step-title">Honeypot Seed</h5>
                         <input type="number" step="0.001" class="form-control" id="honeypot-seed" placeholder="Random Seed (0.0-1.0)" value="0.5" style="display: inline; width: 80%">
                         <small class="form-text text-muted">Reproducibility seed for Chaos Maps</small>
+                        <h5 class="step-title" style="margin-top: 10px;">Post-Containment Sanitization Strategy</h5>
+                        <select class="form-control" id="honeypot-sanitization-strategy" style="display: inline; width: 80%">
+                            <option value="">Default (use checkbox below)</option>
+                            <option value="global_reset">Global Reset (discard all progress, resync to SYNC_SEED)</option>
+                            <option value="no_reset">No Reset (shock-training LR boost, keep progress)</option>
+                            <option value="gradient_ascent">Unlearning: Gradient Ascent (on honeypot trap set)</option>
+                            <option value="influence_function">Unlearning: Influence Function (LiSSA-approximated)</option>
+                            <option value="sisa">Unlearning: SISA-style (rollback to clean checkpoint + retrain)</option>
+                            <option value="fed_eraser">Unlearning: FedEraser-style (recalibrated correction)</option>
+                            <option value="honeypot_guided">Unlearning: Honeypot-Guided (directed forget set + synthesized clean model)</option>
+                        </select>
+                        <small class="form-text text-muted">Selecting a strategy here overrides the checkbox below. Leave as "Default" to use the checkbox (legacy Global Reset / No Reset behavior).</small>
                         <div class="form-check" style="margin-top: 5px;">
                              <input class="form-check-input" type="checkbox" id="honeypot-global-reset" checked>
                              <label class="form-check-label" for="honeypot-global-reset">Enable Global Model Reset on Detection</label>

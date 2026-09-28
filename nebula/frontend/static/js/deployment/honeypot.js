@@ -20,6 +20,11 @@ const HoneypotManager = (function () {
         }
 
         const globalResetEl = document.getElementById("honeypot-global-reset");
+        const strategyEl = document.getElementById("honeypot-sanitization-strategy");
+        // Empty string ("Default") means: no explicit strategy chosen, fall back to the
+        // global_reset checkbox (legacy behavior) — only send a non-empty string when the
+        // user has EXPLICITLY picked a strategy from the dropdown, unlearning included.
+        const sanitizationStrategy = strategyEl && strategyEl.value ? strategyEl.value : null;
 
         return {
             enabled: true,
@@ -28,7 +33,8 @@ const HoneypotManager = (function () {
             seed: parseFloat(document.getElementById("honeypot-seed").value),
             attacker_pivoting: document.getElementById("attacker-pivoting") ? document.getElementById("attacker-pivoting").checked : false,
             pivot_round: parseInt(document.getElementById("pivot-round") ? document.getElementById("pivot-round").value : 10) || 10,
-            global_reset: document.getElementById("honeypot-global-reset") ? document.getElementById("honeypot-global-reset").checked : true
+            global_reset: document.getElementById("honeypot-global-reset") ? document.getElementById("honeypot-global-reset").checked : true,
+            sanitization_strategy: sanitizationStrategy
         };
     }
 
@@ -57,6 +63,10 @@ const HoneypotManager = (function () {
         if (document.getElementById("honeypot-global-reset")) {
             document.getElementById("honeypot-global-reset").checked = config.global_reset !== undefined ? config.global_reset : true;
         }
+
+        if (document.getElementById("honeypot-sanitization-strategy")) {
+            document.getElementById("honeypot-sanitization-strategy").value = config.sanitization_strategy || "";
+        }
     }
 
     function resetHoneypotConfig() {
@@ -79,6 +89,9 @@ const HoneypotManager = (function () {
         }
         if (document.getElementById("honeypot-global-reset")) {
             document.getElementById("honeypot-global-reset").checked = true;
+        }
+        if (document.getElementById("honeypot-sanitization-strategy")) {
+            document.getElementById("honeypot-sanitization-strategy").value = "";
         }
     }
 

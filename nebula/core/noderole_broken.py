@@ -1120,7 +1120,31 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         elif threat_detected_this_round and not self.threat_confirmed_locally:
             # Detectamos víctimas pero no la fuente directa. Solo permitimos pivot
             # si no hay ya un candidato directo serio en el baseline local.
-            if self._has_pending_direct_attacker_candidate():
+            #
+            # OVERRIDE (sparse-topology reach): if reputation clearly flags a SILENT attacker
+            # that is NOT one of our neighbors, the local "candidate" is a victim/relay, not the
+            # source — we must be free to travel toward the real attacker. Otherwise a strong
+            # local victim signature pins us in HOLD forever (the 2026-07-08 07:33 stall).
+            rep_module = self._engine._reputation if hasattr(self._engine, '_reputation') else None
+            nav_topology = self._engine.cm.get_global_topology()
+            nav_suspect = self.manager.reputation_navigation_suspect(rep_module, my_id=self._engine.addr, topology=nav_topology)
+            try:
+                current_neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
+            except Exception:
+                current_neighbors = []
+            reputation_points_elsewhere = (
+                nav_suspect is not None
+                and str(nav_suspect) != str(self._engine.addr)
+                and nav_suspect not in current_neighbors
+                and not self.manager.is_visited(nav_suspect)
+            )
+            if reputation_points_elsewhere:
+                logging.info(
+                    f"[Honeypot] 🧭 Local threat is a victim, but reputation flags non-neighbor suspect "
+                    f"{nav_suspect}. Allowing pivot to approach the real attacker."
+                )
+                self._allow_pivot_for_indirect_threats = True
+            elif self._has_pending_direct_attacker_candidate():
                 logging.info(
                     "[Honeypot] ⚠️ Threat detected via victims/echoes, but a direct baseline attacker "
                     "candidate is still under active investigation. Holding position."
@@ -1175,7 +1199,23 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
         """
         Envía la orden 'BLOCK_NEIGHBOR' a los nodos VECINOS del atacante.
         Use la topología global para identificarlos.
+
+        IDEMPOTENCY: once containment has been initiated for a given attacker, later
+        calls (the manager re-detects the same frozen MALICIOUS state every cycle,
+        since analyze_neighbor short-circuits and stops updating rounds_tested once
+        status == "MALICIOUS") must not re-run the connect/broadcast steps. Without
+        this guard, extended_learning_cycle() re-invokes this method every ~2 minutes
+        for the lifetime of the run, repeatedly reconnecting to the attacker's
+        neighbors and re-sending KILL ORDER with no progress (observed 2026-07-22
+        MNIST-10-1-Reset: re-detected every cycle for 1h20+, reset never scheduled).
         """
+        if not hasattr(self, "_containment_started_for"):
+            self._containment_started_for = set()
+        if attacker_id in self._containment_started_for:
+            logging.debug(f"[Honeypot] Containment already initiated for {attacker_id}; skipping re-run.")
+            return
+        self._containment_started_for.add(attacker_id)
+
         logging.info(f"[Honeypot] 🛡️ INITIATING CONTAINMENT against {attacker_id}")
 
         # 1. Obtener la topología GLOBAL para saber quiénes son los vecinos del atacante
@@ -1207,6 +1247,55 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             self._engine.config.set_runtime_topology_override(False)
 
         # 3. Enviar la orden de bloqueo
+        # Incluimos el honey_map (y el patch_size del trigger) usado en esta epoch para que
+        # cada nodo receptor pueda reconstruir localmente el trap dataset D^(t)_trap
+        # (HoneyDataset envolviendo SU PROPIO dataset benigno) y así aplicar unlearning
+        # guiado por honeypot (p.ej. gradient-ascent) sin depender de los datos del HoneyNode.
+        honey_map = None
+        patch_size = 4
+        verified_round = None
+        local_streak_required = None
+        dominant_target = None
+        contamination_rounds = None
+        try:
+            honey_map = dict(self.manager.current_map) if getattr(self.manager, "current_map", None) else None
+            if getattr(self.manager, "detector", None) is not None:
+                patch_size = getattr(self.manager.detector, "patch_size", 4)
+            # SISA-style unlearning needs to know how far back to roll: verified_round is the
+            # round the attack was CONFIRMED, and it took local_streak_required consecutive
+            # rounds of sustained signature to get there (see _confirm_malicious), so
+            # verified_round - local_streak_required approximates when contamination began.
+            tracking = getattr(self.manager, "neighbor_tracking", {}) or {}
+            attacker_state = tracking.get(attacker_id, {})
+            verified_round = attacker_state.get("verified_round")
+            local_streak_required = getattr(self.manager, "LOCAL_STREAK_REQUIRED", None) or 4
+            # Honeypot-guided unlearning needs the specific class the attacker's poisoned
+            # predictions concentrate on (measured in HoneyDetector.check(), tracked as
+            # last_dominant_target in manager.py's per-neighbor state), so the forget set
+            # can be directed at the actual measured (trigger, source_class) -> dominant_target
+            # association instead of a generic hypothesis about what was poisoned.
+            dominant_target = attacker_state.get("last_dominant_target")
+            # How long the honeypot has actually been auditing this suspect before conviction
+            # (rounds_tested), a better proxy for real contamination exposure than the fixed
+            # local_streak_required constant — used to scale unlearning correction effort to
+            # how long the poison signal was actually present, rather than a flat budget for
+            # every conviction regardless of how long it took to confirm.
+            contamination_rounds = attacker_state.get("rounds_tested")
+        except Exception as e:
+            logging.warning(f"[Honeypot] Could not read honey_map/patch_size/verified_round/dominant_target/rounds_tested for block_neighbor payload: {e}")
+
+        block_payload = {
+            "type": "block_neighbor",
+            "attacker_id": attacker_id,
+            "honey_map": honey_map,
+            "patch_size": patch_size,
+            "verified_round": verified_round,
+            "local_streak_required": local_streak_required,
+            "dominant_target": dominant_target,
+            "contamination_rounds": contamination_rounds,
+        }
+        content = json.dumps(block_payload, sort_keys=True)
+
         for neighbor in targets:
             if neighbor == self._engine.addr:
                 continue
@@ -1218,9 +1307,79 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             msg = self._engine.cm.create_message(
                 "control",
                 "block_neighbor",
-                log=attacker_id
+                log=content
             )
             asyncio.create_task(self._engine.cm.send_message(neighbor, msg))
+
+        # 4. RECOVERY STRATEGY: block-then-reset vs block-then-continue.
+        # Controlled by the honeypot's `global_reset` flag (default False = continue training).
+        # When True, after blocking we also broadcast a coordinated model_reset_flood so every
+        # node restores its SYNC_SEED initial weights next round and re-trains from scratch
+        # WITHOUT the poison. When False, the network simply keeps training from where it is.
+        # This is the experiment knob for the reset-vs-continue comparison.
+        if self._global_reset_enabled():
+            # Emit the coordinated reset ONCE per attacker. _execute_containment_protocol runs
+            # every round (KILL ORDERs are re-broadcast for durability), so without this guard the
+            # reset re-fires each round and repeatedly wipes the model — the network never
+            # converges (observed 2026-07-13 EMNIST edge0.5: reset fired 74× and pinned accuracy
+            # at ~0.10). Track which attackers we've already reset for.
+            if not hasattr(self, "_reset_broadcast_for"):
+                self._reset_broadcast_for = set()
+            if attacker_id not in self._reset_broadcast_for:
+                self._reset_broadcast_for.add(attacker_id)
+                await self._broadcast_model_reset(attacker_id)
+            else:
+                logging.debug(f"[Honeypot] Reset already broadcast for {attacker_id}; not re-firing.")
+        else:
+            logging.info("[Honeypot] ♻️ Recovery mode = CONTINUE (global_reset disabled). Network keeps training post-block.")
+
+    def _global_reset_enabled(self) -> bool:
+        """Read the honeypot's global_reset flag from config (default False = continue)."""
+        try:
+            part = self._engine.config.participant
+            for key in ("honeypot_args",):
+                v = part.get(key, {})
+                if isinstance(v, dict) and "global_reset" in v:
+                    return bool(v["global_reset"])
+            # Fallback location: defense_args.honeypot
+            v = part.get("defense_args", {}).get("honeypot", {})
+            if isinstance(v, dict) and "global_reset" in v:
+                return bool(v["global_reset"])
+        except Exception as e:
+            logging.warning(f"[Honeypot] Could not read global_reset flag: {e}. Defaulting to CONTINUE.")
+        return False
+
+    async def _broadcast_model_reset(self, attacker_id):
+        """
+        Broadcast a COORDINATED model_reset_flood so all nodes reinitialize to SYNC_SEED
+        weights at the same round (round+1), after the attacker has been blocked. This is the
+        RESET recovery mode. Reset is scheduled (target_round) so every node resets in lockstep.
+        """
+        try:
+            current_round = int(getattr(self._engine, 'round', 0) or 0)
+            target_round = current_round + 1
+            payload = {
+                "type": "model_reset_flood",
+                "source_honeypot": self._engine.addr,
+                "round": current_round,
+                "target_round": target_round,
+                "blocked": attacker_id,
+            }
+            content = json.dumps(payload, sort_keys=True)
+            logging.warning(
+                f"[Honeypot] 🔄 Recovery mode = RESET. Broadcasting coordinated MODEL RESET "
+                f"(target_round={target_round}) after blocking {attacker_id}."
+            )
+            neighbors = await self._engine.cm.get_addrs_current_connections(only_direct=True, myself=False)
+            for neighbor in neighbors:
+                if neighbor == attacker_id:
+                    continue  # never tell the attacker to reset
+                msg = self._engine.cm.create_message("control", "model_reset_flood", log=content)
+                asyncio.create_task(self._engine.cm.send_message(neighbor, msg))
+            # Also apply the reset locally (schedule for the same target round).
+            self._engine._pending_reset_round = target_round
+        except Exception as e:
+            logging.error(f"[Honeypot] Error broadcasting model reset: {e}", exc_info=True)
 
     async def _check_and_react_to_pivot(self):
         """
@@ -1302,7 +1461,24 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
             await self._execute_containment_protocol(pivot_decision)
             return
 
+        # PRIORITY NAVIGATION: if reputation clearly flags a silent attacker that is NOT our
+        # neighbor, travel STRAIGHT toward it (shortest path) instead of wandering the topology
+        # with blind DFS. This is the difference between reaching the attacker in ~1 hop/level
+        # vs the 76-round blind migration seen in 2026-07-08 10:49. Reputation is used ONLY to
+        # choose the destination; conviction still happens locally once we are adjacent.
+        if await self._try_approach_reputation_suspect(topology, neighbors, current_round):
+            return
+
         if pivot_decision == getattr(self.manager, "HOLD_POSITION", "__HOLD__"):
+            # BEFORE honouring HOLD: if reputation clearly points at a silent attacker that is
+            # NOT our neighbor (sparse topology), do NOT get hypnotized holding next to a local
+            # victim — travel toward the real attacker so we can measure it directly. Reputation
+            # is used ONLY to pick the destination (navigation), never to convict. This must run
+            # before the HOLD return (the 2026-07-08 07:33 failure: HOLD short-circuited the
+            # navigation and the honeypot never approached the attacker).
+            approached = await self._try_approach_reputation_suspect(topology, neighbors, current_round)
+            if approached:
+                return
             logging.info("[HONEYPOT DFS] ⏸️ Manager requested HOLD. Skipping pivot this round.")
             return
 
@@ -1327,6 +1503,26 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 came_from=self._last_pivot_source,
                 exclude_nodes=temporarily_unavailable_targets | set(self.manager.visited_history),
             )
+
+        # ACTIVE APPROACH (sparse-topology reach fix): if blind DFS found no forward direction,
+        # or before wandering, steer toward the reputation-flagged silent suspect so the honeypot
+        # becomes a DIRECT NEIGHBOR of the attacker and can run local+reputation conviction there.
+        # Reputation is used ONLY to choose the travel destination, not to convict.
+        if next_pivot is None:
+            rep_module = self._engine._reputation if hasattr(self._engine, '_reputation') else None
+            nav_suspect = self.manager.reputation_navigation_suspect(rep_module, my_id=self._engine.addr, topology=topology)
+            if nav_suspect and str(nav_suspect) != str(self._engine.addr) and not self.manager.is_visited(nav_suspect):
+                approach_hop = self.manager.next_hop_towards(
+                    topology=topology,
+                    my_id=self._engine.addr,
+                    target_id=nav_suspect,
+                    avoid=self.manager.get_confirmed_malicious_nodes(),
+                )
+                if approach_hop and approach_hop in neighbors:
+                    logging.info(
+                        f"[HONEYPOT DFS] 🧭 Approaching reputation suspect {nav_suspect} via next hop {approach_hop}."
+                    )
+                    next_pivot = approach_hop
 
         if next_pivot is None and temporarily_unavailable_targets:
             next_pivot = self.manager.get_dfs_pivot_direction(
@@ -1365,6 +1561,31 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                     f"{temporarily_blocked_candidates} are temporarily unavailable."
                 )
                 return
+            # PROXIMITY GUIDANCE: before backtracking blindly, if we have a locked attacker
+            # target that is still unconvicted and not yet reached, steer toward it via the
+            # shortest topological path — even re-treading visited nodes. This prevents the
+            # honeypot from getting stranded far from a known attacker (the 16:52:44 failure).
+            locked = getattr(self.manager, "locked_target", None)
+            if (
+                locked
+                and str(locked) != str(self._engine.addr)
+                and not self.manager.is_visited(locked)
+            ):
+                approach_hop = self.manager.next_hop_towards(
+                    topology=topology,
+                    my_id=self._engine.addr,
+                    target_id=locked,
+                    avoid=self.manager.get_confirmed_malicious_nodes(),
+                )
+                if approach_hop and approach_hop in neighbors:
+                    logging.info(
+                        f"[HONEYPOT DFS] 🧭 Dead end at {self._engine.addr}, but locked attacker "
+                        f"{locked} not yet reached. Approaching via next hop {approach_hop}."
+                    )
+                    self._last_pivot_round = current_round
+                    await self._pivot_to(approach_hop, mode="forward")
+                    return
+
             backtrack_target = self._get_backtrack_target()
             if backtrack_target and backtrack_target in neighbors:
                 logging.info(
@@ -1377,6 +1598,59 @@ class HoneypotRoleBehavior(AggregatorRoleBehavior):
                 logging.warning("[HONEYPOT DFS] ⚠️ No valid pivot direction found and no backtrack target available.")
                 # Unlock target to allow recalculation
                 self.manager.locked_target = None
+
+    async def _try_approach_reputation_suspect(self, topology, neighbors, current_round):
+        """
+        Navigate one hop toward the reputation-flagged silent attacker if it is not our neighbor.
+
+        Reputation is used ONLY to pick the destination (navigation), never to convict. Returns
+        True if it initiated an approach pivot (caller should stop), False otherwise. This lets
+        the honeypot escape a HOLD next to a local victim and travel to the real attacker in
+        sparse topologies (fixes the 2026-07-08 07:33 stall).
+        """
+        rep_module = self._engine._reputation if hasattr(self._engine, '_reputation') else None
+        nav_suspect = self.manager.reputation_navigation_suspect(rep_module, my_id=self._engine.addr, topology=topology)
+        if not nav_suspect or str(nav_suspect) == str(self._engine.addr):
+            return False
+        # If the suspect is already our direct neighbor, we don't travel — we stay and measure it
+        # locally (the normal conviction path handles it). Only navigate when it's NOT adjacent.
+        if nav_suspect in (neighbors or []):
+            return False
+        # SAFETY vs noisy navigation: if a DIRECT neighbor already shows a strong local attack
+        # signature (building local_streak with clashes & 0% bait), the attacker may be right in
+        # front of us — do NOT abandon it to chase a possibly-noisy far reputation suspect.
+        for nb in (neighbors or []):
+            st = self.manager.neighbor_tracking.get(nb, {})
+            if (
+                max(int(st.get("semantic_malicious_streak", 0)), int(st.get("extreme_streak", 0))) >= 2
+                and int(st.get("clash_count", 0)) >= 3
+                and float(st.get("max_compliant_seen", 1.0)) < 0.02
+            ):
+                logging.info(
+                    f"[HONEYPOT DFS] 🧭 Skipping reputation navigation to {nav_suspect}: direct neighbor {nb} "
+                    f"already shows a strong local attack signature — staying to measure it."
+                )
+                return False
+        if self.manager.is_visited(nav_suspect):
+            return False
+        approach_hop = self.manager.next_hop_towards(
+            topology=topology,
+            my_id=self._engine.addr,
+            target_id=nav_suspect,
+            avoid=self.manager.get_confirmed_malicious_nodes(),
+        )
+        if not approach_hop or approach_hop not in (neighbors or []):
+            return False
+        logging.info(
+            f"[HONEYPOT DFS] 🧭 Approaching reputation suspect {nav_suspect} via next hop {approach_hop} "
+            f"(overriding local HOLD to reach the real attacker)."
+        )
+        self._last_pivot_round = current_round
+        self._last_pivot_source = self._engine.addr
+        self.manager.register_visit(self._engine.addr)
+        self.manager.register_visit(approach_hop)
+        await self._pivot_to(approach_hop, mode="forward")
+        return True
 
     async def _pivot_to(self, candidate, mode="forward"):
         if not self._is_honeypot_active():
